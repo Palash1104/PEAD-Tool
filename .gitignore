@@ -1,0 +1,4 @@
+.env
+seen.json
+pead_results.csv
+__pycache__/
