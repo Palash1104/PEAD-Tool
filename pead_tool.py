@@ -14,6 +14,9 @@ CONFIG:
 import os
 from dotenv import load_dotenv
 import json
+import re
+import html
+import math
 import pytesseract
 from pdf2image import convert_from_bytes
 import csv
@@ -49,6 +52,11 @@ if not all([
 PEAD_THRESHOLD     = 35
 POLL_INTERVAL_SEC  = 30
 CLAUDE_MODEL       = "anthropic/claude-haiku-4-5"
+MAX_RETRIES        = 3      # extra attempts per failed filing, one per poll
+
+# Growth factors are skipped when last year's base is this small (Rs. Cr)
+SMALL_BASE_PAT_CR  = 1
+SMALL_BASE_REV_CR  = 10
 
 SEEN_FILE = "seen.json"
 RESULTS_CSV = "pead_results.csv"
@@ -127,24 +135,28 @@ def save_result_csv(company, scrip, score, fin):
     ebitda = (estimate_ebitda(fin) + [None,None,None])[:3]
     eps = get3("basic_eps")
 
-    with open(RESULTS_CSV, "a", newline="", encoding="utf-8") as f:
+    try:
+        with open(RESULTS_CSV, "a", newline="", encoding="utf-8") as f:
 
-        writer = csv.writer(f)
+            writer = csv.writer(f)
 
-        writer.writerow([
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            writer.writerow([
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
 
-            company,
-            scrip,
-            score,
+                company,
+                scrip,
+                score,
 
-            *rev,
-            *pat,
-            *ebitda,
+                *rev,
+                *pat,
+                *ebitda,
 
-            eps[0],
-            eps[2],
-        ])
+                eps[0],
+                eps[2],
+            ])
+    except OSError as e:
+        # e.g. CSV open in Excel — don't let logging block the alert
+        log.warning(f"   Could not write CSV row: {e}")
 
 # ── BSE ──────────────────────────────────────────────────────
 
@@ -196,7 +208,7 @@ def download_pdf(attachment_name: str):
         log.warning(f"PDF download failed: {e}")
         return None
 
-def parse_exchange_time(ann: dict) -> str:
+def parse_exchange_time(ann: dict) -> datetime | None:
     for field in ["EXCHANGE_RECEIVED_TIME", "NEWS_DT", "DT_TM", "DTTM"]:
         val = ann.get(field)
         if not val:
@@ -210,23 +222,56 @@ def parse_exchange_time(ann: dict) -> str:
             "%d-%m-%Y %H:%M:%S",
         ]:
             try:
-                return datetime.strptime(s, fmt).strftime("%d %b %Y  %H:%M:%S")
+                return datetime.strptime(s, fmt)
             except ValueError:
                 continue
-        return s
-    return "N/A"
+    return None
+
+def announcement_headline(ann: dict) -> str:
+    return " ".join(
+        str(ann.get(field) or "")
+        for field in ["NEWSSUB", "HEADLINE", "SUBCATNAME"]
+    ).strip()
+
+def is_result_board_meeting(headline: str) -> bool:
+    """Board Meeting filings only count when they are an outcome with results.
+
+    Intimations, trading window, AGM and dividend notices are dropped unless
+    they also mention results, which the result-keyword requirement already
+    enforces ("Intimation of outcome ... financial results" is a real result).
+    """
+    text = headline.lower()
+    return "outcome" in text and re.search(r"\bresults?\b", text) is not None
+
+def reporting_quarter(filed_on: date) -> str:
+    """Quarter a result filed on this date reports, e.g. Sep 2026 → Q1FY27.
+
+    Results are filed in the three months after quarter end, and the
+    Indian financial year runs April–March (FY27 = Apr 2026 – Mar 2027).
+    """
+    m, y = filed_on.month, filed_on.year
+    if m in (7, 8, 9):
+        q, fy = 1, y + 1
+    elif m in (10, 11, 12):
+        q, fy = 2, y + 1
+    elif m in (1, 2, 3):
+        q, fy = 3, y
+    else:
+        q, fy = 4, y
+    return f"Q{q}FY{fy % 100:02d}"
 
 # ── CLAUDE PDF EXTRACTION ─────────────────────────────────────
 
-CLAUDE_PROMPT = """This is a quarterly financial result PDF filed by an Indian listed company on BSE/NSE.
+CLAUDE_PROMPT = """This text comes from a quarterly financial result PDF filed by an Indian listed company on BSE/NSE.
 
-Extract the following metrics from the STANDALONE QUARTERLY columns only (NOT year-to-date or full year columns).
+Use the CONSOLIDATED results if the text contains a consolidated results table; otherwise use the STANDALONE results.
+Use only the individual quarter columns (NOT year-to-date, half-year, nine-month or full year columns).
 The result table has 3 quarterly columns:
   Column 1: Current quarter (most recent)
   Column 2: Previous quarter (immediately preceding)
   Column 3: Same quarter last year (year-over-year)
 
-Extract these values IN CRORES (Rs. Cr):
+Extract these values exactly as printed, in the table's own unit (do NOT convert units):
 - revenue_from_operations: Revenue from operations / Net Sales (NOT total income)
 - total_income: Total income including other income
 - ebitda: EBITDA or Operating Profit if explicitly stated as a line item (else set null)
@@ -239,8 +284,14 @@ Extract these values IN CRORES (Rs. Cr):
 - pat: Profit After Tax for the quarter
 - basic_eps: Basic Earnings Per Share in Rs.
 
+Also report:
+- basis: which results you used, "consolidated" or "standalone"
+- unit: the unit the table states for amounts, one of "crores", "lakhs", "millions", "thousands", "rupees"
+
 Return ONLY a JSON object, no explanation, no markdown:
 {
+"basis":"consolidated|standalone",
+"unit":"crores|lakhs|millions|thousands|rupees",
 "revenue_from_operations":[cq,pq,ly],
 "total_income":[cq,pq,ly],
 "ebitda":[cq,pq,ly],
@@ -256,18 +307,66 @@ Return ONLY a JSON object, no explanation, no markdown:
 
 Rules:
 - null for any value not found with confidence
-- Plain floats only, no commas or symbols
-- If values shown in lakhs, divide by 100 to convert to crores
-- Negatives as negative floats e.g. -12.5
+- Plain numbers only, no commas or symbols
+- Negatives as negative numbers e.g. -12.5 (values in brackets like (12.5) are negative)
 - Do NOT include annual/year-ended columns"""
 
-RESULT_PAGE_PATTERNS = [
-    "statement of audited consolidated financial results",
-    "statement of audited standalone financial results",
-    "statement of unaudited consolidated financial results",
-    "statement of unaudited standalone financial results",
-    "financial results for the quarter",
-    "financial results for the half year",
+FIN_KEYS = [
+    "revenue_from_operations",
+    "total_income",
+    "ebitda",
+    "finance_cost",
+    "depreciation",
+    "employee_expense",
+    "other_expenses",
+    "total_expenses",
+    "pbt",
+    "pat",
+    "basic_eps",
+]
+PER_SHARE_KEYS = {"basic_eps"}  # already in Rs., never unit-converted
+
+UNIT_TO_CRORE = {
+    "crores": 1,
+    "lakhs": 0.01,
+    "millions": 0.1,
+    "thousands": 0.0001,
+    "rupees": 0.0000001,
+}
+UNIT_ALIASES = {
+    "crore": "crores", "cr": "crores",
+    "lakh": "lakhs", "lacs": "lakhs", "lac": "lakhs",
+    "million": "millions", "mn": "millions",
+    "thousand": "thousands",
+    "rupee": "rupees", "rs": "rupees", "inr": "rupees",
+}
+
+MAX_PDF_PAGES  = 25
+MIN_TEXT_CHARS = 500   # less real text than this → treat PDF as scanned, OCR it
+HEADING_LINES  = 20    # a result table's title sits near the top of its page
+
+# A page counts as a result table only if it has at least two of these
+TABLE_MARKERS = [
+    "revenue from operations",
+    "total income",
+    "profit before tax",
+    "earnings per share",
+]
+
+# Checked against the top of each table page, in order of preference
+RESULT_HEADINGS = [
+    ("consolidated", re.compile(
+        r"(?:un)?audited\s+consolidated|consolidated\s+(?:un)?audited"
+        r"|consolidated\s+financial\s+results|consolidated\s+statement"
+    )),
+    ("standalone", re.compile(
+        r"(?:un)?audited\s+standalone|standalone\s+(?:un)?audited"
+        r"|standalone\s+financial\s+results|standalone\s+statement"
+    )),
+    ("generic", re.compile(
+        r"financial\s+results\s+for\s+the\s+(?:quarter|half\s+year|period)"
+        r"|(?:un)?audited\s+financial\s+results"
+    )),
 ]
 
 PAGE_SCORE_KEYWORDS = {
@@ -284,144 +383,189 @@ PAGE_SCORE_KEYWORDS = {
     "consolidated": 3,
 }
 
-def extract_text_ocr(pdf_bytes: bytes) -> str:
+def classify_result_page(text: str) -> str | None:
+    lower = text.lower()
+
+    if sum(marker in lower for marker in TABLE_MARKERS) < 2:
+        return None
+
+    heading = " ".join(lower.splitlines()[:HEADING_LINES])
+
+    for basis, pattern in RESULT_HEADINGS:
+        if pattern.search(heading):
+            return basis
+
+    return None
+
+def select_result_pages(page_texts: list) -> tuple:
+    """Pick the result table page plus its continuation page.
+
+    Prefers consolidated, then standalone, then an untitled result table,
+    then the best keyword-scoring page. Returns (page indices, reason).
+    """
+    first_found = {}
+
+    for idx, text in enumerate(page_texts):
+        basis = classify_result_page(text)
+        if basis and basis not in first_found:
+            first_found[basis] = idx
+
+    for basis in ["consolidated", "standalone", "generic"]:
+        if basis in first_found:
+            idx = first_found[basis]
+            return [i for i in (idx, idx + 1) if i < len(page_texts)], f"{basis} table"
+
+    scores = [
+        sum(w for kw, w in PAGE_SCORE_KEYWORDS.items() if kw in text.lower())
+        for text in page_texts
+    ]
+
+    if not scores or max(scores) == 0:
+        return [], "no result page"
+
+    idx = scores.index(max(scores))
+    return [i for i in (idx, idx + 1) if i < len(page_texts)], f"best keyword score {max(scores)}"
+
+def extract_pages_ocr(pdf_bytes: bytes, page_count: int) -> list:
+    """OCR one page at a time, stopping once a consolidated table and its next page are read."""
+    log.info("    Running OCR fallback...")
+
+    page_texts = []
+
     try:
-        log.info("    Running OCR fallback...")
+        for page_num in range(1, min(page_count, MAX_PDF_PAGES) + 1):
 
-        images = convert_from_bytes(
-            pdf_bytes,
-            dpi=250,
-            first_page=2,
-            last_page=10,
-            poppler_path=POPPLER_PATH
-        )
+            images = convert_from_bytes(
+                pdf_bytes,
+                dpi=250,
+                first_page=page_num,
+                last_page=page_num,
+                poppler_path=POPPLER_PATH
+            )
 
-        ocr_text = ""
+            page_texts.append(
+                pytesseract.image_to_string(images[0]) if images else ""
+            )
 
-        for i, image in enumerate(images):
-            text = pytesseract.image_to_string(image)
-
-            if text.strip():
-                ocr_text += f"\n\n--- OCR PAGE {i+1} ---\n{text}"
-
-        return ocr_text
+            if (
+                len(page_texts) >= 2 and
+                classify_result_page(page_texts[-2]) == "consolidated"
+            ):
+                break
 
     except Exception as e:
         log.warning(f"    OCR extraction failed: {e}")
-        return ""
+
+    return page_texts
+
+def _to_number(value) -> float | None:
+    if isinstance(value, bool):
+        return None
+
+    if isinstance(value, str):
+        try:
+            value = float(value.replace(",", "").strip())
+        except ValueError:
+            return None
+
+    if isinstance(value, (int, float)) and math.isfinite(value):
+        return float(value)
+
+    return None
+
+def normalise_financials(data) -> dict | None:
+    """Validate Claude's JSON: numbers only, 3 values per metric, amounts in crores."""
+    if not isinstance(data, dict):
+        log.warning("    Claude returned non-object JSON")
+        return None
+
+    unit = str(data.get("unit") or "").strip().lower()
+    unit = UNIT_ALIASES.get(unit, unit)
+
+    if unit not in UNIT_TO_CRORE:
+        log.warning(f"    Unrecognised unit from Claude: {data.get('unit')!r}")
+        return None
+
+    factor = UNIT_TO_CRORE[unit]
+
+    fin = {
+        "basis": str(data.get("basis") or "unknown").strip().lower(),
+        "unit": unit,
+    }
+
+    for key in FIN_KEYS:
+        values = data.get(key)
+
+        if not isinstance(values, list):
+            values = []
+
+        numbers = [_to_number(v) for v in (values + [None, None, None])[:3]]
+
+        if key not in PER_SHARE_KEYS:
+            numbers = [
+                round(n * factor, 4) if n is not None else None
+                for n in numbers
+            ]
+
+        fin[key] = numbers
+
+    return fin
 
 def extract_financials_claude(pdf_bytes: bytes) -> dict | None:
     """Extract text from PDF locally, then send to Claude via AICredits."""
     try:
-        # Step 1 — extract text locally with pdfplumber
-        relevant_pages = []
-
+        # Step 1 — extract text locally with pdfplumber, OCR if it's a scan
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            page_count = len(pdf.pages)
+            page_texts = [
+                page.extract_text() or ""
+                for page in pdf.pages[:MAX_PDF_PAGES]
+            ]
 
-            pages = pdf.pages[1:10]
-            
-            best_page = None
-            best_score = -1
+        real_chars = sum(len(t.strip()) for t in page_texts)
 
-            for idx, page in enumerate(pages, start=2):
+        if real_chars < MIN_TEXT_CHARS:
+            log.info(f"    Only {real_chars} chars of text layer, attempting OCR...")
+            page_texts = extract_pages_ocr(pdf_bytes, page_count)
 
-                page_text = page.extract_text() or ""
+        selected, reason = select_result_pages(page_texts)
 
-                lower = page_text.lower()
-                
-                page_score = 0
+        if not selected:
+            log.warning("    No result table page found")
+            return None
 
-                for keyword, weight in PAGE_SCORE_KEYWORDS.items():
-
-                    if keyword in lower:
-                        page_score += weight
-
-                if page_score > best_score:
-
-                    best_score = page_score
-
-                    best_page = {
-                        "page_num": idx,
-                        "text": page_text
-                    }
-
-                matched = any(
-                    pattern in lower
-                    for pattern in RESULT_PAGE_PATTERNS
-                )
-
-                if matched:
-
-                    log.info(f"    Found result table on PAGE {idx}")
-
-                    relevant_pages.append(
-                        f"\n\n--- PAGE {idx} ---\n{page_text}"
-                    )
-
-                    # Include next page too (table continuation)
-
-                    actual_next_page = idx
-
-                    if actual_next_page < len(pdf.pages):
-
-                        next_page_text = (
-                            pdf.pages[actual_next_page].extract_text() or ""
-                        )
-
-                        relevant_pages.append(
-                            f"\n\n--- PAGE {idx + 1} ---\n{next_page_text}"
-                        )
-
-                    break
-
-        # No exact heading found -> use highest scoring page
-
-        if not relevant_pages and best_page:
-
-            log.info(
-                f"    No exact result heading found. "
-                f"Using PAGE {best_page['page_num']} "
-                f"(score={best_score})"
-            )
-
-            relevant_pages.append(
-                f"\n\n--- PAGE {best_page['page_num']} ---\n"
-                f"{best_page['text']}"
-            )
-
-        text = "\n".join(relevant_pages)
-
-        if not text.strip():
-
-            log.warning("    No text layer found, attempting OCR...")
-
-            text = extract_text_ocr(pdf_bytes)
-
-            if not text.strip():
-                log.warning("    OCR also failed")
-                return None
+        text = "\n".join(
+            f"\n\n--- PAGE {i + 1} ---\n{page_texts[i]}"
+            for i in selected
+        )
 
         log.info(
-            f"    Selected {len(relevant_pages)} relevant pages "
-            f"({len(text)} chars)"
+            f"    Selected pages {[i + 1 for i in selected]} "
+            f"({reason}, {len(text)} chars)"
         )
+
         # Step 2 — send text to Claude via AICredits OpenAI-compatible API
         response = client.chat.completions.create(
             model=CLAUDE_MODEL,
-            max_tokens=512,
+            max_tokens=1500,
             messages=[
                 {
                     "role": "user",
-                    "content": f"{CLAUDE_PROMPT}\n\n---\nPDF TEXT:\n{text[:12000]}"
+                    "content": f"{CLAUDE_PROMPT}\n\n---\nPDF TEXT:\n{text}"
                 }
             ],
         )
 
-        raw = response.choices[0].message.content.strip()
-        raw = raw.replace("```json", "").replace("```", "").strip()
-        data = json.loads(raw)
+        raw = response.choices[0].message.content or ""
+        data = json.loads(raw[raw.find("{"):raw.rfind("}") + 1])
         log.info(f"    Claude extracted: {data}")
-        return data
+
+        fin = normalise_financials(data)
+
+        if fin:
+            log.info(f"    Basis: {fin['basis']}, unit: {fin['unit']}")
+
+        return fin
 
     except json.JSONDecodeError as e:
         log.warning(f"    Claude JSON parse error: {e}")
@@ -429,7 +573,7 @@ def extract_financials_claude(pdf_bytes: bytes) -> dict | None:
     except Exception as e:
         log.warning(f"    Claude extraction failed: {e}")
         return None
-    
+
 
 PROCESSED_SCRIPS_FILE = "processed_scrips.json"
 
@@ -566,11 +710,27 @@ def compute_pead_score(fin: dict):
     rev_yoy = _pct(c_rev, y_rev)
     rev_qoq = _pct(c_rev, q_rev)
 
+    # Tiny prior-year base makes growth % meaningless → no growth points.
+    # abs() so a real loss (e.g. -5 Cr) still counts as a turnaround base.
+    small_base = (
+        (y_pat is not None and abs(y_pat) < SMALL_BASE_PAT_CR) or
+        (y_rev is not None and y_rev < SMALL_BASE_REV_CR)
+    )
+
+    def growth_label(growth):
+        if small_base:
+            return "small base"
+        return f"{growth:.1f}%" if growth is not None else "N/A"
+
+    # Current negatives were rejected above, so a negative base = loss → profit
+    eps_turnaround = y_eps is not None and y_eps < 0 and c_eps is not None
+    pat_turnaround = y_pat is not None and y_pat < 0 and c_pat is not None
+
     # ─────────────────────────────────────────
-    # 1. EPS Surprise (15 pts)
+    # 1. EPS Surprise (15 pts, half on turnaround)
     # ─────────────────────────────────────────
 
-    s = band_score(eps_yoy, [
+    s = 0.0 if small_base else band_score(eps_yoy, [
         (100, 15),
         (70, 13),
         (50, 11),
@@ -579,18 +739,21 @@ def compute_pead_score(fin: dict):
         (5, 2),
     ])
 
+    if eps_turnaround:
+        s /= 2
+
     score += s
 
     bd["EPS Surprise"] = (
-        f"{eps_yoy:.1f}%" if eps_yoy is not None else "N/A",
+        growth_label(eps_yoy),
         f"{s:.1f}/15"
     )
 
     # ─────────────────────────────────────────
-    # 2. PAT Growth YoY (10 pts)
+    # 2. PAT Growth YoY (10 pts, half on turnaround)
     # ─────────────────────────────────────────
 
-    s = band_score(pat_yoy, [
+    s = 0.0 if small_base else band_score(pat_yoy, [
         (80, 10),
         (50, 8),
         (30, 6),
@@ -598,10 +761,13 @@ def compute_pead_score(fin: dict):
         (5, 2),
     ])
 
+    if pat_turnaround:
+        s /= 2
+
     score += s
 
     bd["PAT Growth YoY"] = (
-        f"{pat_yoy:.1f}%" if pat_yoy is not None else "N/A",
+        growth_label(pat_yoy),
         f"{s:.1f}/10"
     )
 
@@ -609,7 +775,7 @@ def compute_pead_score(fin: dict):
     # 3. Revenue Growth YoY (10 pts)
     # ─────────────────────────────────────────
 
-    s = band_score(rev_yoy, [
+    s = 0.0 if small_base else band_score(rev_yoy, [
         (50, 10),
         (30, 8),
         (20, 6),
@@ -620,7 +786,7 @@ def compute_pead_score(fin: dict):
     score += s
 
     bd["Revenue Growth YoY"] = (
-        f"{rev_yoy:.1f}%" if rev_yoy is not None else "N/A",
+        growth_label(rev_yoy),
         f"{s:.1f}/10"
     )
 
@@ -664,7 +830,7 @@ def compute_pead_score(fin: dict):
     # 5. Revenue QoQ Momentum (5 pts)
     # ─────────────────────────────────────────
 
-    s = band_score(rev_qoq, [
+    s = 0.0 if small_base else band_score(rev_qoq, [
         (25, 5),
         (15, 4),
         (10, 3),
@@ -674,7 +840,7 @@ def compute_pead_score(fin: dict):
     score += s
 
     bd["Revenue QoQ"] = (
-        f"{rev_qoq:.1f}%" if rev_qoq is not None else "N/A",
+        growth_label(rev_qoq),
         f"{s:.1f}/5"
     )
 
@@ -704,6 +870,12 @@ def compute_pead_score(fin: dict):
             f"{s:.1f}/5"
         )
 
+    if (eps_turnaround or pat_turnaround) and not small_base:
+        bd["Turnaround"] = (
+            "loss→profit",
+            "½ PAT/EPS"
+        )
+
     return round(score, 1), bd
 
 # ── TELEGRAM ─────────────────────────────────────────────────
@@ -730,9 +902,10 @@ def send_telegram(company,
     lines = [
 
         f"{emoji} <b>PEAD ALERT • {score}/50</b>",
+        *(["🔄 <b>TURNAROUND</b> (loss → profit)"] if "Turnaround" in bd else []),
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
 
-        f"🏢 <b>{company}</b>",
+        f"🏢 <b>{html.escape(company)}</b>",
         f"📌 BSE: <code>{scrip}</code>",
 
         "",
@@ -744,7 +917,7 @@ def send_telegram(company,
 
         "",
 
-        "📊 <b>QUARTERLY FINANCIALS (₹ Cr)</b>",
+        f"📊 <b>QUARTERLY FINANCIALS (₹ Cr, {html.escape(fin.get('basis', 'unknown'))})</b>",
 
         "<pre>"
 
@@ -802,7 +975,7 @@ def send_telegram(company,
         f"{'Factor':<28}{'Value':>12}{'Pts':>10}\n"
         f"{'-'*50}\n"
         + "\n".join(
-            f"{k[:27]:<28}{val:>12}{pts:>10}"
+            html.escape(f"{k[:27]:<28}{val:>12}{pts:>10}")
             for k, (val, pts) in bd.items()
         )
         + "</pre>",
@@ -814,15 +987,19 @@ def send_telegram(company,
         f"🔗 https://www.bseindia.com/stock-share-price/x/x/{scrip}/",
     ]
 
-    r = requests.post(
-        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-        json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": "\n".join(lines),
-            "parse_mode": "HTML",
-        },
-        timeout=10,
-    )
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": "\n".join(lines),
+                "parse_mode": "HTML",
+            },
+            timeout=10,
+        )
+    except requests.RequestException as e:
+        log.warning(f"  Telegram send failed: {e}")
+        return
 
     if r.status_code == 200:
         log.info("  ✅ Telegram sent")
@@ -831,6 +1008,69 @@ def send_telegram(company,
 
 
 # ── MAIN ─────────────────────────────────────────────────────
+
+def has_core_values(fin: dict) -> bool:
+    return (
+        fin["revenue_from_operations"][0] is not None and
+        fin["pat"][0] is not None
+    )
+
+def process_filing(ann, company, scrip, filing_type, exchange_dt) -> bool:
+    """Download, extract, score and alert. True only if financials were extracted."""
+    attach = ann.get("ATTACHMENTNAME") or ""
+
+    if not attach:
+        log.info("   No attachment"); return False
+
+    exchange_time = (
+        exchange_dt.strftime("%d %b %Y  %H:%M:%S") if exchange_dt else "N/A"
+    )
+    log.info(f"   Exchange time: {exchange_time}")
+
+    pdf = download_pdf(attach)
+    if not pdf:
+        log.info("   PDF download failed"); return False
+
+    pdf_mb = len(pdf) / (1024 * 1024)
+    log.info(f"   PDF: {pdf_mb:.1f} MB — extracting text…")
+    fin = extract_financials_claude(pdf)
+    if not fin:
+        log.info("   Could not extract financials"); return False
+
+    if not has_core_values(fin):
+        log.info("   Missing current-quarter revenue or PAT"); return False
+
+    score, bd = compute_pead_score(fin)
+
+    save_result_csv(company, scrip, score, fin)
+    log.info(f"   PEAD score: {score}")
+
+    if score >= PEAD_THRESHOLD:
+
+        log.info("   🚀 Above threshold! Sending alert…")
+
+        delay_text = "N/A"
+
+        if exchange_dt:
+            delay_seconds = int((datetime.now() - exchange_dt).total_seconds())
+            mins, secs = divmod(delay_seconds, 60)
+            delay_text = f"{mins}m {secs}s"
+
+        send_telegram(
+            company,
+            scrip,
+            score,
+            bd,
+            fin,
+            exchange_time,
+            datetime.now().strftime("%d %b %Y  %H:%M:%S"),
+            filing_type,
+            delay_text
+        )
+    else:
+        log.info(f"   Below {PEAD_THRESHOLD}, no alert")
+
+    return True
 
 def main():
     log.info("=" * 55)
@@ -841,10 +1081,11 @@ def main():
     initialize_csv()
 
     seen: set = load_seen()
-    processed_scrips = load_processed_scrips()
+    processed_scrips = load_processed_scrips()   # "{scrip}_{quarter}" keys
+    failed_attempts: dict = {}                   # fid → failures, this run only
 
     log.info(f"Loaded {len(seen)} previously seen filings")
-    log.info(f"Loaded {len(processed_scrips)} processed scrips")
+    log.info(f"Loaded {len(processed_scrips)} processed scrip-quarters")
 
     while True:
         filings = fetch_all_announcements()
@@ -854,94 +1095,62 @@ def main():
             fid     = str(ann.get("NEWSID") or ann.get("DT_TM") or "")
             company = ann.get("SLONGNAME") or ann.get("SNAME") or "Unknown"
             scrip   = str(ann.get("SCRIP_CD") or "")
-            attach  = ann.get("ATTACHMENTNAME") or ""
             category = ann.get("CATEGORYNAME", "")
-            
+
+            if not fid or fid in seen:
+                continue
+
             if category not in {
                 "Result",
                 "Board Meeting"
             }:
                 continue
-            
-            if scrip in processed_scrips:
-                log.info(
-                    f"   {scrip} already scanned before, skip"
-                )
-                continue
-            
+
             if category == "Board Meeting":
-                filing_type = "Board Meeting"
-            else:
-                filing_type = "Result"
-            
+                headline = announcement_headline(ann)
 
-            if not fid or fid in seen:
+                if not is_result_board_meeting(headline):
+                    log.info(f"→ Skip board meeting without results: {company} — {headline[:100]}")
+                    seen.add(fid)
+                    save_seen(seen)
+                    continue
+
+            exchange_dt = parse_exchange_time(ann)
+            quarter_key = f"{scrip}_{reporting_quarter((exchange_dt or datetime.now()).date())}"
+
+            if quarter_key in processed_scrips:
+                log.info(f"→ Skip {company}: {quarter_key} already scored")
+                seen.add(fid)
+                save_seen(seen)
                 continue
 
-            seen.add(fid)
-            save_seen(seen)
-
-            log.info(f"→ New: {company} ({scrip})")
-            if not attach:
-                log.info("   No attachment, skip"); continue
-
-            exchange_time = parse_exchange_time(ann)
-            log.info(f"   Exchange time: {exchange_time}")
-            
-            delay_text = "N/A"
+            log.info(f"→ New: {company} ({quarter_key}, {category})")
 
             try:
-
-                exchange_dt = datetime.strptime(
-                    exchange_time,
-                    "%d %b %Y  %H:%M:%S"
-                )
-
-                delay_seconds = int(
-                    (datetime.now() - exchange_dt).total_seconds()
-                )
-
-                mins, secs = divmod(delay_seconds, 60)
-
-                delay_text = f"{mins}m {secs}s"
-
+                ok = process_filing(ann, company, scrip, category, exchange_dt)
             except Exception:
-                pass
+                log.exception("   Unexpected error processing filing")
+                ok = False
 
-            pdf = download_pdf(attach)
-            if not pdf:
-                log.info("   PDF download failed"); continue
+            if ok:
+                processed_scrips.add(quarter_key)
+                save_processed_scrips(processed_scrips)
+                seen.add(fid)
+                save_seen(seen)
+                failed_attempts.pop(fid, None)
+                continue
 
-            pdf_mb = len(pdf) / (1024 * 1024)
-            log.info(f"   PDF: {pdf_mb:.1f} MB — extracting text…")
-            fin = extract_financials_claude(pdf)
-            if not fin:
-                log.info("   Could not extract financials"); continue
+            failed_attempts[fid] = failed_attempts.get(fid, 0) + 1
 
-            score, bd = compute_pead_score(fin)
-
-            processed_scrips.add(scrip)
-            save_processed_scrips(processed_scrips)
-
-            save_result_csv(company, scrip, score, fin)
-            log.info(f"   PEAD score: {score}")
-
-            if score >= PEAD_THRESHOLD:
-                
-                log.info("   🚀 Above threshold! Sending alert…")
-                send_telegram(
-                    company,
-                    scrip,
-                    score,
-                    bd,
-                    fin,
-                    exchange_time,
-                    datetime.now().strftime("%d %b %Y  %H:%M:%S"),
-                    filing_type,
-                    delay_text
-                )
+            if failed_attempts[fid] > MAX_RETRIES:
+                log.info(f"   Giving up after {failed_attempts[fid]} attempts")
+                seen.add(fid)
+                save_seen(seen)
             else:
-                log.info(f"   Below {PEAD_THRESHOLD}, no alert")
+                log.info(
+                    f"   Will retry next poll "
+                    f"({failed_attempts[fid]}/{MAX_RETRIES} retries used)"
+                )
 
         log.info(f"Sleeping {POLL_INTERVAL_SEC}s…\n")
         time.sleep(POLL_INTERVAL_SEC)
