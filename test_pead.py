@@ -9,6 +9,7 @@ The PDF tests use the real pdfplumber, Poppler and Tesseract (~30s of OCR).
 import csv
 import io
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -61,6 +62,19 @@ class FakeResponse:
         if self.status_code >= 400:
             raise pt.requests.HTTPError(str(self.status_code))
 
+class LogCapture(logging.Handler):
+    """Collects pead_tool log messages inside a `with` block."""
+    def __enter__(self):
+        self.messages = []
+        pt.log.addHandler(self)
+        return self
+    def __exit__(self, *exc):
+        pt.log.removeHandler(self)
+    def emit(self, record):
+        self.messages.append(record.getMessage())
+    def has(self, text):
+        return any(text in m for m in self.messages)
+
 ACCESS_DENIED = FakeResponse(403, text="<HTML><TITLE>Access Denied</TITLE>You don't have permission</HTML>")
 
 def mk(**kw):
@@ -93,18 +107,24 @@ check("filing_quarter ignores future period_end", pt.filing_quarter({"period_end
 section("board meeting filter")
 
 for h, want in [
-    ("Board Meeting Outcome for Outcome Of Board Meeting - Unaudited Financial Results For Quarter Ended 30.06.2026", True),
-    ("Intimation of Outcome of Board Meeting held today - Financial Results", True),
-    ("Board Meeting Intimation for Considering And Approving Unaudited Financial Results", False),
-    ("Board Meeting Outcome for Fund Raising By Way Of QIP", False),
-    ("Board Meeting Outcome for Declaration Of Interim Dividend", False),
-    ("Board Meeting Outcome for Dividend And Financial Results", True),
-    ("Outcome of Board Meeting - Date of AGM", False),
-    ("Closure of Trading Window", False),
-    ("Outcome of Board Meeting Reliance Industries Limited has informed the Exchange that the Board approved the financial results", True),
-    ("", False),
+    ("Board Meeting Outcome for Outcome Of Board Meeting - Unaudited Financial Results For Quarter Ended 30.06.2026", "results"),
+    ("Intimation of Outcome of Board Meeting held today - Financial Results", "results"),
+    ("Board Meeting Intimation for Considering And Approving Unaudited Financial Results", "intimation"),
+    ("Transport Corporation of India Ltd - 532349 - Board Meeting Intimation for Prior Intimation Of The Meeting", "intimation"),
+    ("Board Meeting Outcome for Fund Raising By Way Of QIP", "ambiguous"),
+    ("Board Meeting Outcome for Declaration Of Interim Dividend", "ambiguous"),
+    ("Board Meeting Outcome for Dividend And Financial Results", "results"),
+    ("Outcome of Board Meeting - Date of AGM", "ambiguous"),
+    ("Board Meeting - Financial Results for the quarter ended 30.06.2026", "results"),
+    ("Closure of Trading Window", "other"),
+    ("Outcome of Board Meeting Reliance Industries Limited has informed the Exchange that the Board approved the financial results", "results"),
+    # Headlines from the 2026-09-24 live log that used to be skipped outright
+    ("GACM Technologies Ltd - 531723 - Board Meeting Outcome for Meeting Held On Thursday, September 24, 2026 Outcome of Board Meeting", "ambiguous"),
+    ("Saraswati Saree Depot Ltd - 544230 - Board Meeting Outcome for Outcome Of Board Meeting Held Today I.E Thursday, September 24, 2026", "ambiguous"),
+    ("", "other"),
 ]:
-    check(f"bm filter: {h[:60]!r}", pt.is_result_board_meeting(h) == want)
+    got = pt.board_meeting_kind(h)
+    check(f"bm kind {want:<10} {h[:60]!r}", got == want, got)
 
 # ─────────────────────────────────────────────────────────────
 section("exchange normalisation")
@@ -129,7 +149,7 @@ check("NSE isin", g["isin"] == "INE101A01026")
 check("NSE category mapped", g["category"] == "Board Meeting")
 check("NSE headline fields", g["headline_fields"] == ["desc", "attchmntText"])
 check("NSE time from exchdisstime", g["exchange_dt"] == datetime(2026, 9, 24, 17, 31, 5))
-check("NSE headline passes filter", pt.is_result_board_meeting(g["headline"]))
+check("NSE headline -> results", pt.board_meeting_kind(g["headline"]) == "results")
 check("NSE result desc -> Result", pt.nse_category("Financial Result Updates") == "Result")
 check("NSE other desc unchanged", pt.nse_category("Change in Director(s)") == "Change in Director(s)")
 check("NSE bad isin -> None", pt.normalise_nse({"sm_isin": "junk"})["isin"] is None)
@@ -142,20 +162,30 @@ REAL_BSE_INTIMATION = {'NEWSID': '36d890d0-cf3f-499d-85b2-0b7633d543e6', 'SCRIP_
 REAL_NSE_RESULT = {'an_dt': '24-Sep-2026 20:30:02', 'attFileSize': '7.43 MB', 'attchmntFile': 'https://nsearchives.nseindia.com/corporate/ESDS_24092026202831_ESDS_BM_Outcome_BSE_NSE_Intimation.pdf', 'attchmntText': 'ESDS Software Solution Limited has submitted to the Exchange, the financial results for the period ended Jun 30, 2026.', 'bflag': None, 'csvName': None, 'desc': 'Outcome of Board Meeting', 'difference': '00:00:01', 'dt': '24092026203002', 'exchdisstime': '24-Sep-2026 20:30:03', 'fileSize': '7.43 MB', 'hasXbrl': True, 'old_new': None, 'orgid': None, 'seq_id': '106792297', 'smIndustry': None, 'sm_isin': 'INE0DRI01029', 'sm_name': 'ESDS Software Solution Limited', 'sort_date': '2026-09-24 20:30:02', 'symbol': 'ESDS'}
 REAL_NSE_OTHER_OUTCOME = {'an_dt': '24-Sep-2026 12:36:57', 'attchmntFile': 'https://nsearchives.nseindia.com/corporate/GLOBAL_24092026123634_Outcoem_of_Baord_Meeting_24092026.pdf', 'attchmntText': 'Global Education Limited has informed the Exchange regarding Outcome of Board Meeting held on September 24, 2026.', 'desc': 'Outcome of Board Meeting', 'exchdisstime': '24-Sep-2026 12:36:58', 'seq_id': '106790850', 'sm_isin': 'INE291W01011', 'sm_name': 'Global Education Limited', 'sort_date': '2026-09-24 12:36:57', 'symbol': 'GLOBAL'}
 REAL_NSE_NO_ATTACHMENT = {'an_dt': '24-Sep-2026 17:41:45', 'attchmntFile': '-', 'attchmntText': 'Significant increase in volume has been observed in Dc Infotech And Communication Limited.', 'desc': 'Spurt in Volume', 'exchdisstime': '24-Sep-2026 17:41:46', 'seq_id': '106791782', 'sm_isin': 'INE0A1101019', 'sm_name': 'DC Infotech and Communication Limited', 'symbol': 'DCI'}
+# Both were skipped by headline in the live run; their PDFs (preferential allotment,
+# interim dividend) indeed have no results table
+REAL_BSE_GACM = {'NEWSID': '89e47c89-06e0-482d-9615-ae037068d044', 'SCRIP_CD': 531723, 'SLONGNAME': 'GACM Technologies Ltd', 'NEWSSUB': 'Board Meeting Outcome for Meeting Held On Thursday, September 24, 2026', 'HEADLINE': 'OUTCOME FOR MEETING OF THE BOARD OF DIRECTORS HELD ON THURSDAY, SEPTEMBER 24, 2026', 'MORE': '', 'SUBCATNAME': 'Outcome of Board Meeting', 'CATEGORYNAME': 'Board Meeting', 'DT_TM': '2026-09-24T13:38:56.833', 'ATTACHMENTNAME': '9c3460b1-c215-4933-a5d4-1e9ea79f2907.pdf'}
+REAL_BSE_SARASWATI = {'NEWSID': '0eff5578-1c84-437f-83f8-d9be6c665d99', 'SCRIP_CD': 544230, 'SLONGNAME': 'Saraswati Saree Depot Ltd', 'NEWSSUB': 'Board Meeting Outcome for Outcome Of Board Meeting Held Today I.E Thursday, September 24, 2026', 'HEADLINE': 'The Board at its meeting held today declared and approved Interim dividend of Rs 3 (30%) per equity share of Rs 10 each for the financial year 2026-27.', 'MORE': '', 'SUBCATNAME': 'Outcome of Board Meeting', 'CATEGORYNAME': 'Board Meeting', 'DT_TM': '2026-09-24T16:40:36.453', 'ATTACHMENTNAME': '9a9b5888-bd45-4b49-9105-785ab453ffc5.pdf'}
 REAL_BSE_MASTER_ROW = {'SCRIP_CD': '500002', 'Scrip_Name': 'ABB India Ltd', 'Status': 'Active', 'GROUP': 'A', 'FACE_VALUE': '2.00', 'ISIN_NUMBER': 'INE117A01022', 'INDUSTRY': None, 'scrip_id': 'ABB', 'Segment': 'Equity', 'NSURL': 'https://www.bseindia.com/stock-share-price/abb-india-ltd/abb/500002/', 'Issuer_Name': 'ABB India Limited', 'Mktcap': '150772.81'}
 
 b = pt.normalise_bse(REAL_BSE_OUTCOME)
 check("real BSE outcome: id/code/category", b["id"] == "BSE:1b933ea0-6848-4e29-9436-5b1b0dd40cb4" and b["code"] == "544898" and b["category"] == "Board Meeting")
 check("real BSE outcome: headline fields", b["headline_fields"] == ["NEWSSUB", "HEADLINE", "SUBCATNAME"], b["headline_fields"])
-check("real BSE outcome passes filter", pt.is_result_board_meeting(b["headline"]))
+check("real BSE outcome -> results", pt.board_meeting_kind(b["headline"]) == "results")
 check("real BSE time (2-digit fraction)", b["exchange_dt"] == datetime(2026, 9, 24, 20, 37, 48, 960000))
-check("real BSE intimation fails filter", not pt.is_result_board_meeting(pt.normalise_bse(REAL_BSE_INTIMATION)["headline"]))
+alfa = pt.normalise_bse(REAL_BSE_INTIMATION)
+check("real BSE intimation -> intimation", pt.board_meeting_kind(alfa["headline"]) == "intimation")
+check("truncated HEADLINE replaced by full MORE text", alfa["headline_fields"] == ["NEWSSUB", "MORE", "SUBCATNAME"]
+      and "Appointment of Company Secretary" in alfa["headline"] and "...." not in alfa["headline"], alfa["headline_fields"])
+for real in (REAL_BSE_GACM, REAL_BSE_SARASWATI):
+    rf = pt.normalise_bse(real)
+    check(f"real {rf['company']} outcome -> ambiguous", pt.board_meeting_kind(rf["headline"]) == "ambiguous", rf["headline"])
 check("BSE category whitespace stripped", pt.normalise_bse({"NEWSID": "x", "CATEGORYNAME": " Corp Action"})["category"] == "Corp Action")
 n = pt.normalise_nse(REAL_NSE_RESULT)
 check("real NSE result: id/isin/category/time", n["id"] == "NSE:106792297" and n["isin"] == "INE0DRI01029"
       and n["category"] == "Board Meeting" and n["exchange_dt"] == datetime(2026, 9, 24, 20, 30, 3))
-check("real NSE result passes filter", pt.is_result_board_meeting(n["headline"]))
-check("real NSE non-result outcome fails filter", not pt.is_result_board_meeting(pt.normalise_nse(REAL_NSE_OTHER_OUTCOME)["headline"]))
+check("real NSE result -> results", pt.board_meeting_kind(n["headline"]) == "results")
+check("real NSE vague outcome -> ambiguous", pt.board_meeting_kind(pt.normalise_nse(REAL_NSE_OTHER_OUTCOME)["headline"]) == "ambiguous")
 check("NSE '-' attachment treated as none", pt.normalise_nse(REAL_NSE_NO_ATTACHMENT)["attachment_url"] == "")
 with mock.patch.object(pt.requests, "get", lambda *a, **k: FakeResponse(200, [REAL_BSE_MASTER_ROW])):
     check("real BSE master row parsed", pt.fetch_bse_master() == {"500002": "INE117A01022"})
@@ -198,32 +228,53 @@ row = lambda i: {"NEWSID": f"n{i}", "SCRIP_CD": i, "CATEGORYNAME": "Result", "DT
 known = set()
 get, calls = bse_pages({1: [row(1), row(2), row(3)], 2: [row(4), row(5), row(6)], 3: []})
 with mock.patch.object(pt.requests, "get", get), mock.patch.object(pt.time, "sleep"):
-    got = pt.fetch_bse_filings(known)
-check("first poll reads until empty page", calls == [1, 2, 3] and len(got) == 6, calls)
+    got, pages = pt.fetch_bse_filings(known)
+check("first poll reads until empty page", calls == [1, 2, 3] and len(got) == 6 and pages == 3, (calls, pages))
 
 get, calls = bse_pages({1: [row(0), row(1), row(2)], 2: [row(3), row(4), row(5)], 3: [row(6)]})
 with mock.patch.object(pt.requests, "get", get), mock.patch.object(pt.time, "sleep"):
-    got = pt.fetch_bse_filings(known)
+    got, pages = pt.fetch_bse_filings(known)
 check("later poll stops at first page with nothing new", calls == [1, 2] and [f["id"] for f in got] == ["BSE:n0"], calls)
+
+get, calls = bse_pages({1: [row(0), row(1)]})
+with mock.patch.object(pt.requests, "get", get):
+    got, pages = pt.fetch_bse_filings(known)
+check("quiet poll: 0 new, 1 page read", got == [] and pages == 1 and calls == [1])
 
 counter = iter(range(100000))
 def endless(url, headers=None, timeout=None):
     return FakeResponse(200, {"Table": [row(next(counter)) for _ in range(3)]})
 with mock.patch.object(pt.requests, "get", endless), mock.patch.object(pt.time, "sleep"):
-    got = pt.fetch_bse_filings(set())
-check("pagination capped", len(got) == 3 * pt.BSE_MAX_PAGES, len(got))
+    got, pages = pt.fetch_bse_filings(set())
+check("pagination capped", len(got) == 3 * pt.BSE_MAX_PAGES and pages == pt.BSE_MAX_PAGES, len(got))
 
 paged = lambda i: dict(row(i), TotalPageCnt=2)
 get, calls = bse_pages({1: [paged(1), paged(2)], 2: [paged(3), paged(4)], 3: [paged(5)]})
 with mock.patch.object(pt.requests, "get", get), mock.patch.object(pt.time, "sleep"):
-    got = pt.fetch_bse_filings(set())
-check("stops at TotalPageCnt without requesting further", calls == [1, 2] and len(got) == 4, calls)
+    got, pages = pt.fetch_bse_filings(set())
+check("stops at TotalPageCnt without requesting further", calls == [1, 2] and len(got) == 4 and pages == 2, calls)
 
 shifted = {1: [row(10), row(11)], 2: [row(11), row(12)], 3: []}   # a new filing pushed row 11 down
 get, calls = bse_pages(shifted)
 with mock.patch.object(pt.requests, "get", get), mock.patch.object(pt.time, "sleep"):
-    got = pt.fetch_bse_filings(set())
+    got, pages = pt.fetch_bse_filings(set())
 check("rows shifted between pages aren't duplicated", [f["id"] for f in got] == ["BSE:n10", "BSE:n11", "BSE:n12"])
+
+def flaky(url, headers=None, timeout=None):
+    page = int(url.split("pageno=")[1].split("&")[0])
+    if page == 2:
+        raise pt.requests.ConnectionError("reset")
+    return FakeResponse(200, {"Table": [row(100 + page)]})
+with mock.patch.object(pt.requests, "get", flaky), mock.patch.object(pt.time, "sleep"):
+    got, pages = pt.fetch_bse_filings(set())
+check("later page failing keeps earlier pages", [f["id"] for f in got] == ["BSE:n101"] and pages == 1, (got, pages))
+
+with mock.patch.object(pt.requests, "get", side_effect=pt.requests.ConnectionError("down")):
+    try:
+        pt.fetch_bse_filings(set())
+        check("page-1 failure raises (not '0 new')", False)
+    except pt.requests.ConnectionError:
+        check("page-1 failure raises (not '0 new')", True)
 
 with mock.patch.object(pt.requests, "get", lambda *a, **k: ACCESS_DENIED):
     try:
@@ -457,7 +508,7 @@ def run_main(polls, bse=lambda known: [], nse=lambda client: [], extract=None, m
         if counter["n"] >= polls:
             raise Stop()
     alerts = []
-    with mock.patch.object(pt, "fetch_bse_filings", bse), \
+    with mock.patch.object(pt, "fetch_bse_filings", lambda known: (bse(known), 1)), \
          mock.patch.object(pt, "fetch_nse_filings", nse), \
          mock.patch.object(pt, "fetch_bse_master", lambda: dict((master or {}).get("bse", {}))), \
          mock.patch.object(pt, "fetch_nse_master", lambda client: dict((master or {}).get("nse", {}))), \
@@ -472,11 +523,15 @@ def run_main(polls, bse=lambda known: [], nse=lambda client: [], extract=None, m
             pass
     return alerts
 
+ambiguous_calls = []
+
 def counting_extract(behaviour):
     calls = {}
-    def extract(pdf):
+    def extract(pdf, ambiguous=False):
         name = pdf.decode()[len("%PDF-"):]
         calls[name] = calls.get(name, 0) + 1
+        if ambiguous:
+            ambiguous_calls.append(name)
         result = behaviour[name]
         if isinstance(result, Exception):
             raise result
@@ -560,6 +615,56 @@ no_retries = not os.path.exists(pt.RETRIES_FILE) or json.load(open(pt.RETRIES_FI
 check("no-table filing: one attempt, seen, no retry", calls == {no_table["attachment_url"]: 1} and "BSE:t1" in seen and no_retries, calls)
 check("non-PDF attachment skipped, model never called", "NSE:z1" in seen and zipped["attachment_url"] not in calls)
 check("skipped filings not processed", not set(json.load(open(pt.PROCESSED_SCRIPS_FILE))))
+
+# Ambiguous outcomes: PDF checked for a results table; model only if found
+fresh_state_dir()
+ambiguous_calls.clear()
+gacm = pt.normalise_bse(REAL_BSE_GACM)
+saraswati = pt.normalise_bse(REAL_BSE_SARASWATI)
+vague_nse = pt.normalise_nse(REAL_NSE_OTHER_OUTCOME)
+alfa = pt.normalise_bse(REAL_BSE_INTIMATION)
+extract, calls = counting_extract({
+    gacm["attachment_url"]: pt.SkipFiling("no results table found"),        # like the real PDF
+    saraswati["attachment_url"]: pt.SkipFiling("no results table found"),   # like the real PDF
+    vague_nse["attachment_url"]: good_fin,                                   # results inside
+})
+with LogCapture() as logs:
+    alerts = run_main(2, bse=lambda k: [gacm, saraswati, alfa], nse=lambda c: [vague_nse], extract=extract)
+seen = set(json.load(open(pt.SEEN_FILE)))
+check("ambiguous outcomes are downloaded and checked, flagged ambiguous",
+      sorted(ambiguous_calls) == sorted([gacm["attachment_url"], saraswati["attachment_url"], vague_nse["attachment_url"]]), ambiguous_calls)
+check("ambiguous without table: once, seen, no retry",
+      calls[gacm["attachment_url"]] == 1 and calls[saraswati["attachment_url"]] == 1
+      and {gacm["id"], saraswati["id"]} <= seen and not os.path.exists(pt.RETRIES_FILE))
+check("ambiguous with table: scored and alerted", alerts == ["NSE:Global Education Limited"], alerts)
+check("intimation still skipped by headline", alfa["attachment_url"] not in calls and alfa["id"] in seen)
+check("log says ambiguous outcome is being checked", logs.has("ambiguous outcome, checking PDF for a results table"))
+check("skip log names the reason", logs.has("→ Skip BSE board meeting (intimation): Alfa Ica India Ltd"))
+
+# Poll logs distinguish "0 new" from a failed fetch
+fresh_state_dir()
+with LogCapture() as logs:
+    run_main(1)
+check("quiet poll logged as fetch OK", logs.has("BSE: 0 new announcements (fetch OK, 1 page read)")
+      and logs.has("NSE: 0 new announcements (fetch OK, 0 today)"), logs.messages)
+def bse_down(known):
+    raise pt.requests.ConnectionError("connection reset")
+with LogCapture() as logs:
+    run_main(1, bse=bse_down)
+check("failed BSE fetch logged as FAILED, not 0", logs.has("BSE: fetch FAILED (connection reset)")
+      and not logs.has("BSE: 0 new"), logs.messages)
+with LogCapture() as logs:
+    run_main(2, nse=lambda c: [vague_nse], extract=lambda pdf, ambiguous=False: None)
+check("NSE counts only new filings on later polls",
+      logs.has("NSE: 1 new announcements (fetch OK, 1 today)") and logs.has("NSE: 0 new announcements (fetch OK, 1 today)"))
+
+# Startup reports processed-key migration
+fresh_state_dir()
+pt.save_processed_scrips({"531694_Q4FY26", "532386_Q1FY27", "BSE-509084_Q4FY26", "INE0DRI01029_Q1FY27"})
+with LogCapture() as logs:
+    run_main(1, master={"bse": {"531694": "INE111A01011", "532386": "INE222A01011"}, "nse": {}})
+check("migration logged", logs.has("Migrated 2 processed keys to ISIN format"), logs.messages)
+check("keys still without ISIN listed", logs.has("Processed keys still without ISIN: BSE-509084_Q4FY26"))
 
 # Pending retries come back even when the exchange stops returning the filing
 fresh_state_dir()
@@ -733,6 +838,43 @@ with mock.patch.object(pt.client.chat.completions, "create", fake_create):
         check("no results table -> SkipFiling, model not called", False)
     except pt.SkipFiling as e:
         check("no results table -> SkipFiling, model not called", str(e) == "no results table found" and not sent_requests, str(e))
+
+    sent_requests.clear()
+    with LogCapture() as logs:
+        pt.extract_financials(text_pdf(PAGES), ambiguous=True)
+    check("ambiguous with table: logged found, model called", logs.has("Ambiguous outcome → results table found") and len(sent_requests) == 1)
+
+    sent_requests.clear()
+    with LogCapture() as logs:
+        try:
+            pt.extract_financials(text_pdf([COVER, NOTES]), ambiguous=True)
+            skipped = False
+        except pt.SkipFiling:
+            skipped = True
+    check("ambiguous without table: logged not found, skipped, no model call",
+          skipped and logs.has("Ambiguous outcome → results table not found") and not sent_requests)
+
+    ocr_seen = []
+    def fake_ocr(pdf_bytes, page_num):
+        ocr_seen.append(page_num)
+        return ""
+    blank12 = text_pdf([["."]] * 12)
+    with mock.patch.object(pt, "ocr_page", fake_ocr):
+        for ambiguous, want in [(True, list(range(1, 9))), (False, list(range(1, 13)))]:
+            ocr_seen.clear()
+            try:
+                pt.extract_financials(blank12, ambiguous=ambiguous)
+            except pt.SkipFiling:
+                pass
+            check(f"scanned PDF OCR pages ({'ambiguous, capped at 8' if ambiguous else 'normal'})", ocr_seen == want, ocr_seen)
+
+        hybrid12 = text_pdf([COVER] + [["."]] * 11)      # enough text overall, 11 near-empty pages
+        ocr_seen.clear()
+        try:
+            pt.extract_financials(hybrid12, ambiguous=True)
+        except pt.SkipFiling:
+            pass
+        check("hybrid PDF low-text OCR also capped for ambiguous", ocr_seen == list(range(2, 9)), ocr_seen)
 
     sent_requests.clear()
     try:

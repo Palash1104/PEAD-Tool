@@ -33,6 +33,8 @@ Each poll, `main()` calls `poll_exchanges()`, then `handle_filing()` for each fi
      - Verified 2026-09-24: 50 rows per page, newest first, and an out-of-range page returns an empty `Table`. A busy day runs 30+ pages.
      - BSE returns **403 unless `HEADERS` includes `Origin` and `Accept`**. User-Agent and Referer alone stopped working, for both the API and the scrip master. PDF downloads work either way.
    - **NSE**: `fetch_nse_filings(NseClient)` calls `/api/corporate-announcements` for today. `NseClient` primes cookies from the NSE homepage and re-primes once on 401/403.
+   - `fetch_bse_filings` returns `(new filings, pages read)`. A page-1 failure raises; a later page failing keeps the earlier pages.
+   - Poll logs read "BSE: N new announcements (fetch OK, P pages read)" and "NSE: N new announcements (fetch OK, M today)". A failure logs "BSE/NSE: fetch FAILED (…)", so a quiet poll and a failed one look different.
    - An Access Denied, 401 or 403 response raises `ExchangeBlocked`. `warn_blocked()` then logs an error every poll and sends Telegram at most every `BLOCKED_ALERT_SEC` per exchange. A block is never treated as zero announcements.
    - Filings from both exchanges plus pending ones are sorted oldest first, so whichever exchange published first is processed.
 2. **Normalise**: `normalise_bse` and `normalise_nse` produce one shared filing dict:
@@ -41,8 +43,12 @@ Each poll, `main()` calls `poll_exchanges()`, then `handle_filing()` for each fi
    - `headline` plus the `headline_fields` it came from, `attachment_url`, `exchange_dt`
 3. **Filter** (`handle_filing`)
    - Skip filings already in `seen`. The category must be "Result" or "Board Meeting".
-   - Board Meeting filings must pass `is_result_board_meeting()`: "outcome" plus the word result(s).
-   - Headline sources are BSE `NEWSSUB`/`HEADLINE`/`SUBCATNAME` and NSE `desc`/`attchmntText`. Which fields were used is logged.
+   - Board Meeting filings are classified by `board_meeting_kind()` on the **full** headline:
+     - "intimation" ("intimation" and no "outcome"): skip
+     - "results" (the word result(s)): process normally
+     - "ambiguous" ("outcome" without a result word, e.g. "Outcome of Board Meeting held today"): download and process only if the PDF has a results table, with OCR capped at `AMBIGUOUS_OCR_PAGES` (8). Logged as "Ambiguous outcome → results table found / not found".
+     - "other": skip
+   - Headline sources are BSE `NEWSSUB` + `MORE` (the full text when set; `HEADLINE` is cut at about 190 chars with "....") + `SUBCATNAME`, and NSE `desc`/`attchmntText`. Which fields were used is logged. Skip log lines shorten the headline to 120 chars with "…", but the filter itself always reads the full text.
    - Verified against live data on 2026-09-24, as were `seq_id`, `sm_isin`, `exchdisstime` and BSE `NEWSID`/`DT_TM`. `test_pead.py` has real captured rows as fixtures.
    - NSE files results under desc "Outcome of Board Meeting", with the standard text "…has submitted to the Exchange, the financial results for the period ended…".
    - NSE's generic "…Outcome of Board Meeting held on <date>" filings are non-result outcomes, such as buybacks.
@@ -99,7 +105,7 @@ Growth is `_pct(curr, prev) = (curr - prev) / abs(prev) * 100`. `band_score` awa
 | File | Purpose | Git |
 |---|---|---|
 | `seen.json` | Filing ids finished with. Bare legacy ids load as `BSE:` ids. | ignored |
-| `processed_scrips.json` | `{ISIN}_{quarter}` keys (or the `{EXCHANGE}-{code}_{quarter}` fallback). `migrate_processed_keys()` upgrades legacy or fallback keys at startup and at the daily master refresh. | **tracked** |
+| `processed_scrips.json` | `{ISIN}_{quarter}` keys (or the `{EXCHANGE}-{code}_{quarter}` fallback). `migrate_processed_keys()` upgrades legacy or fallback keys at startup and at the daily master refresh. It logs "Migrated N processed keys to ISIN format" and lists the keys still without an ISIN. `BSE-509084_Q4FY26` (Photon Capital) is not in BSE's active scrip list. | **tracked** |
 | `retry_counts.json` | filing id → failed attempts | ignored |
 | `scrip_master.json` | `{"bse": {code: ISIN}, "nse": {symbol: ISIN}, "updated"}` | ignored |
 | `pead_results.csv` | One row per scored filing | ignored |
@@ -131,7 +137,7 @@ Growth is `_pct(curr, prev) = (curr - prev) / abs(prev) * 100`. `band_score` awa
 
 - NSE SME announcements (`index=sme`) are not polled.
 - `nse_category` maps any NSE desc containing "financial result" to "Result", but no such desc was seen on 2026-09-24; results came as "Outcome of Board Meeting".
-- BSE `HEADLINE` can be truncated at about 190 chars; the full text is in `MORE`, which the filter doesn't read. This was fine on 2026-09-24 because outcome headlines are short.
+- Ambiguous outcomes cost one PDF download each (no model call unless a table is found). In results season that could mean hundreds of downloads a day.
 - Announcements are fetched for today only, so filings just before midnight can be missed on a restart.
 - The emoji tiers are hardcoded, and `send_telegram` calls `estimate_ebitda` 7 times.
 - The CSV lacks filing id, headline, basis, period and score-version columns. State writes aren't atomic, and `requirements.txt` is unpinned.

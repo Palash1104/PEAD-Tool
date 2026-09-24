@@ -256,7 +256,7 @@ BSE_MASTER_URL = (
     "?Group=&Scripcode=&industry=&segment=Equity&status=Active"
 )
 BSE_MAX_PAGES = 100       # safety cap; pages are 50 rows and rows carry TotalPageCnt
-BSE_HEADLINE_FIELDS = ["NEWSSUB", "HEADLINE", "SUBCATNAME"]
+BSE_HEADLINE_FIELDS = ["NEWSSUB", "HEADLINE", "MORE", "SUBCATNAME"]
 BSE_TIME_FIELDS = ["EXCHANGE_RECEIVED_TIME", "NEWS_DT", "DT_TM", "DTTM"]
 
 NSE_HOME = "https://www.nseindia.com/"
@@ -330,7 +330,9 @@ def headline_from(row: dict, fields: list) -> tuple:
     return " ".join(str(row[f]).strip() for f in used), used
 
 def normalise_bse(row: dict) -> dict:
-    headline, fields = headline_from(row, BSE_HEADLINE_FIELDS)
+    # HEADLINE is cut off at ~190 chars ("...."); MORE, when set, is the full text
+    body = "MORE" if str(row.get("MORE") or "").strip() else "HEADLINE"
+    headline, fields = headline_from(row, ["NEWSSUB", body, "SUBCATNAME"])
     raw_id = row.get("NEWSID") or row.get("DT_TM")
     attach = row.get("ATTACHMENTNAME") or ""
 
@@ -388,12 +390,15 @@ def fetch_bse_page(page: int, day: date) -> list:
     r.raise_for_status()
     return r.json().get("Table") or []
 
-def fetch_bse_filings(known_ids: set) -> list:
+def fetch_bse_filings(known_ids: set) -> tuple:
     """Today's new BSE announcements, newest first, paging until a page has
     no new rows or the last page (TotalPageCnt) is reached.
+    Returns (new filings, pages read).
 
     known_ids holds the NEWSIDs fetched on earlier polls and is updated in
     place, so a normal poll reads page 1 and one page of already-known rows.
+    A failure on page 1 raises (nothing was read); a later page failing keeps
+    what the earlier pages returned.
     """
     today = date.today()
     filings = []
@@ -407,7 +412,10 @@ def fetch_bse_filings(known_ids: set) -> list:
         except ExchangeBlocked:
             raise
         except Exception as e:
-            log.warning(f"BSE announcements page {page} failed: {e}")
+            if page == 1:
+                raise
+            log.warning(f"BSE: page {page} failed ({e}); keeping {len(filings)} new announcements from earlier pages")
+            page -= 1
             break
 
         new_rows = [
@@ -430,7 +438,7 @@ def fetch_bse_filings(known_ids: set) -> list:
     else:
         log.warning(f"BSE: stopped at the {BSE_MAX_PAGES}-page cap, older filings may be missed")
 
-    return filings
+    return filings, page
 
 def fetch_nse_filings(nse: NseClient) -> list:
     r = nse.get(NSE_ANN_URL.format(date=date.today().strftime("%d-%m-%Y")))
@@ -474,15 +482,28 @@ def warn_blocked(exchange: str, detail: str):
             f"(Repeats at most hourly.)"
         )
 
-def is_result_board_meeting(headline: str) -> bool:
-    """Board Meeting filings only count when they are an outcome with results.
+RESULT_WORD_RE = re.compile(r"\bresults?\b")
 
-    Intimations, trading window, AGM and dividend notices are dropped unless
-    they also mention results, which the result-keyword requirement already
-    enforces ("Intimation of outcome ... financial results" is a real result).
+def board_meeting_kind(headline: str) -> str:
+    """How to treat a Board Meeting filing, judged on its full headline text.
+
+      "intimation" — notice of a future meeting (no "outcome"): skip
+      "results"    — mentions results: process as a result filing
+      "ambiguous"  — an outcome that doesn't say what was decided ("Outcome of
+                     Board Meeting held today"): process only if the PDF has a
+                     results table, and cap OCR at AMBIGUOUS_OCR_PAGES
+      "other"      — neither an outcome nor results: skip
     """
     text = headline.lower()
-    return "outcome" in text and re.search(r"\bresults?\b", text) is not None
+    has_outcome = "outcome" in text
+
+    if "intimation" in text and not has_outcome:
+        return "intimation"
+    if RESULT_WORD_RE.search(text):
+        return "results"
+    if has_outcome:
+        return "ambiguous"
+    return "other"
 
 # ── QUARTERS, SCRIP MASTER & DEDUP KEYS ──────────────────────
 
@@ -723,6 +744,7 @@ PERIOD_END_FORMATS = [
 ]
 
 MAX_PDF_PAGES       = 25
+AMBIGUOUS_OCR_PAGES = 8     # OCR budget for outcomes whose headline names no results
 MIN_TEXT_CHARS      = 500   # whole PDF below this → treat as scanned, OCR it all
 LOW_TEXT_PAGE_CHARS = 200   # no table in text layer → OCR pages below this
 HEADING_LINES       = 20    # a result table's title sits near the top of its page
@@ -822,10 +844,11 @@ def ocr_pages(pdf_bytes: bytes, page_texts: list, indices: list) -> list:
 
     return page_texts
 
-def get_result_text(pdf_bytes: bytes) -> tuple:
+def get_result_text(pdf_bytes: bytes, ocr_page_limit: int = MAX_PDF_PAGES) -> tuple:
     """Text of the result table pages to send to the model: (text, reason).
 
     text is None when no page passes the results-table check, even after OCR.
+    Only the first ocr_page_limit pages are ever OCR'd.
     """
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         page_count = min(len(pdf.pages), MAX_PDF_PAGES)
@@ -838,7 +861,7 @@ def get_result_text(pdf_bytes: bytes) -> tuple:
 
     if real_chars < MIN_TEXT_CHARS:
         log.info(f"    Only {real_chars} chars of text layer, OCR-ing the whole PDF...")
-        page_texts = ocr_pages(pdf_bytes, page_texts, list(range(page_count)))
+        page_texts = ocr_pages(pdf_bytes, page_texts, list(range(min(page_count, ocr_page_limit))))
         selected, basis = find_table_pages(page_texts)
 
     else:
@@ -847,7 +870,7 @@ def get_result_text(pdf_bytes: bytes) -> tuple:
         # Hybrid PDF: text cover letter, scanned result pages
         low_text = [
             i for i, t in enumerate(page_texts)
-            if len(t.strip()) < LOW_TEXT_PAGE_CHARS
+            if len(t.strip()) < LOW_TEXT_PAGE_CHARS and i < ocr_page_limit
         ]
 
         if not selected and low_text:
@@ -974,16 +997,25 @@ def extract_from_text(text: str, model: str) -> dict | None:
         log.warning(f"    Model extraction failed: {e}")
         return None
 
-def extract_financials(pdf_bytes: bytes, model: str | None = None) -> dict | None:
+def extract_financials(pdf_bytes: bytes, model: str | None = None,
+                       ambiguous: bool = False) -> dict | None:
     """Pick the result pages locally (OCR if needed), then have the model read them.
 
+    ambiguous: a board meeting outcome whose headline names no results — OCR
+    is capped at AMBIGUOUS_OCR_PAGES and the table check outcome is logged.
     Raises SkipFiling when the PDF has no results table (the model isn't called).
     """
     try:
-        text, reason = get_result_text(pdf_bytes)
+        text, reason = get_result_text(
+            pdf_bytes,
+            AMBIGUOUS_OCR_PAGES if ambiguous else MAX_PDF_PAGES
+        )
     except Exception as e:
         log.warning(f"    PDF text extraction failed: {e}")
         return None
+
+    if ambiguous:
+        log.info(f"   Ambiguous outcome → results table {'found' if text else 'not found'}")
 
     if not text:
         raise SkipFiling(reason)
@@ -1420,7 +1452,8 @@ def has_core_values(fin: dict) -> bool:
         fin["pat"][0] is not None
     )
 
-def process_filing(filing: dict, isin, processed: set, nse: NseClient) -> str | None:
+def process_filing(filing: dict, isin, processed: set, nse: NseClient,
+                   ambiguous: bool = False) -> str | None:
     """Download, extract, score and alert.
 
     Returns the processed key once financials are extracted — including when
@@ -1445,7 +1478,7 @@ def process_filing(filing: dict, isin, processed: set, nse: NseClient) -> str | 
 
     pdf_mb = len(pdf) / (1024 * 1024)
     log.info(f"   PDF: {pdf_mb:.1f} MB — extracting text…")
-    fin = extract_financials(pdf)
+    fin = extract_financials(pdf, ambiguous=ambiguous)
     if not fin:
         log.info("   Could not extract financials"); return None
 
@@ -1498,13 +1531,27 @@ class ScannerState:
         self.retries = load_retries()          # filing id → failed attempts
         self.pending = {}                      # filing id → filing awaiting retry
         self.bse_known_ids = set()             # BSE NEWSIDs fetched on earlier polls
+        self.nse_known_ids = set()             # NSE filing ids fetched on earlier polls
         self.refresh_master()
 
     def refresh_master(self):
         self.master = load_scrip_master(self.nse)
         self.master_day = date.today()
-        self.processed = migrate_processed_keys(load_processed_scrips(), self.master)
+
+        before = load_processed_scrips()
+        self.processed = migrate_processed_keys(before, self.master)
         save_processed_scrips(self.processed)
+
+        changed = self.processed - before
+        to_isin = [k for k in changed if not k.startswith(("BSE-", "NSE-"))]
+        without_isin = sorted(k for k in self.processed if k.startswith(("BSE-", "NSE-")))
+
+        if to_isin:
+            log.info(f"Migrated {len(to_isin)} processed key{'' if len(to_isin) == 1 else 's'} to ISIN format")
+        if len(changed) > len(to_isin):
+            log.info(f"Renamed {len(changed) - len(to_isin)} old-format keys to EXCHANGE-code format (ISIN unknown)")
+        if without_isin:
+            log.info(f"Processed keys still without ISIN: {', '.join(without_isin)}")
 
     def finish(self, fid: str):
         """Done with a filing for good: success, skip, or retries exhausted."""
@@ -1536,11 +1583,15 @@ def handle_filing(filing: dict, state: ScannerState):
 
     exchange, company = filing["exchange"], filing["company"]
     source = "+".join(filing["headline_fields"]) or "no headline field"
+    kind = board_meeting_kind(filing["headline"]) if filing["category"] == "Board Meeting" else "results"
 
-    if filing["category"] == "Board Meeting" and not is_result_board_meeting(filing["headline"]):
+    if kind in ("intimation", "other"):
+        # The filter reads the full headline; only this log line is shortened
+        shown = filing["headline"]
+        shown = shown if len(shown) <= 120 else shown[:120] + "…"
         log.info(
-            f"→ Skip {exchange} board meeting without results: {company} — "
-            f"{filing['headline'][:100]!r} (headline from {source})"
+            f"→ Skip {exchange} board meeting ({kind}): {company} — "
+            f"{shown!r} (headline from {source})"
         )
         state.finish(fid)
         return
@@ -1561,10 +1612,11 @@ def handle_filing(filing: dict, state: ScannerState):
     log.info(
         f"→ New {exchange}: {company} ({filing['code']}, ISIN {isin or 'unknown'}, "
         f"{filing['category']}; headline from {source})"
+        + ("; ambiguous outcome, checking PDF for a results table" if kind == "ambiguous" else "")
     )
 
     try:
-        key = process_filing(filing, isin, state.processed, state.nse)
+        key = process_filing(filing, isin, state.processed, state.nse, ambiguous=(kind == "ambiguous"))
     except SkipFiling as e:
         log.info(f"   Skip: {e} — not calling the model, not retrying")
         state.finish(fid)
@@ -1595,18 +1647,28 @@ def poll_exchanges(state: ScannerState) -> list:
     so whichever exchange published a result first is the one processed."""
     fresh = []
 
-    for exchange, fetch in [
-        ("BSE", lambda: fetch_bse_filings(state.bse_known_ids)),
-        ("NSE", lambda: fetch_nse_filings(state.nse)),
-    ]:
-        try:
-            filings = fetch()
-            log.info(f"{exchange}: {len(filings)} announcements fetched")
-            fresh += filings
-        except ExchangeBlocked as e:
-            warn_blocked(exchange, str(e))
-        except Exception as e:
-            log.warning(f"{exchange} announcements fetch failed: {e}")
+    try:
+        filings, pages = fetch_bse_filings(state.bse_known_ids)
+        log.info(
+            f"BSE: {len(filings)} new announcements "
+            f"(fetch OK, {pages} page{'' if pages == 1 else 's'} read)"
+        )
+        fresh += filings
+    except ExchangeBlocked as e:
+        warn_blocked("BSE", str(e))
+    except Exception as e:
+        log.warning(f"BSE: fetch FAILED ({e}) — announcements not read this poll")
+
+    try:
+        filings = fetch_nse_filings(state.nse)
+        new = [f for f in filings if f["id"] not in state.nse_known_ids]
+        state.nse_known_ids.update(f["id"] for f in filings)
+        log.info(f"NSE: {len(new)} new announcements (fetch OK, {len(filings)} today)")
+        fresh += filings
+    except ExchangeBlocked as e:
+        warn_blocked("NSE", str(e))
+    except Exception as e:
+        log.warning(f"NSE: fetch FAILED ({e}) — announcements not read this poll")
 
     by_id = {f["id"]: f for f in state.pending.values()}
     by_id.update({f["id"]: f for f in fresh})
