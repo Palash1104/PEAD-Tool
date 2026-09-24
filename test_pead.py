@@ -13,6 +13,7 @@ import logging
 import os
 import sys
 import tempfile
+import threading
 import time
 from datetime import date, datetime
 from unittest import mock
@@ -500,11 +501,21 @@ section("main loop")
 class Stop(Exception):
     pass
 
-def run_main(polls, bse=lambda known: [], nse=lambda client: [], extract=None, master=None, download=None):
-    """Run pt.main() for a number of polls with everything external mocked."""
+def run_main(polls, bse=lambda known: [], nse=lambda client: [], extract=None, master=None,
+             download=None, on_wait=None):
+    """Run pt.main() for a number of polls with everything external mocked.
+
+    Between polls the default waits for queued ambiguous checks to finish and
+    applies them, so runs are deterministic; on_wait(state, poll) replaces that.
+    """
     counter = {"n": 0}
-    def fake_sleep(sec):
+    def fake_wait(state, seconds):
         counter["n"] += 1
+        if on_wait:
+            on_wait(state, counter["n"])
+        else:
+            state.checker.todo.join()
+            pt.drain_checks(state)
         if counter["n"] >= polls:
             raise Stop()
     alerts = []
@@ -516,7 +527,7 @@ def run_main(polls, bse=lambda known: [], nse=lambda client: [], extract=None, m
          mock.patch.object(pt, "extract_financials", extract), \
          mock.patch.object(pt, "send_telegram", lambda filing, *a: alerts.append(filing["exchange"] + ":" + filing["company"])), \
          mock.patch.object(pt, "send_telegram_text", lambda text: True), \
-         mock.patch.object(pt.time, "sleep", fake_sleep):
+         mock.patch.object(pt, "wait_for_checks", fake_wait):
         try:
             pt.main([])
         except Stop:
@@ -527,7 +538,7 @@ ambiguous_calls = []
 
 def counting_extract(behaviour):
     calls = {}
-    def extract(pdf, ambiguous=False):
+    def extract(pdf, ambiguous=False, timings=None):
         name = pdf.decode()[len("%PDF-"):]
         calls[name] = calls.get(name, 0) + 1
         if ambiguous:
@@ -638,8 +649,67 @@ check("ambiguous without table: once, seen, no retry",
       and {gacm["id"], saraswati["id"]} <= seen and not os.path.exists(pt.RETRIES_FILE))
 check("ambiguous with table: scored and alerted", alerts == ["NSE:Global Education Limited"], alerts)
 check("intimation still skipped by headline", alfa["attachment_url"] not in calls and alfa["id"] in seen)
-check("log says ambiguous outcome is being checked", logs.has("ambiguous outcome, checking PDF for a results table"))
+check("log says ambiguous outcome is queued for a check", logs.has("ambiguous outcome, queued for a PDF check"))
+check("checker logs the table check result", logs.has("→ Checked ambiguous outcome BSE: GACM Technologies Ltd"))
 check("skip log names the reason", logs.has("→ Skip BSE board meeting (intimation): Alfa Ica India Ltd"))
+
+# Priority: clear results first (oldest first), ambiguous outcomes after, on the checker thread
+fresh_state_dir()
+order = []
+def ordered_extract(pdf, ambiguous=False, timings=None):
+    order.append((pdf.decode()[len("%PDF-"):].rsplit("/", 1)[-1], threading.current_thread().name))
+    return good_fin
+amb_old = pt.normalise_bse(bse_raw("a1", 701, "Board Meeting", "2026-09-24T09:00:00", sub="Board Meeting Outcome for Meeting Held Today"))
+amb_new = pt.normalise_bse(bse_raw("a2", 702, "Board Meeting", "2026-09-24T09:15:00", sub="Outcome of Board Meeting held today"))
+clear_new = pt.normalise_bse(bse_raw("c1", 703, "Result", "2026-09-24T10:00:00"))
+clear_old = pt.normalise_nse(nse_raw("c0", "CLR", "INE703A01010", "24-Sep-2026 09:30:00"))
+alerts = run_main(1, bse=lambda k: [amb_new, clear_new, amb_old], nse=lambda c: [clear_old], extract=ordered_extract)
+check("clear results first (oldest first), then ambiguous (oldest first)",
+      [name for name, _ in order] == ["c0.pdf", "c1.pdf", "a1.pdf", "a2.pdf"], order)
+check("clear filings run on the main thread, ambiguous on the checker",
+      [thread for _, thread in order] == ["MainThread", "MainThread", "checker", "checker"], order)
+check("alerts follow the same priority", alerts == ["NSE:Co CLR", "BSE:Co 703", "BSE:Co 701", "BSE:Co 702"], alerts)
+
+# A slow ambiguous check doesn't hold up a clear result from the next poll
+fresh_state_dir()
+started, release = threading.Event(), threading.Event()
+slow_amb = pt.normalise_nse(nse_raw("s50", "SLOW", "INE050A01010", "24-Sep-2026 09:00:00", desc="Outcome of Board Meeting"))
+next_clear = pt.normalise_bse(bse_raw("c50", 750, "Result", "2026-09-24T10:00:00"))
+amb_calls = []
+def slow_extract(pdf, ambiguous=False, timings=None):
+    if ambiguous:
+        amb_calls.append(1)
+        started.set()
+        release.wait(10)
+    return good_fin
+seen_during = {}
+def hold_then_release(state, poll):
+    if poll == 1:
+        started.wait(10)                 # checker is now busy with the ambiguous PDF
+    else:
+        seen_during["processed"] = sorted(state.processed)
+        seen_during["in_flight"] = slow_amb["id"] in state.checker.in_flight
+        release.set()
+        state.checker.todo.join()
+        pt.drain_checks(state)
+polls = {"n": 0}
+def bse_second_poll(known):
+    polls["n"] += 1
+    return [next_clear] if polls["n"] == 2 else []
+alerts = run_main(2, bse=bse_second_poll, nse=lambda c: [slow_amb], extract=slow_extract, on_wait=hold_then_release)
+check("clear result scored while the ambiguous check was still running",
+      seen_during == {"processed": ["BSE-750_Q1FY27"], "in_flight": True}, seen_during)
+check("clear alert first, ambiguous alert once its check finished", alerts == ["BSE:Co 750", "NSE:Co SLOW"], alerts)
+check("in-flight ambiguous filing not resubmitted when NSE lists it again", len(amb_calls) == 1, amb_calls)
+
+# Timing line per processed filing
+fresh_state_dir()
+timed = pt.normalise_bse(bse_raw("t9", 909, "Result", "2026-09-24T10:00:00"))
+extract, calls = counting_extract({timed["attachment_url"]: good_fin})
+with LogCapture() as logs:
+    run_main(1, bse=lambda k: [timed], extract=extract)
+check("timing line with download and exchange→alert",
+      any(m.startswith("   ⏱ download ") and "exchange→alert" in m for m in logs.messages), [m for m in logs.messages if "⏱" in m])
 
 # Poll logs distinguish "0 new" from a failed fetch
 fresh_state_dir()
@@ -654,7 +724,7 @@ with LogCapture() as logs:
 check("failed BSE fetch logged as FAILED, not 0", logs.has("BSE: fetch FAILED (connection reset)")
       and not logs.has("BSE: 0 new"), logs.messages)
 with LogCapture() as logs:
-    run_main(2, nse=lambda c: [vague_nse], extract=lambda pdf, ambiguous=False: None)
+    run_main(2, nse=lambda c: [vague_nse], extract=lambda pdf, ambiguous=False, timings=None: None)
 check("NSE counts only new filings on later polls",
       logs.has("NSE: 1 new announcements (fetch OK, 1 today)") and logs.has("NSE: 0 new announcements (fetch OK, 1 today)"))
 
@@ -827,6 +897,12 @@ with mock.patch.object(pt.client.chat.completions, "create", fake_create):
         if len(expect_pages) == 2:
             ok = ok and "consolidated" in pdf_text.split("--- PAGE 5")[0].lower()
         check(f"{label} ({time.time() - started:.0f}s)", ok, sent_pages)
+
+    t_text, t_scan = {}, {}
+    pt.extract_financials(text_pdf(PAGES), timings=t_text)
+    check("timings: text PDF records page scan + model, no OCR", set(t_text) == {"scan", "model"}, t_text)
+    pt.extract_financials(scanned_pdf(PAGES[:2]), timings=t_scan)
+    check("timings: scanned PDF records OCR separately", set(t_scan) == {"scan", "ocr", "model"} and t_scan["ocr"] > t_scan["scan"], t_scan)
 
     sent_requests.clear()
     pt.extract_financials(text_pdf(PAGES), model="google/gemini-test")

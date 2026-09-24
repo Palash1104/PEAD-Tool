@@ -26,7 +26,24 @@ python test_pead.py
 
 ## Pipeline
 
-Each poll, `main()` calls `poll_exchanges()`, then `handle_filing()` for each filing, then sleeps `POLL_INTERVAL_SEC` (30s). Processing is sequential.
+Each poll, `main()` calls `run_cycle()` and then `wait_for_checks()` until the next poll (`POLL_INTERVAL_SEC`, 30s). `run_cycle()`:
+1. `poll_exchanges()`
+2. Sorts filings by priority: clear results (`filing_kind` "results") first, then ambiguous outcomes, each oldest first.
+3. `triage()` filters and pre-checks dedup; clear filings are handled synchronously on the main thread (`handle_clear` → `process_filing`).
+4. `drain_checks()` applies finished ambiguous checks.
+5. New ambiguous outcomes are queued on `AmbiguousChecker` (`handle_ambiguous`).
+
+**Threads.**
+- `AmbiguousChecker` is a single daemon thread named `checker`. It runs `obtain_financials(..., ambiguous=True)`: download, results-table check, and the model only if a table is found.
+- It has its own `NseClient` and **never touches `ScannerState`**. Results go on `checker.done`, and the main thread applies them in `apply_ambiguous_result` (score, CSV, alert, retry bookkeeping), during `wait_for_checks` or `drain_checks`.
+- `in_flight` stops the checker re-queueing a filing (NSE lists it every poll). Only the main thread touches it.
+- Checker log lines are tagged `[checker]` (the `ThreadTag` log filter).
+- `main()` stops the checker in a `finally`.
+- Keep all state changes on the main thread.
+
+**Timings.**
+- `obtain_financials` records download time, `get_result_text` page-scan and OCR time, and `extract_from_text` model time, all in a `timings` dict.
+- `log_timings` prints one line per filing, e.g. `⏱ download 1.2s · page scan 0.3s · OCR 6.1s · model 3.4s · exchange→alert 2m 13s` ("exchange→scored" when there is no alert).
 
 1. **Fetch** (`poll_exchanges`)
    - **BSE**: `fetch_bse_filings(known_ids)` reads `AnnSubCategoryGetData` pages. It stops when a page has no NEWSIDs unseen on earlier polls, or at the row's `TotalPageCnt`, capped at `BSE_MAX_PAGES` (100). It returns only new rows, so `state.pending` re-queues filings awaiting retry.
@@ -41,7 +58,7 @@ Each poll, `main()` calls `poll_exchanges()`, then `handle_filing()` for each fi
    - `exchange`, `id` (`BSE:<NEWSID>` / `NSE:<seq_id>`), `company`, `code` (scrip code or symbol), `isin` (NSE only)
    - `category`: NSE's `desc` is mapped to "Board Meeting" or "Result" by `nse_category`
    - `headline` plus the `headline_fields` it came from, `attachment_url`, `exchange_dt`
-3. **Filter** (`handle_filing`)
+3. **Filter** (`triage`)
    - Skip filings already in `seen`. The category must be "Result" or "Board Meeting".
    - Board Meeting filings are classified by `board_meeting_kind()` on the **full** headline:
      - "intimation" ("intimation" and no "outcome"): skip
@@ -57,7 +74,7 @@ Each poll, `main()` calls `poll_exchanges()`, then `handle_filing()` for each fi
    - The ISIN comes from the NSE filing itself, or from the scrip master for BSE (`lookup_isin`).
    - The pre-check key is `{ISIN}_{quarter}`, with the quarter estimated from the filing date (`reporting_quarter`). While the ISIN is unknown the key is `{EXCHANGE}-{code}_{quarter}`.
    - If the key is already in `processed_scrips`, the filing is marked seen and skipped.
-5. **`process_filing()`**: download (NSE via the session), extract, check `has_core_values` (current revenue **and** PAT), then compute the real key.
+5. **`process_filing()`** = `obtain_financials()` + `score_filing()`. The first downloads (NSE via the session), extracts and checks `has_core_values` (current revenue **and** PAT); it touches no state, so the checker thread shares it. The second computes the real key, scores, writes the CSV and alerts, on the main thread only.
    - The real quarter comes from the PDF's `period_end` via `filing_quarter`. It is only trusted if it falls 0–400 days before the filing date; otherwise the filing-date estimate is used.
    - If that key is already processed, the filing is a duplicate: no score and no alert.
    - Otherwise it scores, writes the CSV and alerts, and returns the key. It returns None on failure.
@@ -127,7 +144,7 @@ Growth is `_pct(curr, prev) = (curr - prev) / abs(prev) * 100`. `band_score` awa
 ## Conventions
 
 - The style is procedural: module-level functions, `log = logging.getLogger`, and f-string logs with leading spaces to indent sub-steps under `→ New ...`. `ScannerState` and `NseClient` are the only classes.
-- Network and parse errors are caught, logged with `log.warning`, and the step returns None or `[]`. `handle_filing` wraps `process_filing` in try/except, so a crash counts as a failed attempt.
+- Network and parse errors are caught, logged with `log.warning`, and the step returns None or `[]`. `handle_clear` wraps `process_filing` in try/except (and the checker wraps `obtain_financials`), so a crash counts as a failed attempt.
 - After `normalise_financials()`, every `FIN_KEYS` value is a 3-element list of floats or None, in ₹ crore. Add new metrics to `FIN_KEYS` **and** the prompt.
 - Telegram uses `parse_mode: HTML`, so HTML-escape anything dynamic. Company names and NSE symbols contain `&` (e.g. `M&M`).
 - Both exchanges sit behind Akamai. Keep the browser-like headers and don't add request volume casually.
