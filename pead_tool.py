@@ -1,18 +1,23 @@
 """
-PEAD Score Tool — BSE Financial Results Monitor
-================================================
-Polls BSE every 30s → downloads PDF → Claude Haiku extracts financials
-→ PEAD score computed → Telegram alert if score >= 30
+PEAD Score Tool — BSE + NSE Financial Results Monitor
+=====================================================
+Polls BSE and NSE every 30s → downloads result PDF → LLM extracts financials
+→ PEAD score computed → Telegram alert if score >= PEAD_THRESHOLD
 
 SETUP:
-  pip install requests openai pdfplumber
+  pip install -r requirements.txt   (plus Tesseract + Poppler for OCR)
 
-CONFIG:
-  Fill in AICREDITS_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID below.
-  Then run:  python pead_tool.py
+CONFIG (.env):
+  AICREDITS_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+  EXTRACTION_MODEL  (optional, default anthropic/claude-haiku-4-5)
+
+RUN:
+  python pead_tool.py          poll forever
+  python pead_tool.py --dump   save one raw BSE and NSE response, then exit
 """
 import os
 from dotenv import load_dotenv
+import argparse
 import json
 import re
 import html
@@ -25,7 +30,8 @@ import logging
 import requests
 import pdfplumber
 import io
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
+from urllib.parse import quote
 from openai import OpenAI
 
 load_dotenv()
@@ -41,6 +47,7 @@ POPPLER_PATH = r"C:\poppler\Library\bin"
 AICREDITS_API_KEY  = os.getenv("AICREDITS_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
+EXTRACTION_MODEL   = os.getenv("EXTRACTION_MODEL") or "anthropic/claude-haiku-4-5"
 
 if not all([
     AICREDITS_API_KEY,
@@ -51,8 +58,8 @@ if not all([
 
 PEAD_THRESHOLD     = 35
 POLL_INTERVAL_SEC  = 30
-CLAUDE_MODEL       = "anthropic/claude-haiku-4-5"
 MAX_RETRIES        = 3      # extra attempts per failed filing, one per poll
+BLOCKED_ALERT_SEC  = 3600   # Telegram at most hourly about an exchange blocking us
 
 # Growth factors are skipped when last year's base is this small (Rs. Cr)
 SMALL_BASE_PAT_CR  = 1
@@ -60,6 +67,9 @@ SMALL_BASE_REV_CR  = 10
 
 SEEN_FILE = "seen.json"
 RESULTS_CSV = "pead_results.csv"
+PROCESSED_SCRIPS_FILE = "processed_scrips.json"   # "{ISIN}_{quarter}" keys
+RETRIES_FILE = "retry_counts.json"                # filing id → failed attempts
+SCRIP_MASTER_FILE = "scrip_master.json"           # BSE code / NSE symbol → ISIN
 # ─────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -74,57 +84,101 @@ client = OpenAI(
     base_url="https://api.aicredits.in/v1",
 )
 
-def load_seen() -> set:
+def load_json(path: str, default):
     try:
-        if os.path.exists(SEEN_FILE):
-            with open(SEEN_FILE, "r") as f:
-                data = json.load(f)
-                return set(data)
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
     except Exception as e:
-        log.warning(f"Could not load seen file: {e}")
+        log.warning(f"Could not load {path}: {e}")
 
-    return set()
+    return default
 
+def save_json(path: str, data):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception as e:
+        log.warning(f"Could not save {path}: {e}")
+
+def load_seen() -> set:
+    # Ids are "BSE:<NEWSID>" / "NSE:<seq_id>"; bare ids predate NSE support
+    return {
+        fid if ":" in fid else f"BSE:{fid}"
+        for fid in load_json(SEEN_FILE, [])
+    }
 
 def save_seen(seen: set):
-    try:
-        with open(SEEN_FILE, "w") as f:
-            json.dump(list(seen), f)
-    except Exception as e:
-        log.warning(f"Could not save seen file: {e}")
+    save_json(SEEN_FILE, list(seen))
+
+def load_processed_scrips() -> set:
+    return set(load_json(PROCESSED_SCRIPS_FILE, []))
+
+def save_processed_scrips(data: set):
+    save_json(PROCESSED_SCRIPS_FILE, sorted(data))
+
+def load_retries() -> dict:
+    return load_json(RETRIES_FILE, {})
+
+def save_retries(retries: dict):
+    save_json(RETRIES_FILE, retries)
+
+CSV_HEADER = [
+    "timestamp",
+    "company",
+    "scrip",
+    "score",
+
+    "revenue_cq",
+    "revenue_pq",
+    "revenue_ly",
+
+    "pat_cq",
+    "pat_pq",
+    "pat_ly",
+
+    "ebitda_cq",
+    "ebitda_pq",
+    "ebitda_ly",
+
+    "eps_cq",
+    "eps_ly",
+
+    "exchange",
+]
 
 def initialize_csv():
 
-    if os.path.exists(RESULTS_CSV):
+    if not os.path.exists(RESULTS_CSV):
+        with open(RESULTS_CSV, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(CSV_HEADER)
         return
 
-    with open(RESULTS_CSV, "w", newline="", encoding="utf-8") as f:
+    # Files from before NSE support lack the exchange column — add it
+    try:
+        with open(RESULTS_CSV, newline="", encoding="utf-8") as f:
+            rows = list(csv.reader(f))
 
-        writer = csv.writer(f)
+        if not rows or "exchange" in rows[0]:
+            return
 
-        writer.writerow([
-            "timestamp",
-            "company",
-            "scrip",
-            "score",
+        rows[0].append("exchange")
 
-            "revenue_cq",
-            "revenue_pq",
-            "revenue_ly",
+        for row in rows[1:]:
+            if row:
+                row.append("BSE")
 
-            "pat_cq",
-            "pat_pq",
-            "pat_ly",
+        tmp = RESULTS_CSV + ".tmp"
+        with open(tmp, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerows(rows)
+        os.replace(tmp, RESULTS_CSV)
 
-            "ebitda_cq",
-            "ebitda_pq",
-            "ebitda_ly",
+        log.info(f"Added exchange column to {RESULTS_CSV} (existing rows marked BSE)")
 
-            "eps_cq",
-            "eps_ly",
-        ])
+    except OSError as e:
+        log.warning(f"Could not add exchange column to {RESULTS_CSV}: {e}")
 
-def save_result_csv(company, scrip, score, fin):
+def save_result_csv(filing, score, fin):
 
     def get3(key):
         v = fin.get(key) or []
@@ -143,8 +197,8 @@ def save_result_csv(company, scrip, score, fin):
             writer.writerow([
                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
 
-                company,
-                scrip,
+                filing["company"],
+                filing["code"],
                 score,
 
                 *rev,
@@ -153,73 +207,116 @@ def save_result_csv(company, scrip, score, fin):
 
                 eps[0],
                 eps[2],
+
+                filing["exchange"],
             ])
     except OSError as e:
         # e.g. CSV open in Excel — don't let logging block the alert
         log.warning(f"   Could not write CSV row: {e}")
 
-# ── BSE ──────────────────────────────────────────────────────
+# ── EXCHANGES ────────────────────────────────────────────────
+#
+# Both exchanges are normalised into the same "filing" dict:
+#   exchange, id ("BSE:<NEWSID>" / "NSE:<seq_id>"), company, code (scrip code
+#   or symbol), isin (NSE only), category ("Result" / "Board Meeting" / other),
+#   headline, headline_fields, attachment_url, exchange_dt
 
-BSE_ALL_ANN_URL = (
-    "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w"
-    "?pageno=1&strCat=-1&strPrevDate={date}"
-    "&strScrip=&strSearch=P&strToDate={date}"
-    "&strType=C&subcategory=-1"
-)
-BSE_PDF_BASE = "https://www.bseindia.com/xml-data/corpfiling/AttachLive/"
+class ExchangeBlocked(Exception):
+    """Access Denied / 401 / 403 — must never be read as 'no announcements'."""
+
+class SkipFiling(Exception):
+    """The filing can never yield results (no results table, not a PDF):
+    skip it for good — no model call, no retry."""
+
+def is_blocked_response(r) -> bool:
+    return r.status_code in (401, 403) or "access denied" in r.text[:2000].lower()
+
+# BSE's API answers 403 Access Denied unless Origin/Accept are sent too
+# (verified 2026-09-24; UA + Referer alone stopped working)
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
     ),
     "Referer": "https://www.bseindia.com/",
+    "Origin": "https://www.bseindia.com",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
-def fetch_all_announcements() -> list:
+BSE_ANN_URL = (
+    "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w"
+    "?pageno={page}&strCat=-1&strPrevDate={date}"
+    "&strScrip=&strSearch=P&strToDate={date}"
+    "&strType=C&subcategory=-1"
+)
+BSE_PDF_BASE = "https://www.bseindia.com/xml-data/corpfiling/AttachLive/"
+BSE_MASTER_URL = (
+    "https://api.bseindia.com/BseIndiaAPI/api/ListofScripData/w"
+    "?Group=&Scripcode=&industry=&segment=Equity&status=Active"
+)
+BSE_MAX_PAGES = 100       # safety cap; pages are 50 rows and rows carry TotalPageCnt
+BSE_HEADLINE_FIELDS = ["NEWSSUB", "HEADLINE", "SUBCATNAME"]
+BSE_TIME_FIELDS = ["EXCHANGE_RECEIVED_TIME", "NEWS_DT", "DT_TM", "DTTM"]
 
-    today = date.today().strftime("%Y%m%d")
+NSE_HOME = "https://www.nseindia.com/"
+NSE_ANN_URL = (
+    "https://www.nseindia.com/api/corporate-announcements"
+    "?index=equities&from_date={date}&to_date={date}"
+)
+NSE_MASTER_URLS = [
+    "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv",
+    "https://nsearchives.nseindia.com/emerge/corporates/content/SME_EQUITY_L.csv",
+]
+NSE_HEADERS = {
+    "User-Agent": HEADERS["User-Agent"],
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.nseindia.com/companies-listing/corporate-filings-announcements",
+}
+NSE_HEADLINE_FIELDS = ["desc", "attchmntText"]
+NSE_TIME_FIELDS = ["exchdisstime", "an_dt", "sort_date"]
 
-    try:
+ISIN_RE = re.compile(r"[A-Z]{2}[A-Z0-9]{9}[0-9]")
 
-        r = requests.get(
-            BSE_ALL_ANN_URL.format(date=today),
-            headers=HEADERS,
-            timeout=15
-        )
+class NseClient:
+    """requests session holding NSE cookies; re-primed from the homepage on 401/403."""
 
-        r.raise_for_status()
+    def __init__(self):
+        self.session = None
 
-        return r.json().get("Table", [])
+    def _prime(self):
+        self.session = requests.Session()
+        self.session.headers.update(NSE_HEADERS)
+        self.session.get(NSE_HOME, timeout=15)
 
-    except Exception as e:
+    def get(self, url: str, timeout: int = 15):
+        if self.session is None:
+            self._prime()
 
-        log.warning(
-            f"All announcements fetch failed: {e}"
-        )
+        r = self.session.get(url, timeout=timeout)
 
-        return []
+        if r.status_code in (401, 403):
+            log.info(f"NSE returned {r.status_code}, refreshing session cookies")
+            self._prime()
+            r = self.session.get(url, timeout=timeout)
 
-def download_pdf(attachment_name: str):
-    try:
-        r = requests.get(BSE_PDF_BASE + attachment_name, headers=HEADERS, timeout=20)
-        r.raise_for_status()
-        return r.content
-    except Exception as e:
-        log.warning(f"PDF download failed: {e}")
-        return None
+        return r
 
-def parse_exchange_time(ann: dict) -> datetime | None:
-    for field in ["EXCHANGE_RECEIVED_TIME", "NEWS_DT", "DT_TM", "DTTM"]:
-        val = ann.get(field)
+def parse_exchange_time(row: dict, fields: list) -> datetime | None:
+    for field in fields:
+        val = row.get(field)
         if not val:
             continue
         s = str(val).strip()
         for fmt in [
             "%Y-%m-%dT%H:%M:%S.%f",
             "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%d %H:%M:%S",
             "%d/%m/%Y %H:%M:%S",
             "%Y%m%d%H%M%S",
             "%d-%m-%Y %H:%M:%S",
+            "%d-%b-%Y %H:%M:%S",
         ]:
             try:
                 return datetime.strptime(s, fmt)
@@ -227,11 +324,155 @@ def parse_exchange_time(ann: dict) -> datetime | None:
                 continue
     return None
 
-def announcement_headline(ann: dict) -> str:
-    return " ".join(
-        str(ann.get(field) or "")
-        for field in ["NEWSSUB", "HEADLINE", "SUBCATNAME"]
-    ).strip()
+def headline_from(row: dict, fields: list) -> tuple:
+    """Joined headline text plus the names of the fields it came from."""
+    used = [f for f in fields if str(row.get(f) or "").strip()]
+    return " ".join(str(row[f]).strip() for f in used), used
+
+def normalise_bse(row: dict) -> dict:
+    headline, fields = headline_from(row, BSE_HEADLINE_FIELDS)
+    raw_id = row.get("NEWSID") or row.get("DT_TM")
+    attach = row.get("ATTACHMENTNAME") or ""
+
+    return {
+        "exchange": "BSE",
+        "id": f"BSE:{raw_id}" if raw_id else "",
+        "company": row.get("SLONGNAME") or row.get("SNAME") or "Unknown",
+        "code": str(row.get("SCRIP_CD") or ""),
+        "isin": None,
+        "category": (row.get("CATEGORYNAME") or "").strip(),
+        "headline": headline,
+        "headline_fields": fields,
+        "attachment_url": BSE_PDF_BASE + attach if attach else "",
+        "exchange_dt": parse_exchange_time(row, BSE_TIME_FIELDS),
+    }
+
+def nse_category(desc: str) -> str:
+    """Map NSE's subject line onto the BSE categories the filter understands."""
+    lower = desc.lower()
+    if "board meeting" in lower:
+        return "Board Meeting"
+    if "financial result" in lower:
+        return "Result"
+    return desc
+
+def normalise_nse(row: dict) -> dict:
+    headline, fields = headline_from(row, NSE_HEADLINE_FIELDS)
+    raw_id = row.get("seq_id") or row.get("attchmntFile")
+    isin = str(row.get("sm_isin") or "").strip()
+    attachment = str(row.get("attchmntFile") or "")   # "-" when there is none
+
+    return {
+        "exchange": "NSE",
+        "id": f"NSE:{raw_id}" if raw_id else "",
+        "company": row.get("sm_name") or row.get("symbol") or "Unknown",
+        "code": str(row.get("symbol") or ""),
+        "isin": isin if ISIN_RE.fullmatch(isin) else None,
+        "category": nse_category(str(row.get("desc") or "")),
+        "headline": headline,
+        "headline_fields": fields,
+        "attachment_url": attachment if attachment.startswith("http") else "",
+        "exchange_dt": parse_exchange_time(row, NSE_TIME_FIELDS),
+    }
+
+def fetch_bse_page(page: int, day: date) -> list:
+    r = requests.get(
+        BSE_ANN_URL.format(page=page, date=day.strftime("%Y%m%d")),
+        headers=HEADERS,
+        timeout=15
+    )
+
+    if is_blocked_response(r):
+        raise ExchangeBlocked(f"HTTP {r.status_code} on announcements page {page}")
+
+    r.raise_for_status()
+    return r.json().get("Table") or []
+
+def fetch_bse_filings(known_ids: set) -> list:
+    """Today's new BSE announcements, newest first, paging until a page has
+    no new rows or the last page (TotalPageCnt) is reached.
+
+    known_ids holds the NEWSIDs fetched on earlier polls and is updated in
+    place, so a normal poll reads page 1 and one page of already-known rows.
+    """
+    today = date.today()
+    filings = []
+
+    for page in range(1, BSE_MAX_PAGES + 1):
+        if page > 2:
+            time.sleep(0.5)   # only a startup backlog reads this deep; go gently
+
+        try:
+            rows = fetch_bse_page(page, today)
+        except ExchangeBlocked:
+            raise
+        except Exception as e:
+            log.warning(f"BSE announcements page {page} failed: {e}")
+            break
+
+        new_rows = [
+            row for row in rows
+            if str(row.get("NEWSID") or row.get("DT_TM") or "") not in known_ids
+        ]
+
+        if not new_rows:
+            break
+
+        for row in new_rows:
+            known_ids.add(str(row.get("NEWSID") or row.get("DT_TM") or ""))
+            filings.append(normalise_bse(row))
+
+        try:
+            if page >= int(rows[0].get("TotalPageCnt") or BSE_MAX_PAGES):
+                break
+        except (TypeError, ValueError):
+            pass
+    else:
+        log.warning(f"BSE: stopped at the {BSE_MAX_PAGES}-page cap, older filings may be missed")
+
+    return filings
+
+def fetch_nse_filings(nse: NseClient) -> list:
+    r = nse.get(NSE_ANN_URL.format(date=date.today().strftime("%d-%m-%Y")))
+
+    if is_blocked_response(r):
+        raise ExchangeBlocked(f"HTTP {r.status_code} on announcements")
+
+    r.raise_for_status()
+    data = r.json()
+    rows = data if isinstance(data, list) else data.get("data") or []
+    return [normalise_nse(row) for row in rows]
+
+def download_pdf(filing: dict, nse: NseClient):
+    try:
+        if filing["exchange"] == "NSE":
+            r = nse.get(filing["attachment_url"], timeout=30)
+        else:
+            r = requests.get(filing["attachment_url"], headers=HEADERS, timeout=20)
+        r.raise_for_status()
+        return r.content
+    except Exception as e:
+        log.warning(f"PDF download failed: {e}")
+        return None
+
+_last_blocked_alert = {}   # exchange → time of last Telegram warning
+
+def warn_blocked(exchange: str, detail: str):
+    log.error(
+        f"🚫 {exchange} BLOCKED ({detail}) — its announcements were NOT read "
+        f"this poll; this is not 'zero announcements'"
+    )
+
+    now = time.time()
+
+    if now - _last_blocked_alert.get(exchange, 0) >= BLOCKED_ALERT_SEC:
+        _last_blocked_alert[exchange] = now
+        send_telegram_text(
+            f"🚫 <b>{exchange} is blocking the scanner</b>\n"
+            f"<code>{html.escape(detail)}</code>\n"
+            f"No {exchange} filings are being read until this clears. "
+            f"(Repeats at most hourly.)"
+        )
 
 def is_result_board_meeting(headline: str) -> bool:
     """Board Meeting filings only count when they are an outcome with results.
@@ -243,26 +484,160 @@ def is_result_board_meeting(headline: str) -> bool:
     text = headline.lower()
     return "outcome" in text and re.search(r"\bresults?\b", text) is not None
 
+# ── QUARTERS, SCRIP MASTER & DEDUP KEYS ──────────────────────
+
+def quarter_label(period_end: date) -> str:
+    """Indian FY quarter containing this date, e.g. 30 Jun 2026 → Q1FY27."""
+    m, y = period_end.month, period_end.year
+    if m >= 4:
+        return f"Q{(m - 4) // 3 + 1}FY{(y + 1) % 100:02d}"
+    return f"Q4FY{y % 100:02d}"
+
 def reporting_quarter(filed_on: date) -> str:
-    """Quarter a result filed on this date reports, e.g. Sep 2026 → Q1FY27.
+    """Fallback when the PDF gives no period: results are filed within the
+    three months after quarter end, e.g. filed Sep 2026 → Q1FY27."""
+    m, y = filed_on.month - 3, filed_on.year
+    if m < 1:
+        m, y = m + 12, y - 1
+    return quarter_label(date(y, m, 1))
 
-    Results are filed in the three months after quarter end, and the
-    Indian financial year runs April–March (FY27 = Apr 2026 – Mar 2027).
+def filing_quarter(fin: dict, filed_on: date) -> str:
+    """Quarter from the PDF's period_end, else from the filing date."""
+    period_end = fin.get("period_end")
+
+    if period_end:
+        ended = date.fromisoformat(period_end)
+
+        if timedelta(0) <= filed_on - ended <= timedelta(days=400):
+            return quarter_label(ended)
+
+        log.warning(f"   period_end {period_end} implausible for a filing on {filed_on}, using filing date")
+
+    return reporting_quarter(filed_on)
+
+def fetch_bse_master() -> dict:
+    r = requests.get(BSE_MASTER_URL, headers=HEADERS, timeout=60)
+
+    if is_blocked_response(r):
+        raise ExchangeBlocked(f"HTTP {r.status_code} on scrip master")
+
+    r.raise_for_status()
+    data = r.json()
+    rows = data if isinstance(data, list) else data.get("Table") or []
+
+    master = {}
+
+    for row in rows:
+        fields = {k.lower(): v for k, v in row.items()}
+        code = str(fields.get("scrip_cd") or fields.get("scripcode") or "").strip()
+        isin = str(fields.get("isin_number") or fields.get("isin") or "").strip()
+
+        if code and ISIN_RE.fullmatch(isin):
+            master[code] = isin
+
+    return master
+
+def fetch_nse_master(nse: NseClient) -> dict:
+    master = {}
+
+    for url in NSE_MASTER_URLS:
+        try:
+            r = nse.get(url, timeout=60)
+
+            if is_blocked_response(r):
+                raise ExchangeBlocked(f"HTTP {r.status_code}")
+
+            r.raise_for_status()
+
+            for row in csv.DictReader(io.StringIO(r.text)):
+                row = {
+                    (k or "").strip().upper(): (v or "").strip()
+                    for k, v in row.items()
+                }
+                symbol, isin = row.get("SYMBOL"), row.get("ISIN NUMBER", "")
+
+                if symbol and ISIN_RE.fullmatch(isin):
+                    master[symbol] = isin
+
+        except Exception as e:
+            log.warning(f"NSE scrip list {url.rsplit('/', 1)[-1]} failed: {e}")
+
+    return master
+
+def load_scrip_master(nse: NseClient) -> dict:
+    """{"bse": {code: ISIN}, "nse": {symbol: ISIN}, "updated": date}, refreshed daily.
+
+    Failed downloads keep the cached mappings; "updated" is only stamped when
+    both exchanges delivered, so a restart retries a failed refresh.
     """
-    m, y = filed_on.month, filed_on.year
-    if m in (7, 8, 9):
-        q, fy = 1, y + 1
-    elif m in (10, 11, 12):
-        q, fy = 2, y + 1
-    elif m in (1, 2, 3):
-        q, fy = 3, y
-    else:
-        q, fy = 4, y
-    return f"Q{q}FY{fy % 100:02d}"
+    master = load_json(SCRIP_MASTER_FILE, {})
+    master.setdefault("bse", {})
+    master.setdefault("nse", {})
 
-# ── CLAUDE PDF EXTRACTION ─────────────────────────────────────
+    if master.get("updated") == date.today().isoformat():
+        return master
 
-CLAUDE_PROMPT = """This text comes from a quarterly financial result PDF filed by an Indian listed company on BSE/NSE.
+    complete = True
+
+    for name, fetch in [
+        ("bse", fetch_bse_master),
+        ("nse", lambda: fetch_nse_master(nse)),
+    ]:
+        try:
+            fresh = fetch()
+        except Exception as e:
+            log.warning(f"Scrip master: {name.upper()} download failed: {e}")
+            fresh = {}
+
+        if fresh:
+            master[name].update(fresh)
+        else:
+            complete = False
+
+        log.info(
+            f"Scrip master: {len(fresh)} {name.upper()} codes downloaded, "
+            f"{len(master[name])} known"
+        )
+
+    if complete:
+        master["updated"] = date.today().isoformat()
+
+    save_json(SCRIP_MASTER_FILE, master)
+    return master
+
+def lookup_isin(filing: dict, master: dict) -> str | None:
+    return filing["isin"] or master[filing["exchange"].lower()].get(filing["code"])
+
+def processed_key(filing: dict, isin: str | None, quarter: str) -> str:
+    """"{ISIN}_{quarter}" so one company's BSE and NSE filings collide.
+    Falls back to "{EXCHANGE}-{code}_{quarter}" while the ISIN is unknown."""
+    if isin:
+        return f"{isin}_{quarter}"
+    return f"{filing['exchange']}-{filing['code']}_{quarter}"
+
+KEY_RE = re.compile(r"(?:(BSE|NSE)-)?(.+)_(Q[1-4]FY\d{2})")
+
+def migrate_processed_keys(processed: set, master: dict) -> set:
+    """Upgrade pre-NSE "{scrip}_{q}" keys and "{EXCHANGE}-{code}_{q}" fallback
+    keys to "{ISIN}_{q}" wherever the scrip master now knows the ISIN."""
+    migrated = set()
+
+    for key in processed:
+        m = KEY_RE.fullmatch(key)
+
+        if not m or (m.group(1) is None and ISIN_RE.fullmatch(m.group(2))):
+            migrated.add(key)
+            continue
+
+        exchange, code, quarter = m.group(1) or "BSE", m.group(2), m.group(3)
+        isin = master[exchange.lower()].get(code)
+        migrated.add(f"{isin}_{quarter}" if isin else f"{exchange}-{code}_{quarter}")
+
+    return migrated
+
+# ── LLM PDF EXTRACTION ───────────────────────────────────────
+
+EXTRACTION_PROMPT = """This text comes from a quarterly financial result PDF filed by an Indian listed company on BSE/NSE.
 
 Use the CONSOLIDATED results if the text contains a consolidated results table; otherwise use the STANDALONE results.
 Use only the individual quarter columns (NOT year-to-date, half-year, nine-month or full year columns).
@@ -287,11 +662,13 @@ Extract these values exactly as printed, in the table's own unit (do NOT convert
 Also report:
 - basis: which results you used, "consolidated" or "standalone"
 - unit: the unit the table states for amounts, one of "crores", "lakhs", "millions", "thousands", "rupees"
+- period_end: the "quarter ended" date of the current quarter column, as YYYY-MM-DD (null if not shown)
 
 Return ONLY a JSON object, no explanation, no markdown:
 {
 "basis":"consolidated|standalone",
 "unit":"crores|lakhs|millions|thousands|rupees",
+"period_end":"YYYY-MM-DD",
 "revenue_from_operations":[cq,pq,ly],
 "total_income":[cq,pq,ly],
 "ebitda":[cq,pq,ly],
@@ -340,12 +717,18 @@ UNIT_ALIASES = {
     "thousand": "thousands",
     "rupee": "rupees", "rs": "rupees", "inr": "rupees",
 }
+PERIOD_END_FORMATS = [
+    "%Y-%m-%d", "%d-%m-%Y", "%d.%m.%Y", "%d/%m/%Y",
+    "%d-%b-%Y", "%d %b %Y", "%d %B %Y", "%B %d, %Y", "%b %d, %Y",
+]
 
-MAX_PDF_PAGES  = 25
-MIN_TEXT_CHARS = 500   # less real text than this → treat PDF as scanned, OCR it
-HEADING_LINES  = 20    # a result table's title sits near the top of its page
+MAX_PDF_PAGES       = 25
+MIN_TEXT_CHARS      = 500   # whole PDF below this → treat as scanned, OCR it all
+LOW_TEXT_PAGE_CHARS = 200   # no table in text layer → OCR pages below this
+HEADING_LINES       = 20    # a result table's title sits near the top of its page
 
 # A page counts as a result table only if it has at least two of these
+# (real text layers are noisy: ESDS and Purple Style tables matched just two)
 TABLE_MARKERS = [
     "revenue from operations",
     "total income",
@@ -357,31 +740,20 @@ TABLE_MARKERS = [
 RESULT_HEADINGS = [
     ("consolidated", re.compile(
         r"(?:un)?audited\s+consolidated|consolidated\s+(?:un)?audited"
-        r"|consolidated\s+financial\s+results|consolidated\s+statement"
+        r"|consolidated\s+(?:financial\s+)?results|consolidated\s+statement"
     )),
     ("standalone", re.compile(
         r"(?:un)?audited\s+standalone|standalone\s+(?:un)?audited"
-        r"|standalone\s+financial\s+results|standalone\s+statement"
+        r"|standalone\s+(?:financial\s+)?results|standalone\s+statement"
     )),
     ("generic", re.compile(
-        r"financial\s+results\s+for\s+the\s+(?:quarter|half\s+year|period)"
+        r"results\s+for\s+the\s+(?:quarter|half\s+year|period)"
         r"|(?:un)?audited\s+financial\s+results"
     )),
 ]
 
-PAGE_SCORE_KEYWORDS = {
-    "financial results": 5,
-    "quarter ended": 4,
-    "half year": 4,
-    "year ended": 4,
-    "revenue from operations": 5,
-    "earnings per share": 5,
-    "profit before tax": 4,
-    "profit after tax": 4,
-    "total income": 3,
-    "standalone": 3,
-    "consolidated": 3,
-}
+# Table pages whose title matched none of the above rank last, as "untitled"
+TABLE_PREFERENCE = ["consolidated", "standalone", "generic", "untitled"]
 
 def classify_result_page(text: str) -> str | None:
     lower = text.lower()
@@ -395,14 +767,14 @@ def classify_result_page(text: str) -> str | None:
         if pattern.search(heading):
             return basis
 
-    return None
+    return "untitled"
 
-def select_result_pages(page_texts: list) -> tuple:
-    """Pick the result table page plus its continuation page.
+def with_next_page(idx: int, page_texts: list) -> list:
+    return [i for i in (idx, idx + 1) if i < len(page_texts)]
 
-    Prefers consolidated, then standalone, then an untitled result table,
-    then the best keyword-scoring page. Returns (page indices, reason).
-    """
+def find_table_pages(page_texts: list) -> tuple:
+    """Result table page plus its continuation, in TABLE_PREFERENCE order.
+    Returns (indices, basis), or ([], None) if no page is a results table."""
     first_found = {}
 
     for idx, text in enumerate(page_texts):
@@ -410,53 +782,95 @@ def select_result_pages(page_texts: list) -> tuple:
         if basis and basis not in first_found:
             first_found[basis] = idx
 
-    for basis in ["consolidated", "standalone", "generic"]:
+    for basis in TABLE_PREFERENCE:
         if basis in first_found:
-            idx = first_found[basis]
-            return [i for i in (idx, idx + 1) if i < len(page_texts)], f"{basis} table"
+            return with_next_page(first_found[basis], page_texts), basis
 
-    scores = [
-        sum(w for kw, w in PAGE_SCORE_KEYWORDS.items() if kw in text.lower())
-        for text in page_texts
-    ]
+    return [], None
 
-    if not scores or max(scores) == 0:
-        return [], "no result page"
+def ocr_page(pdf_bytes: bytes, page_num: int) -> str:
+    images = convert_from_bytes(
+        pdf_bytes,
+        dpi=250,
+        first_page=page_num,
+        last_page=page_num,
+        poppler_path=POPPLER_PATH
+    )
+    return pytesseract.image_to_string(images[0]) if images else ""
 
-    idx = scores.index(max(scores))
-    return [i for i in (idx, idx + 1) if i < len(page_texts)], f"best keyword score {max(scores)}"
+def ocr_pages(pdf_bytes: bytes, page_texts: list, indices: list) -> list:
+    """OCR the given pages one at a time, replacing their text.
 
-def extract_pages_ocr(pdf_bytes: bytes, page_count: int) -> list:
-    """OCR one page at a time, stopping once a consolidated table and its next page are read."""
-    log.info("    Running OCR fallback...")
+    Stops early once a consolidated table and its next page are both readable.
+    """
+    log.info(f"    Running OCR on pages {[i + 1 for i in indices]}...")
 
-    page_texts = []
+    page_texts = list(page_texts)
+    pending = set(indices)
 
     try:
-        for page_num in range(1, min(page_count, MAX_PDF_PAGES) + 1):
+        for idx in indices:
+            page_texts[idx] = ocr_page(pdf_bytes, idx + 1)
+            pending.discard(idx)
 
-            images = convert_from_bytes(
-                pdf_bytes,
-                dpi=250,
-                first_page=page_num,
-                last_page=page_num,
-                poppler_path=POPPLER_PATH
-            )
-
-            page_texts.append(
-                pytesseract.image_to_string(images[0]) if images else ""
-            )
-
-            if (
-                len(page_texts) >= 2 and
-                classify_result_page(page_texts[-2]) == "consolidated"
-            ):
+            pages, basis = find_table_pages(page_texts)
+            if basis == "consolidated" and not pending.intersection(pages):
                 break
 
     except Exception as e:
         log.warning(f"    OCR extraction failed: {e}")
 
     return page_texts
+
+def get_result_text(pdf_bytes: bytes) -> tuple:
+    """Text of the result table pages to send to the model: (text, reason).
+
+    text is None when no page passes the results-table check, even after OCR.
+    """
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        page_count = min(len(pdf.pages), MAX_PDF_PAGES)
+        page_texts = [
+            page.extract_text() or ""
+            for page in pdf.pages[:page_count]
+        ]
+
+    real_chars = sum(len(t.strip()) for t in page_texts)
+
+    if real_chars < MIN_TEXT_CHARS:
+        log.info(f"    Only {real_chars} chars of text layer, OCR-ing the whole PDF...")
+        page_texts = ocr_pages(pdf_bytes, page_texts, list(range(page_count)))
+        selected, basis = find_table_pages(page_texts)
+
+    else:
+        selected, basis = find_table_pages(page_texts)
+
+        # Hybrid PDF: text cover letter, scanned result pages
+        low_text = [
+            i for i, t in enumerate(page_texts)
+            if len(t.strip()) < LOW_TEXT_PAGE_CHARS
+        ]
+
+        if not selected and low_text:
+            log.info("    No result table in text layer, OCR-ing low-text pages...")
+            page_texts = ocr_pages(pdf_bytes, page_texts, low_text)
+            selected, basis = find_table_pages(page_texts)
+
+    if not selected:
+        return None, "no results table found"
+
+    reason = f"{basis} table"
+
+    text = "\n".join(
+        f"\n\n--- PAGE {i + 1} ---\n{page_texts[i]}"
+        for i in selected
+    )
+
+    log.info(
+        f"    Selected pages {[i + 1 for i in selected]} "
+        f"({reason}, {len(text)} chars)"
+    )
+
+    return text, reason
 
 def _to_number(value) -> float | None:
     if isinstance(value, bool):
@@ -473,17 +887,30 @@ def _to_number(value) -> float | None:
 
     return None
 
+def parse_period_end(value) -> str | None:
+    """ISO date string, or None if the model gave nothing parseable."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+
+    for fmt in PERIOD_END_FORMATS:
+        try:
+            return datetime.strptime(value.strip(), fmt).date().isoformat()
+        except ValueError:
+            continue
+
+    return None
+
 def normalise_financials(data) -> dict | None:
-    """Validate Claude's JSON: numbers only, 3 values per metric, amounts in crores."""
+    """Validate the model's JSON: numbers only, 3 values per metric, amounts in crores."""
     if not isinstance(data, dict):
-        log.warning("    Claude returned non-object JSON")
+        log.warning("    Model returned non-object JSON")
         return None
 
     unit = str(data.get("unit") or "").strip().lower()
     unit = UNIT_ALIASES.get(unit, unit)
 
     if unit not in UNIT_TO_CRORE:
-        log.warning(f"    Unrecognised unit from Claude: {data.get('unit')!r}")
+        log.warning(f"    Unrecognised unit from model: {data.get('unit')!r}")
         return None
 
     factor = UNIT_TO_CRORE[unit]
@@ -491,6 +918,7 @@ def normalise_financials(data) -> dict | None:
     fin = {
         "basis": str(data.get("basis") or "unknown").strip().lower(),
         "unit": unit,
+        "period_end": parse_period_end(data.get("period_end")),
     }
 
     for key in FIN_KEYS:
@@ -511,94 +939,56 @@ def normalise_financials(data) -> dict | None:
 
     return fin
 
-def extract_financials_claude(pdf_bytes: bytes) -> dict | None:
-    """Extract text from PDF locally, then send to Claude via AICredits."""
+def extract_from_text(text: str, model: str) -> dict | None:
+    """Send result-page text to the model via AICredits; validated financials or None."""
     try:
-        # Step 1 — extract text locally with pdfplumber, OCR if it's a scan
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            page_count = len(pdf.pages)
-            page_texts = [
-                page.extract_text() or ""
-                for page in pdf.pages[:MAX_PDF_PAGES]
-            ]
-
-        real_chars = sum(len(t.strip()) for t in page_texts)
-
-        if real_chars < MIN_TEXT_CHARS:
-            log.info(f"    Only {real_chars} chars of text layer, attempting OCR...")
-            page_texts = extract_pages_ocr(pdf_bytes, page_count)
-
-        selected, reason = select_result_pages(page_texts)
-
-        if not selected:
-            log.warning("    No result table page found")
-            return None
-
-        text = "\n".join(
-            f"\n\n--- PAGE {i + 1} ---\n{page_texts[i]}"
-            for i in selected
-        )
-
-        log.info(
-            f"    Selected pages {[i + 1 for i in selected]} "
-            f"({reason}, {len(text)} chars)"
-        )
-
-        # Step 2 — send text to Claude via AICredits OpenAI-compatible API
         response = client.chat.completions.create(
-            model=CLAUDE_MODEL,
+            model=model,
             max_tokens=1500,
             messages=[
                 {
                     "role": "user",
-                    "content": f"{CLAUDE_PROMPT}\n\n---\nPDF TEXT:\n{text}"
+                    "content": f"{EXTRACTION_PROMPT}\n\n---\nPDF TEXT:\n{text}"
                 }
             ],
         )
 
         raw = response.choices[0].message.content or ""
         data = json.loads(raw[raw.find("{"):raw.rfind("}") + 1])
-        log.info(f"    Claude extracted: {data}")
+        log.info(f"    {model} extracted: {data}")
 
         fin = normalise_financials(data)
 
         if fin:
-            log.info(f"    Basis: {fin['basis']}, unit: {fin['unit']}")
+            log.info(
+                f"    Basis: {fin['basis']}, unit: {fin['unit']}, "
+                f"period end: {fin['period_end']}"
+            )
 
         return fin
 
     except json.JSONDecodeError as e:
-        log.warning(f"    Claude JSON parse error: {e}")
+        log.warning(f"    Model JSON parse error: {e}")
         return None
     except Exception as e:
-        log.warning(f"    Claude extraction failed: {e}")
+        log.warning(f"    Model extraction failed: {e}")
         return None
 
+def extract_financials(pdf_bytes: bytes, model: str | None = None) -> dict | None:
+    """Pick the result pages locally (OCR if needed), then have the model read them.
 
-PROCESSED_SCRIPS_FILE = "processed_scrips.json"
-
-def load_processed_scrips():
-
+    Raises SkipFiling when the PDF has no results table (the model isn't called).
+    """
     try:
-        if os.path.exists(PROCESSED_SCRIPS_FILE):
-            with open(PROCESSED_SCRIPS_FILE, "r") as f:
-                return set(json.load(f))
-    except:
-        pass
+        text, reason = get_result_text(pdf_bytes)
+    except Exception as e:
+        log.warning(f"    PDF text extraction failed: {e}")
+        return None
 
-    return set()
+    if not text:
+        raise SkipFiling(reason)
 
-def save_processed_scrips(data):
-
-    with open(
-        PROCESSED_SCRIPS_FILE,
-        "w"
-    ) as f:
-
-        json.dump(
-            list(data),
-            f
-        )
+    return extract_from_text(text, model or EXTRACTION_MODEL)
 
 # ── PEAD SCORE ────────────────────────────────────────────────
 
@@ -710,15 +1100,14 @@ def compute_pead_score(fin: dict):
     rev_yoy = _pct(c_rev, y_rev)
     rev_qoq = _pct(c_rev, q_rev)
 
-    # Tiny prior-year base makes growth % meaningless → no growth points.
+    # A tiny base makes that growth % meaningless → skip just that factor.
     # abs() so a real loss (e.g. -5 Cr) still counts as a turnaround base.
-    small_base = (
-        (y_pat is not None and abs(y_pat) < SMALL_BASE_PAT_CR) or
-        (y_rev is not None and y_rev < SMALL_BASE_REV_CR)
-    )
+    pat_small     = y_pat is not None and abs(y_pat) < SMALL_BASE_PAT_CR
+    rev_yoy_small = y_rev is not None and y_rev < SMALL_BASE_REV_CR
+    rev_qoq_small = q_rev is not None and q_rev < SMALL_BASE_REV_CR
 
-    def growth_label(growth):
-        if small_base:
+    def growth_label(growth, small):
+        if small:
             return "small base"
         return f"{growth:.1f}%" if growth is not None else "N/A"
 
@@ -730,7 +1119,7 @@ def compute_pead_score(fin: dict):
     # 1. EPS Surprise (15 pts, half on turnaround)
     # ─────────────────────────────────────────
 
-    s = 0.0 if small_base else band_score(eps_yoy, [
+    s = 0.0 if pat_small else band_score(eps_yoy, [
         (100, 15),
         (70, 13),
         (50, 11),
@@ -745,7 +1134,7 @@ def compute_pead_score(fin: dict):
     score += s
 
     bd["EPS Surprise"] = (
-        growth_label(eps_yoy),
+        growth_label(eps_yoy, pat_small),
         f"{s:.1f}/15"
     )
 
@@ -753,7 +1142,7 @@ def compute_pead_score(fin: dict):
     # 2. PAT Growth YoY (10 pts, half on turnaround)
     # ─────────────────────────────────────────
 
-    s = 0.0 if small_base else band_score(pat_yoy, [
+    s = 0.0 if pat_small else band_score(pat_yoy, [
         (80, 10),
         (50, 8),
         (30, 6),
@@ -767,7 +1156,7 @@ def compute_pead_score(fin: dict):
     score += s
 
     bd["PAT Growth YoY"] = (
-        growth_label(pat_yoy),
+        growth_label(pat_yoy, pat_small),
         f"{s:.1f}/10"
     )
 
@@ -775,7 +1164,7 @@ def compute_pead_score(fin: dict):
     # 3. Revenue Growth YoY (10 pts)
     # ─────────────────────────────────────────
 
-    s = 0.0 if small_base else band_score(rev_yoy, [
+    s = 0.0 if rev_yoy_small else band_score(rev_yoy, [
         (50, 10),
         (30, 8),
         (20, 6),
@@ -786,7 +1175,7 @@ def compute_pead_score(fin: dict):
     score += s
 
     bd["Revenue Growth YoY"] = (
-        growth_label(rev_yoy),
+        growth_label(rev_yoy, rev_yoy_small),
         f"{s:.1f}/10"
     )
 
@@ -830,7 +1219,7 @@ def compute_pead_score(fin: dict):
     # 5. Revenue QoQ Momentum (5 pts)
     # ─────────────────────────────────────────
 
-    s = 0.0 if small_base else band_score(rev_qoq, [
+    s = 0.0 if rev_qoq_small else band_score(rev_qoq, [
         (25, 5),
         (15, 4),
         (10, 3),
@@ -840,7 +1229,7 @@ def compute_pead_score(fin: dict):
     score += s
 
     bd["Revenue QoQ"] = (
-        growth_label(rev_qoq),
+        growth_label(rev_qoq, rev_qoq_small),
         f"{s:.1f}/5"
     )
 
@@ -870,7 +1259,7 @@ def compute_pead_score(fin: dict):
             f"{s:.1f}/5"
         )
 
-    if (eps_turnaround or pat_turnaround) and not small_base:
+    if (eps_turnaround or pat_turnaround) and not pat_small:
         bd["Turnaround"] = (
             "loss→profit",
             "½ PAT/EPS"
@@ -880,15 +1269,45 @@ def compute_pead_score(fin: dict):
 
 # ── TELEGRAM ─────────────────────────────────────────────────
 
-def send_telegram(company,
-    scrip,
+def send_telegram_text(text: str) -> bool:
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": text,
+                "parse_mode": "HTML",
+            },
+            timeout=10,
+        )
+    except requests.RequestException as e:
+        log.warning(f"  Telegram send failed: {e}")
+        return False
+
+    if r.status_code == 200:
+        return True
+
+    log.warning(f"  Telegram error: {r.text}")
+    return False
+
+def exchange_link(filing: dict) -> str:
+    if filing["exchange"] == "NSE":
+        return f"https://www.nseindia.com/get-quotes/equity?symbol={quote(filing['code'])}"
+    return f"https://www.bseindia.com/stock-share-price/x/x/{quote(filing['code'])}/"
+
+def send_telegram(filing,
     score,
     bd,
     fin,
-    exchange_time,
+    quarter,
     alert_time,
-    filing_type,
     delay_text):
+    exchange_time = (
+        filing["exchange_dt"].strftime("%d %b %Y  %H:%M:%S")
+        if filing["exchange_dt"] else "N/A"
+    )
+    period = f"{quarter} (to {fin['period_end']})" if fin.get("period_end") else quarter
+
     emoji = (
         "🚀" if score >= 40 else
         "✅" if score >= 30 else
@@ -905,12 +1324,14 @@ def send_telegram(company,
         *(["🔄 <b>TURNAROUND</b> (loss → profit)"] if "Turnaround" in bd else []),
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
 
-        f"🏢 <b>{html.escape(company)}</b>",
-        f"📌 BSE: <code>{scrip}</code>",
+        f"🏢 <b>{html.escape(filing['company'])}</b>",
+        f"📌 {filing['exchange']}: <code>{html.escape(filing['code'])}</code>",
 
         "",
 
-        f"📄 <b>Filing:</b> <code>{filing_type}</code>",
+        f"🏛 <b>Source:</b> <code>{filing['exchange']}</code>",
+        f"📄 <b>Filing:</b> <code>{html.escape(filing['category'])}</code>",
+        f"🗓 <b>Period:</b> <code>{html.escape(period)}</code>",
         f"🕐 <b>Exchange:</b> <code>{exchange_time}</code>",
         f"📲 <b>Alert:</b>   <code>{alert_time}</code>",
         f"⚡ <b>Delay:</b>   <code>{delay_text}</code>",
@@ -984,27 +1405,11 @@ def send_telegram(company,
 
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
 
-        f"🔗 https://www.bseindia.com/stock-share-price/x/x/{scrip}/",
+        f"🔗 {html.escape(exchange_link(filing))}",
     ]
 
-    try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": "\n".join(lines),
-                "parse_mode": "HTML",
-            },
-            timeout=10,
-        )
-    except requests.RequestException as e:
-        log.warning(f"  Telegram send failed: {e}")
-        return
-
-    if r.status_code == 200:
+    if send_telegram_text("\n".join(lines)):
         log.info("  ✅ Telegram sent")
-    else:
-        log.warning(f"  Telegram error: {r.text}")
 
 
 # ── MAIN ─────────────────────────────────────────────────────
@@ -1015,35 +1420,49 @@ def has_core_values(fin: dict) -> bool:
         fin["pat"][0] is not None
     )
 
-def process_filing(ann, company, scrip, filing_type, exchange_dt) -> bool:
-    """Download, extract, score and alert. True only if financials were extracted."""
-    attach = ann.get("ATTACHMENTNAME") or ""
+def process_filing(filing: dict, isin, processed: set, nse: NseClient) -> str | None:
+    """Download, extract, score and alert.
 
-    if not attach:
-        log.info("   No attachment"); return False
+    Returns the processed key once financials are extracted — including when
+    the PDF's period shows that quarter was already scored — or None on a
+    retryable failure. Raises SkipFiling when retrying can't help.
+    """
+    if not filing["attachment_url"]:
+        log.info("   No attachment"); return None
 
-    exchange_time = (
-        exchange_dt.strftime("%d %b %Y  %H:%M:%S") if exchange_dt else "N/A"
+    exchange_dt = filing["exchange_dt"]
+    log.info(
+        f"   Exchange time: "
+        f"{exchange_dt.strftime('%d %b %Y  %H:%M:%S') if exchange_dt else 'N/A'}"
     )
-    log.info(f"   Exchange time: {exchange_time}")
 
-    pdf = download_pdf(attach)
+    pdf = download_pdf(filing, nse)
     if not pdf:
-        log.info("   PDF download failed"); return False
+        log.info("   PDF download failed"); return None
+
+    if not pdf.startswith(b"%PDF"):
+        raise SkipFiling(f"attachment is not a PDF (starts {pdf[:8]!r})")
 
     pdf_mb = len(pdf) / (1024 * 1024)
     log.info(f"   PDF: {pdf_mb:.1f} MB — extracting text…")
-    fin = extract_financials_claude(pdf)
+    fin = extract_financials(pdf)
     if not fin:
-        log.info("   Could not extract financials"); return False
+        log.info("   Could not extract financials"); return None
 
     if not has_core_values(fin):
-        log.info("   Missing current-quarter revenue or PAT"); return False
+        log.info("   Missing current-quarter revenue or PAT"); return None
+
+    quarter = filing_quarter(fin, (exchange_dt or datetime.now()).date())
+    key = processed_key(filing, isin, quarter)
+
+    if key in processed:
+        log.info(f"   {key} already scored (quarter from PDF), no alert")
+        return key
 
     score, bd = compute_pead_score(fin)
 
-    save_result_csv(company, scrip, score, fin)
-    log.info(f"   PEAD score: {score}")
+    save_result_csv(filing, score, fin)
+    log.info(f"   PEAD score: {score} ({key})")
 
     if score >= PEAD_THRESHOLD:
 
@@ -1057,100 +1476,236 @@ def process_filing(ann, company, scrip, filing_type, exchange_dt) -> bool:
             delay_text = f"{mins}m {secs}s"
 
         send_telegram(
-            company,
-            scrip,
+            filing,
             score,
             bd,
             fin,
-            exchange_time,
+            quarter,
             datetime.now().strftime("%d %b %Y  %H:%M:%S"),
-            filing_type,
             delay_text
         )
     else:
         log.info(f"   Below {PEAD_THRESHOLD}, no alert")
 
-    return True
+    return key
 
-def main():
+class ScannerState:
+    """Everything that survives between polls; persisted parts saved as they change."""
+
+    def __init__(self, nse: NseClient):
+        self.nse = nse
+        self.seen = load_seen()
+        self.retries = load_retries()          # filing id → failed attempts
+        self.pending = {}                      # filing id → filing awaiting retry
+        self.bse_known_ids = set()             # BSE NEWSIDs fetched on earlier polls
+        self.refresh_master()
+
+    def refresh_master(self):
+        self.master = load_scrip_master(self.nse)
+        self.master_day = date.today()
+        self.processed = migrate_processed_keys(load_processed_scrips(), self.master)
+        save_processed_scrips(self.processed)
+
+    def finish(self, fid: str):
+        """Done with a filing for good: success, skip, or retries exhausted."""
+        self.seen.add(fid)
+        save_seen(self.seen)
+        self.pending.pop(fid, None)
+
+        if self.retries.pop(fid, None) is not None:
+            save_retries(self.retries)
+
+    def learn_isin(self, filing: dict):
+        """NSE filings carry the ISIN — keep the symbol mapping for later."""
+        if filing["exchange"] == "NSE" and filing["isin"]:
+            if self.master["nse"].get(filing["code"]) != filing["isin"]:
+                self.master["nse"][filing["code"]] = filing["isin"]
+                save_json(SCRIP_MASTER_FILE, self.master)
+
+def handle_filing(filing: dict, state: ScannerState):
+    fid = filing["id"]
+
+    if not fid or fid in state.seen:
+        return
+
+    if filing["category"] not in {
+        "Result",
+        "Board Meeting"
+    }:
+        return
+
+    exchange, company = filing["exchange"], filing["company"]
+    source = "+".join(filing["headline_fields"]) or "no headline field"
+
+    if filing["category"] == "Board Meeting" and not is_result_board_meeting(filing["headline"]):
+        log.info(
+            f"→ Skip {exchange} board meeting without results: {company} — "
+            f"{filing['headline'][:100]!r} (headline from {source})"
+        )
+        state.finish(fid)
+        return
+
+    state.learn_isin(filing)
+    isin = lookup_isin(filing, state.master)
+
+    # Cheap pre-check with the filing-date quarter; process_filing re-checks
+    # with the quarter printed in the PDF
+    filed_on = (filing["exchange_dt"] or datetime.now()).date()
+    estimated_key = processed_key(filing, isin, reporting_quarter(filed_on))
+
+    if estimated_key in state.processed:
+        log.info(f"→ Skip {exchange} {company}: {estimated_key} already scored")
+        state.finish(fid)
+        return
+
+    log.info(
+        f"→ New {exchange}: {company} ({filing['code']}, ISIN {isin or 'unknown'}, "
+        f"{filing['category']}; headline from {source})"
+    )
+
+    try:
+        key = process_filing(filing, isin, state.processed, state.nse)
+    except SkipFiling as e:
+        log.info(f"   Skip: {e} — not calling the model, not retrying")
+        state.finish(fid)
+        return
+    except Exception:
+        log.exception("   Unexpected error processing filing")
+        key = None
+
+    if key:
+        state.processed.add(key)
+        save_processed_scrips(state.processed)
+        state.finish(fid)
+        return
+
+    attempts = state.retries.get(fid, 0) + 1
+
+    if attempts > MAX_RETRIES:
+        log.info(f"   Giving up after {attempts} attempts")
+        state.finish(fid)
+    else:
+        state.retries[fid] = attempts
+        save_retries(state.retries)
+        state.pending[fid] = filing
+        log.info(f"   Will retry next poll (retry {attempts}/{MAX_RETRIES})")
+
+def poll_exchanges(state: ScannerState) -> list:
+    """New filings from both exchanges plus pending retries, oldest first,
+    so whichever exchange published a result first is the one processed."""
+    fresh = []
+
+    for exchange, fetch in [
+        ("BSE", lambda: fetch_bse_filings(state.bse_known_ids)),
+        ("NSE", lambda: fetch_nse_filings(state.nse)),
+    ]:
+        try:
+            filings = fetch()
+            log.info(f"{exchange}: {len(filings)} announcements fetched")
+            fresh += filings
+        except ExchangeBlocked as e:
+            warn_blocked(exchange, str(e))
+        except Exception as e:
+            log.warning(f"{exchange} announcements fetch failed: {e}")
+
+    by_id = {f["id"]: f for f in state.pending.values()}
+    by_id.update({f["id"]: f for f in fresh})
+
+    return sorted(by_id.values(), key=lambda f: f["exchange_dt"] or datetime.max)
+
+def dump_samples():
+    """Save one raw announcements response per exchange to verify field names."""
+    nse = NseClient()
+    today = date.today()
+
+    targets = [
+        (
+            "BSE", "raw_bse_sample.json", BSE_HEADLINE_FIELDS,
+            lambda: requests.get(
+                BSE_ANN_URL.format(page=1, date=today.strftime("%Y%m%d")),
+                headers=HEADERS,
+                timeout=15
+            ),
+        ),
+        (
+            "NSE", "raw_nse_sample.json", NSE_HEADLINE_FIELDS,
+            lambda: nse.get(NSE_ANN_URL.format(date=today.strftime("%d-%m-%Y"))),
+        ),
+    ]
+
+    for exchange, path, headline_fields, fetch in targets:
+        try:
+            r = fetch()
+        except Exception as e:
+            log.error(f"{exchange}: request failed: {e}")
+            continue
+
+        try:
+            body = r.json()
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(body, f, indent=2, ensure_ascii=False)
+        except ValueError:
+            body = None
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(r.text)
+
+        log.info(
+            f"{exchange}: HTTP {r.status_code}, saved to {path}"
+            f"{' — ACCESS DENIED' if is_blocked_response(r) else ''}"
+        )
+
+        rows = body if isinstance(body, list) else (
+            (body or {}).get("Table") or (body or {}).get("data") or []
+        )
+
+        if rows:
+            log.info(f"   {len(rows)} rows; fields: {sorted(rows[0].keys())}")
+            present = [f for f in headline_fields if f in rows[0]]
+            log.info(f"   headline fields present: {present or 'NONE'} (expected {headline_fields})")
+
+    for name, fetch in [
+        ("BSE", fetch_bse_master),
+        ("NSE", lambda: fetch_nse_master(nse)),
+    ]:
+        try:
+            log.info(f"{name} scrip master: {len(fetch())} codes with ISIN")
+        except Exception as e:
+            log.error(f"{name} scrip master failed: {e}")
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="PEAD result scanner for BSE + NSE")
+    parser.add_argument(
+        "--dump",
+        action="store_true",
+        help="save one raw BSE and NSE announcements response "
+             "(raw_bse_sample.json, raw_nse_sample.json) and exit",
+    )
+    args = parser.parse_args(argv)
+
+    if args.dump:
+        dump_samples()
+        return
+
     log.info("=" * 55)
-    log.info("  PEAD Tool — BSE poller + Claude Haiku PDF reader")
+    log.info("  PEAD Tool — BSE + NSE poller + LLM PDF reader")
+    log.info(f"  Model           : {EXTRACTION_MODEL}")
     log.info(f"  Alert threshold : score >= {PEAD_THRESHOLD}")
     log.info("=" * 55)
-    
+
     initialize_csv()
 
-    seen: set = load_seen()
-    processed_scrips = load_processed_scrips()   # "{scrip}_{quarter}" keys
-    failed_attempts: dict = {}                   # fid → failures, this run only
+    state = ScannerState(NseClient())
 
-    log.info(f"Loaded {len(seen)} previously seen filings")
-    log.info(f"Loaded {len(processed_scrips)} processed scrip-quarters")
+    log.info(f"Loaded {len(state.seen)} previously seen filings")
+    log.info(f"Loaded {len(state.processed)} processed company-quarters")
+    log.info(f"Loaded {len(state.retries)} filings awaiting retry")
 
     while True:
-        filings = fetch_all_announcements()
-        log.info(f"BSE: {len(filings)} announcements today")
+        if date.today() != state.master_day:
+            state.refresh_master()
 
-        for ann in filings:
-            fid     = str(ann.get("NEWSID") or ann.get("DT_TM") or "")
-            company = ann.get("SLONGNAME") or ann.get("SNAME") or "Unknown"
-            scrip   = str(ann.get("SCRIP_CD") or "")
-            category = ann.get("CATEGORYNAME", "")
-
-            if not fid or fid in seen:
-                continue
-
-            if category not in {
-                "Result",
-                "Board Meeting"
-            }:
-                continue
-
-            if category == "Board Meeting":
-                headline = announcement_headline(ann)
-
-                if not is_result_board_meeting(headline):
-                    log.info(f"→ Skip board meeting without results: {company} — {headline[:100]}")
-                    seen.add(fid)
-                    save_seen(seen)
-                    continue
-
-            exchange_dt = parse_exchange_time(ann)
-            quarter_key = f"{scrip}_{reporting_quarter((exchange_dt or datetime.now()).date())}"
-
-            if quarter_key in processed_scrips:
-                log.info(f"→ Skip {company}: {quarter_key} already scored")
-                seen.add(fid)
-                save_seen(seen)
-                continue
-
-            log.info(f"→ New: {company} ({quarter_key}, {category})")
-
-            try:
-                ok = process_filing(ann, company, scrip, category, exchange_dt)
-            except Exception:
-                log.exception("   Unexpected error processing filing")
-                ok = False
-
-            if ok:
-                processed_scrips.add(quarter_key)
-                save_processed_scrips(processed_scrips)
-                seen.add(fid)
-                save_seen(seen)
-                failed_attempts.pop(fid, None)
-                continue
-
-            failed_attempts[fid] = failed_attempts.get(fid, 0) + 1
-
-            if failed_attempts[fid] > MAX_RETRIES:
-                log.info(f"   Giving up after {failed_attempts[fid]} attempts")
-                seen.add(fid)
-                save_seen(seen)
-            else:
-                log.info(
-                    f"   Will retry next poll "
-                    f"({failed_attempts[fid]}/{MAX_RETRIES} retries used)"
-                )
+        for filing in poll_exchanges(state):
+            handle_filing(filing, state)
 
         log.info(f"Sleeping {POLL_INTERVAL_SEC}s…\n")
         time.sleep(POLL_INTERVAL_SEC)

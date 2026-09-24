@@ -1,112 +1,137 @@
 # PEAD Result Scanner
 
-Post-Earnings Announcement Drift scanner for Indian stocks. Polls BSE corporate announcements, pulls quarterly-result PDFs, has Claude Haiku extract the financials as JSON, scores the result out of 50, logs it to CSV, and sends a Telegram alert when the score is at or above `PEAD_THRESHOLD`.
+Post-Earnings Announcement Drift scanner for Indian stocks. It polls BSE and NSE corporate announcements, pulls quarterly-result PDFs, has an LLM (via AICredits) extract the financials as JSON, scores the result out of 50, logs it to CSV, and sends a Telegram alert when the score is at or above `PEAD_THRESHOLD`.
 
-Everything lives in one file, [pead_tool.py](pead_tool.py). It is a long-running script with no tests, no package structure and no CLI arguments.
+## Files
+
+| File | What it is |
+|---|---|
+| [pead_tool.py](pead_tool.py) | The scanner. It is one procedural module with no package structure. |
+| [compare_models.py](compare_models.py) | Runs a folder of saved PDFs through two models and prints the extracted values side by side. |
+| [test_pead.py](test_pead.py) | Offline tests. Run `python test_pead.py` and expect `FAILURES: 0`. Network, model and Telegram are mocked, and state files go to a temp dir. The PDF section uses the real pdfplumber, Poppler and Tesseract (about 15s of OCR). Keep it passing and extend it with any change. |
 
 ## Running
 
 ```
-python pead_tool.py
+python pead_tool.py            # poll forever
+python pead_tool.py --dump     # save raw_bse_sample.json + raw_nse_sample.json, log field names and scrip-master counts, exit
+python compare_models.py pdfs/ --model-b <aicredits-model-name>   # --model-a defaults to EXTRACTION_MODEL
+python test_pead.py
 ```
 
-- Dependencies are in `requirements.txt` (unpinned): openai, requests, pdfplumber, pdf2image, pytesseract, python-dotenv.
-- On this machine the Python 3.14 install (`C:\Users\tralp\AppData\Local\Python\bin\python.exe`, i.e. `py`) has the deps. The Python 3.10 install on PATH does **not**. Needs Python 3.10+ (`dict | None` syntax).
-- External binaries use hardcoded Windows paths: Tesseract at `C:\Program Files\Tesseract-OCR\tesseract.exe`, Poppler at `C:\poppler\Library\bin`.
-- `.env` must define `AICREDITS_API_KEY`, `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`. The script raises at import if any is missing. Never print or commit `.env`.
+- Dependencies are in `requirements.txt` (unpinned). The tests also use Pillow and pypdfium2, which come with pdfplumber/pdf2image.
+- On this machine the Python 3.14 install (`py`) has the deps. The Python 3.10 on PATH does **not**. Needs Python 3.10+.
+- Tesseract is expected at `C:\Program Files\Tesseract-OCR\tesseract.exe` and Poppler at `C:\poppler\Library\bin` (hardcoded).
+- `.env` needs `AICREDITS_API_KEY`, `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`; the script raises at import if any is missing. `EXTRACTION_MODEL` is optional and defaults to `anthropic/claude-haiku-4-5`. Never print or commit `.env`.
 
-## Pipeline (one poll cycle in `main()`)
+## Pipeline
 
-1. **Fetch**: `fetch_all_announcements()` GETs BSE `AnnSubCategoryGetData` for today's date, `pageno=1` only, with a browser User-Agent and Referer. Returns `json["Table"]`, or `[]` on any error, including an Akamai "Access Denied" HTML page.
-2. **Filter** each announcement in `main()`:
-   - Skip if `NEWSID` is already in `seen`.
-   - `CATEGORYNAME` must be in `{"Result", "Board Meeting"}`. Board Meeting is included because Board Meeting Outcome PDFs often carry results and are published earlier.
-   - Board Meeting filings must also pass `is_result_board_meeting()`: "outcome" plus the word result(s) in `NEWSSUB`/`HEADLINE`/`SUBCATNAME`. Those field names are not verified against a live response. Filings that fail the filter are logged and marked seen.
-   - The block key is `"{scrip}_{quarter}"`, e.g. `532540_Q1FY27`. `reporting_quarter()` derives the quarter from the filing date: Jul–Sep gives Q1, Oct–Dec Q2, Jan–Mar Q3 and Apr–Jun Q4, on an April–March FY. If the key is already in `processed_scrips`, the filing is marked seen and skipped.
-3. **`process_filing()`**: downloads `BSE_PDF_BASE + ATTACHMENTNAME`, extracts, scores, writes the CSV and alerts. It returns True only if extraction succeeded, meaning current-quarter `revenue_from_operations` **and** `pat` are both present (`has_core_values`).
-   - `main()` wraps it in try/except.
-   - On success the quarter key goes into `processed_scrips` and the NEWSID into `seen`.
-   - On failure the NEWSID is retried on later polls, up to `MAX_RETRIES` (3) extra attempts, then marked seen. The attempt counter is in-memory only, so it resets on restart.
-4. **Page texts** in `extract_financials_claude()`: pdfplumber reads pages 1–`MAX_PDF_PAGES` (25). If the combined stripped text is under `MIN_TEXT_CHARS` (500), the PDF is treated as a scan. `extract_pages_ocr()` then OCRs one page at a time (Poppler at 250 dpi, then Tesseract) and stops early once a consolidated table page and its next page are read. OCR takes about 2s per page.
-5. **Page selection** in `select_result_pages()`:
-   - A page is a result table if it has at least 2 `TABLE_MARKERS`.
-   - Its type comes from `RESULT_HEADINGS` matched in its first `HEADING_LINES` (20) lines.
-   - Preference order: the first consolidated table, then standalone, then generic. That page and the next one are sent.
-   - Fallback is the best `PAGE_SCORE_KEYWORDS` page plus the next one. If every page scores 0, the filing fails.
-6. **LLM extraction**: the OpenAI SDK points at `https://api.aicredits.in/v1` with model `anthropic/claude-haiku-4-5` and `max_tokens=1500`. The selected pages are sent in full, with no truncation. The JSON is sliced from the first `{` to the last `}`.
-   - `normalise_financials()` validates the reply. Every `FIN_KEYS` entry becomes a 3-float list `[cq, pq, ly]`: non-numbers become None and the list is padded or trimmed.
-   - It converts amounts to ₹ crore **in code** using `unit` and `UNIT_TO_CRORE`. `basic_eps` is never converted.
-   - It keeps `basis` (consolidated or standalone) and `unit` as extra keys. An unknown unit fails the extraction.
-7. **Score**: `compute_pead_score(fin)` returns `(score, breakdown_dict)`.
-8. **Log and alert**: `save_result_csv()` appends to `pead_results.csv`; an OSError is logged and doesn't block the alert. If `score >= PEAD_THRESHOLD`, `send_telegram()` posts an HTML message.
-   - The company name and scorecard rows are HTML-escaped.
-   - The post is guarded with try/except.
-   - Delay is measured at alert time.
-9. Sleep `POLL_INTERVAL_SEC` (30s). Processing is sequential, so one slow OCR or LLM call delays everything behind it.
+Each poll, `main()` calls `poll_exchanges()`, then `handle_filing()` for each filing, then sleeps `POLL_INTERVAL_SEC` (30s). Processing is sequential.
+
+1. **Fetch** (`poll_exchanges`)
+   - **BSE**: `fetch_bse_filings(known_ids)` reads `AnnSubCategoryGetData` pages. It stops when a page has no NEWSIDs unseen on earlier polls, or at the row's `TotalPageCnt`, capped at `BSE_MAX_PAGES` (100). It returns only new rows, so `state.pending` re-queues filings awaiting retry.
+     - Verified 2026-09-24: 50 rows per page, newest first, and an out-of-range page returns an empty `Table`. A busy day runs 30+ pages.
+     - BSE returns **403 unless `HEADERS` includes `Origin` and `Accept`**. User-Agent and Referer alone stopped working, for both the API and the scrip master. PDF downloads work either way.
+   - **NSE**: `fetch_nse_filings(NseClient)` calls `/api/corporate-announcements` for today. `NseClient` primes cookies from the NSE homepage and re-primes once on 401/403.
+   - An Access Denied, 401 or 403 response raises `ExchangeBlocked`. `warn_blocked()` then logs an error every poll and sends Telegram at most every `BLOCKED_ALERT_SEC` per exchange. A block is never treated as zero announcements.
+   - Filings from both exchanges plus pending ones are sorted oldest first, so whichever exchange published first is processed.
+2. **Normalise**: `normalise_bse` and `normalise_nse` produce one shared filing dict:
+   - `exchange`, `id` (`BSE:<NEWSID>` / `NSE:<seq_id>`), `company`, `code` (scrip code or symbol), `isin` (NSE only)
+   - `category`: NSE's `desc` is mapped to "Board Meeting" or "Result" by `nse_category`
+   - `headline` plus the `headline_fields` it came from, `attachment_url`, `exchange_dt`
+3. **Filter** (`handle_filing`)
+   - Skip filings already in `seen`. The category must be "Result" or "Board Meeting".
+   - Board Meeting filings must pass `is_result_board_meeting()`: "outcome" plus the word result(s).
+   - Headline sources are BSE `NEWSSUB`/`HEADLINE`/`SUBCATNAME` and NSE `desc`/`attchmntText`. Which fields were used is logged.
+   - Verified against live data on 2026-09-24, as were `seq_id`, `sm_isin`, `exchdisstime` and BSE `NEWSID`/`DT_TM`. `test_pead.py` has real captured rows as fixtures.
+   - NSE files results under desc "Outcome of Board Meeting", with the standard text "…has submitted to the Exchange, the financial results for the period ended…".
+   - NSE's generic "…Outcome of Board Meeting held on <date>" filings are non-result outcomes, such as buybacks.
+   - NSE `attchmntFile` is `-` when there is no attachment (treated as none). Some attachments are `.zip`.
+4. **Dedup**
+   - The ISIN comes from the NSE filing itself, or from the scrip master for BSE (`lookup_isin`).
+   - The pre-check key is `{ISIN}_{quarter}`, with the quarter estimated from the filing date (`reporting_quarter`). While the ISIN is unknown the key is `{EXCHANGE}-{code}_{quarter}`.
+   - If the key is already in `processed_scrips`, the filing is marked seen and skipped.
+5. **`process_filing()`**: download (NSE via the session), extract, check `has_core_values` (current revenue **and** PAT), then compute the real key.
+   - The real quarter comes from the PDF's `period_end` via `filing_quarter`. It is only trusted if it falls 0–400 days before the filing date; otherwise the filing-date estimate is used.
+   - If that key is already processed, the filing is a duplicate: no score and no alert.
+   - Otherwise it scores, writes the CSV and alerts, and returns the key. It returns None on failure.
+6. **Retry or skip**
+   - On a retryable failure (download, model call, missing revenue or PAT, crash), the filing is retried on later polls, up to `MAX_RETRIES` (3) extra attempts. The counts persist in `retry_counts.json`, so restarts don't reset them.
+   - `SkipFiling` is raised when retrying can't help: "no results table found", or an attachment that isn't a PDF. The filing is then logged, marked seen and never retried, and the model is not called.
+   - Success, a skip, or giving up calls `state.finish()`, which marks the filing seen and clears its retry count.
+
+## Extraction (`extract_financials` = `get_result_text` + `extract_from_text`)
+
+- pdfplumber reads pages 1–`MAX_PDF_PAGES` (25).
+- If the whole PDF has under `MIN_TEXT_CHARS` (500) of text, it is OCR'd.
+- Otherwise, if no result table is found in the text layer, the pages under `LOW_TEXT_PAGE_CHARS` (200) are OCR'd. That handles a text cover letter with scanned result pages.
+- `ocr_pages()` works one page at a time (Poppler at 250 dpi, then Tesseract) and stops once a consolidated table and its next page are readable. OCR takes about 2s per page.
+- `find_table_pages()`:
+  - A page is a results table if it has at least 2 `TABLE_MARKERS`. Real noisy text layers, like ESDS and Purple Style, match only 2.
+  - Its type comes from `RESULT_HEADINGS` in its first 20 lines, and a table with an unrecognised title is "untitled".
+  - The first page in `TABLE_PREFERENCE` order (consolidated, standalone, generic, untitled) is sent, together with the next page.
+  - There is **no keyword fallback**. If no page is a results table, even after OCR, `get_result_text` returns `(None, "no results table found")` and `extract_financials` raises `SkipFiling`.
+- `extract_from_text(text, model)` sends `EXTRACTION_PROMPT` plus the page text with `max_tokens=1500` and no truncation. The JSON is sliced from the first `{` to the last `}`.
+- `normalise_financials()` validates the reply:
+  - Every `FIN_KEYS` entry becomes a 3-float list `[cq, pq, ly]`.
+  - Amounts are converted to ₹ crore in code from `unit` (`UNIT_TO_CRORE`). EPS is never converted.
+  - It keeps `basis`, `unit` and `period_end` (ISO string or None). An unknown unit fails the extraction.
 
 ## PEAD score (max 50)
 
-Growth is `_pct(curr, prev) = (curr - prev) / abs(prev) * 100`. Bands are applied by `band_score`: the first threshold reached, walking down from the highest.
+Growth is `_pct(curr, prev) = (curr - prev) / abs(prev) * 100`. `band_score` awards the first band threshold reached, walking down from the highest.
 
-| Factor | Pts | Input |
-|---|---|---|
-| EPS surprise | 15 | basic EPS YoY % |
-| PAT growth | 10 | PAT YoY % |
-| Revenue growth | 10 | revenue YoY % |
-| EBITDA margin expansion | 5 | margin delta (pp) vs same quarter last year |
-| Revenue momentum | 5 | revenue QoQ % |
-| Net margin quality | 5 | PAT / revenue % |
+| Factor | Pts | Input | Skipped as "small base" when |
+|---|---|---|---|
+| EPS surprise | 15 | basic EPS YoY % | \|last-year PAT\| < ₹1 Cr |
+| PAT growth | 10 | PAT YoY % | \|last-year PAT\| < ₹1 Cr |
+| Revenue growth | 10 | revenue YoY % | last-year revenue < ₹10 Cr |
+| EBITDA margin expansion | 5 | margin delta (pp) vs same quarter last year | — |
+| Revenue momentum | 5 | revenue QoQ % | last-quarter revenue < ₹10 Cr |
+| Net margin quality | 5 | PAT / revenue % | — |
 
 - **Hard reject**: the score is 0 if current PAT, EBITDA or EPS is negative.
-- **Small base**: all four growth factors (EPS, PAT YoY, revenue YoY, revenue QoQ) score 0, labelled "small base", if `abs(last-year PAT) < SMALL_BASE_PAT_CR` (1) or `last-year revenue < SMALL_BASE_REV_CR` (10). The remaining maximum is then 10, so these companies can't alert.
-- **Turnaround**: the EPS and PAT growth factors are each halved when that metric's last-year value was negative. A `"Turnaround"` row is added to `bd`, which also adds a 🔄 header line to the alert. The row is omitted when small-base applies.
-- **EBITDA**: `estimate_ebitda()` uses the extracted `ebitda` if `[0]` is non-null. Otherwise it computes PBT + finance cost + depreciation. Other income is not removed.
-- Missing inputs score 0 for that factor. A fully null extraction therefore scores 0.0 rather than being treated as a failure.
+- **Turnaround**: when last year's value was negative, that factor's EPS and PAT band scores are halved. A `"Turnaround"` row is added to `bd`, which also adds a 🔄 alert line. The row is omitted when the PAT small base applies.
+- **EBITDA**: `estimate_ebitda()` uses the extracted EBITDA, or else PBT + finance cost + depreciation.
 
-## State and output files
+## State and output files (all relative, so run from the repo root)
 
 | File | Purpose | Git |
 |---|---|---|
-| `seen.json` | NEWSIDs finished with (succeeded, skipped, or retries exhausted) | ignored |
-| `processed_scrips.json` | `"{scrip}_{quarter}"` keys scored successfully. Bare scrip codes from the old format never match. | **tracked** |
+| `seen.json` | Filing ids finished with. Bare legacy ids load as `BSE:` ids. | ignored |
+| `processed_scrips.json` | `{ISIN}_{quarter}` keys (or the `{EXCHANGE}-{code}_{quarter}` fallback). `migrate_processed_keys()` upgrades legacy or fallback keys at startup and at the daily master refresh. | **tracked** |
+| `retry_counts.json` | filing id → failed attempts | ignored |
+| `scrip_master.json` | `{"bse": {code: ISIN}, "nse": {symbol: ISIN}, "updated"}` | ignored |
 | `pead_results.csv` | One row per scored filing | ignored |
+| `raw_bse_sample.json`, `raw_nse_sample.json` | `--dump` output | ignored |
 
-CSV columns: timestamp, company, scrip, score, then revenue/pat/ebitda for cq, pq and ly, then eps_cq and eps_ly.
+- **Scrip master**: built from BSE `ListofScripData` and NSE `EQUITY_L.csv` / `SME_EQUITY_L.csv`, refreshed daily. `updated` is only stamped when both downloads succeed, and failed downloads keep the cached mappings. NSE filings also teach symbol → ISIN (`learn_isin`).
+- **CSV columns**: timestamp, company, scrip (code or symbol), score, revenue/pat/ebitda for cq, pq and ly, eps_cq, eps_ly, exchange.
+  - `initialize_csv()` adds the `exchange` column to older files and marks old rows BSE.
+  - Some rows from 27–28 May 2026 came from an older scoring version (scores above 50).
+  - Rows before 2026-09-24 relied on the LLM to convert units.
 
-Older rows came from an earlier scoring version and include scores above 50. Rows before 2026-09-24 relied on the LLM to convert units, and many small caps look like unconverted lakhs; newer rows are converted in code. There is no version, filing ID, category, headline or basis column.
+## Config (top of `pead_tool.py`)
 
-## Config constants (top of `pead_tool.py`)
-
-- `PEAD_THRESHOLD = 35`. The module docstring says 30, which is stale.
-- `MAX_RETRIES = 3`, `SMALL_BASE_PAT_CR = 1`, `SMALL_BASE_REV_CR = 10`
-- Extraction tuning sits next to the prompt: `MAX_PDF_PAGES`, `MIN_TEXT_CHARS`, `HEADING_LINES`, `TABLE_MARKERS`, `RESULT_HEADINGS`, `UNIT_TO_CRORE`.
-- The Telegram emoji tiers are hardcoded separately in `send_telegram`: 🚀 ≥40, ✅ ≥30, 🟡 otherwise.
-- `POLL_INTERVAL_SEC = 30`
-- `CLAUDE_MODEL = "anthropic/claude-haiku-4-5"` (AICredits model naming)
-- `SEEN_FILE`, `RESULTS_CSV`, `PROCESSED_SCRIPS_FILE` are relative paths, so run from the repo root.
+- `PEAD_THRESHOLD = 35`, `POLL_INTERVAL_SEC = 30`, `MAX_RETRIES = 3`, `BLOCKED_ALERT_SEC = 3600`
+- `SMALL_BASE_PAT_CR = 1`, `SMALL_BASE_REV_CR = 10`
+- The Telegram emoji tiers are hardcoded separately in `send_telegram` (🚀 ≥40, ✅ ≥30).
+- Exchange constants sit in the EXCHANGES section, and extraction tuning sits next to `EXTRACTION_PROMPT`.
 
 ## Conventions
 
-- The code style is procedural: module-level functions, a `log = logging.getLogger` logger, and f-string logs prefixed with spaces to indent sub-steps under `→ New: <company>`.
-- Network and parse errors are generally caught, logged with `log.warning`, and the step returns `None` or `[]`. Keep that pattern. `main()` also wraps each `process_filing()` call in try/except, so a crash counts as a failed attempt instead of stopping the scanner.
-- After `normalise_financials()`, every `FIN_KEYS` value is a 3-element list of floats or None, in ₹ crore (EPS in ₹). Add new metrics to both `FIN_KEYS` and the prompt.
-- Telegram messages use `parse_mode: HTML`. Dynamic text must be HTML-escaped (company names contain `&`).
-- The BSE API and PDF host sit behind Akamai. Keep browser-like headers and don't hammer them.
+- The style is procedural: module-level functions, `log = logging.getLogger`, and f-string logs with leading spaces to indent sub-steps under `→ New ...`. `ScannerState` and `NseClient` are the only classes.
+- Network and parse errors are caught, logged with `log.warning`, and the step returns None or `[]`. `handle_filing` wraps `process_filing` in try/except, so a crash counts as a failed attempt.
+- After `normalise_financials()`, every `FIN_KEYS` value is a 3-element list of floats or None, in ₹ crore. Add new metrics to `FIN_KEYS` **and** the prompt.
+- Telegram uses `parse_mode: HTML`, so HTML-escape anything dynamic. Company names and NSE symbols contain `&` (e.g. `M&M`).
+- Both exchanges sit behind Akamai. Keep the browser-like headers and don't add request volume casually.
+- Heredocs in the Bash tool mangle backslashes and `\n` in Python source. Write code with the Write or Edit tools, or with script files.
 
-## Known issues (as of 2026-09-24; update as they are fixed)
+## Known open issues (2026-09-24)
 
-Fixed on 2026-09-24:
-- The per-quarter block
-- The Board Meeting filter
-- Retry on failure
-- Pages 1–25 and a working OCR trigger
-- Consolidated preference
-- Unit conversion in code
-- No truncation
-- HTML escaping and exception guards
-
-Still open (P1/P2):
-- Only BSE `pageno=1` is fetched, and an Akamai "Access Denied" reply is indistinguishable from "no announcements".
-- A hybrid PDF (text cover letter, scanned result pages) has more than 500 chars of text, so it isn't OCR'd. The table isn't found and the fallback sends the cover letter.
-- The Telegram emoji tiers are hardcoded (40/30), and `send_telegram` calls `estimate_ebitda` 7 times.
-- The CSV lacks filing ID, headline, basis and score-version columns. State-file writes aren't atomic. `requirements.txt` is unpinned, and the module docstring is stale.
+- NSE SME announcements (`index=sme`) are not polled.
+- `nse_category` maps any NSE desc containing "financial result" to "Result", but no such desc was seen on 2026-09-24; results came as "Outcome of Board Meeting".
+- BSE `HEADLINE` can be truncated at about 190 chars; the full text is in `MORE`, which the filter doesn't read. This was fine on 2026-09-24 because outcome headlines are short.
+- Announcements are fetched for today only, so filings just before midnight can be missed on a restart.
+- The emoji tiers are hardcoded, and `send_telegram` calls `estimate_ebitda` 7 times.
+- The CSV lacks filing id, headline, basis, period and score-version columns. State writes aren't atomic, and `requirements.txt` is unpinned.
