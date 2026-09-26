@@ -79,29 +79,51 @@ RETRIES_FILE = "retry_counts.json"                # filing id → failed attempt
 SCRIP_MASTER_FILE = "scrip_master.json"           # BSE code / NSE symbol → ISIN
 # ─────────────────────────────────────────────────────────────
 
-LOG_FORMAT  = "%(asctime)s  %(levelname)s  %(tag)s%(message)s"
-LOG_DATEFMT = "%H:%M:%S"
-LOG_FILE    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pead_tool.log")
+LOG_DATEFMT   = "%H:%M:%S"
+LOG_FILE      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pead_tool.log")
+COMPANY_WIDTH = 30     # company column in filing lines
 
-logging.basicConfig(
-    level=logging.INFO,
-    format=LOG_FORMAT,
-    datefmt=LOG_DATEFMT,
-)
+class LineFormatter(logging.Formatter):
+    """"HH:MM:SS  STATUS  message", one fixed-column line per record.
 
-class ThreadTag(logging.Filter):
-    """Tag log lines written by the ambiguous-outcome worker thread."""
-    def filter(self, record):
-        record.tag = "[checker] " if record.threadName == "checker" else ""
-        return True
+    Filing and poll lines pass a status word (POLL, SKIP, CHECK, NONE, SCORE,
+    ALERT, RETRY, OLD, ERROR) as extra={"status": ...}; other lines show their
+    level (INFO, WARN, ERROR, DEBUG). Non-filing lines from the checker thread
+    are tagged [checker]. dashboard.py parses this layout.
+    """
+    LEVELS = {
+        logging.DEBUG: "DEBUG",
+        logging.INFO: "INFO",
+        logging.WARNING: "WARN",
+        logging.ERROR: "ERROR",
+        logging.CRITICAL: "ERROR",
+    }
 
-for _handler in logging.getLogger().handlers:
-    _handler.addFilter(ThreadTag())
+    def format(self, record):
+        status = getattr(record, "status", None)
+        tag = "[checker] " if record.threadName == "checker" and not status else ""
+        line = (
+            f"{self.formatTime(record, LOG_DATEFMT)}  "
+            f"{status or self.LEVELS.get(record.levelno, record.levelname):<5}  "
+            f"{tag}{record.getMessage()}"
+        )
+        if record.exc_info:
+            line += "\n" + self.formatException(record.exc_info)
+        return line
 
+# This module logs everything down to DEBUG; each handler picks what it shows.
+# The root logger stays at WARNING so libraries (httpx, pdfminer…) stay quiet.
 log = logging.getLogger(__name__)
+log.setLevel(logging.DEBUG)
+
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)          # --verbose lowers it to DEBUG
+console_handler.setFormatter(LineFormatter())
+logging.getLogger().addHandler(console_handler)
 
 def setup_file_logging(path: str = LOG_FILE) -> logging.Handler:
-    """Also write every log line to a UTF-8 file, rotating at 5 MB with 3 backups.
+    """Also write every line, DEBUG included, to a UTF-8 file rotating at 5 MB
+    with 3 backups.
 
     Called only when run as a script, so tests and compare_models.py that
     import this module don't write to the scanner's log.
@@ -112,8 +134,8 @@ def setup_file_logging(path: str = LOG_FILE) -> logging.Handler:
         backupCount=3,
         encoding="utf-8",
     )
-    handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=LOG_DATEFMT))
-    handler.addFilter(ThreadTag())
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(LineFormatter())
     logging.getLogger().addHandler(handler)
     return handler
 
@@ -263,7 +285,7 @@ def save_result_csv(filing, score, fin):
             ])
     except OSError as e:
         # e.g. CSV open in Excel — don't let logging block the alert
-        log.warning(f"   Could not write CSV row: {e}")
+        log.warning(f"Could not write CSV row: {e}")
 
 # ── EXCHANGES ────────────────────────────────────────────────
 #
@@ -277,12 +299,17 @@ class ExchangeBlocked(Exception):
 
 class SkipFiling(Exception):
     """The filing can never yield a score (no results table, not a PDF, old
-    quarter): skip it for good, no retry. model_called says whether the model
-    had already read it (only for an old quarter)."""
+    quarter): skip it for good, no retry. status is its terminal status word
+    (NONE for no results table, OLD for an old quarter, else SKIP);
+    model_called says whether the model had already read it."""
 
-    def __init__(self, reason: str, model_called: bool = False):
+    def __init__(self, reason: str, model_called: bool = False, status: str = "SKIP"):
         super().__init__(reason)
         self.model_called = model_called
+        self.status = status
+
+class RetryFiling(Exception):
+    """A failure worth retrying on a later poll (download, model, missing values)."""
 
 def is_blocked_response(r) -> bool:
     return r.status_code in (401, 403) or "access denied" in r.text[:2000].lower()
@@ -353,7 +380,7 @@ class NseClient:
         r = self.session.get(url, timeout=timeout)
 
         if r.status_code in (401, 403):
-            log.info(f"NSE returned {r.status_code}, refreshing session cookies")
+            log.debug(f"NSE returned {r.status_code}, refreshing session cookies")
             self._prime()
             r = self.session.get(url, timeout=timeout)
 
@@ -588,7 +615,7 @@ def pdf_quarter(fin: dict, filed_on: date) -> str | None:
         if timedelta(0) <= filed_on - ended <= timedelta(days=400):
             return quarter_label(ended)
 
-        log.warning(f"   period_end {period_end} implausible for a filing on {filed_on}, using filing date")
+        log.warning(f"period_end {period_end} implausible for a filing on {filed_on}, using filing date")
 
     return None
 
@@ -816,14 +843,35 @@ MIN_TEXT_CHARS      = 500   # whole PDF below this → treat as scanned, OCR it 
 LOW_TEXT_PAGE_CHARS = 200   # no table in text layer → OCR pages below this
 HEADING_LINES       = 20    # a result table's title sits near the top of its page
 
-# A page counts as a result table only if it has at least two of these
-# (real text layers are noisy: ESDS and Purple Style tables matched just two)
-TABLE_MARKERS = [
-    "revenue from operations",
-    "total income",
-    "profit before tax",
-    "earnings per share",
-]
+# A page counts as a results table if it shows at least two of these kinds
+# of line item. Each kind accepts the wording different formats use:
+# companies ("Revenue from operations", "Profit before tax"), NBFCs ("Total
+# Revenue", "Profit/(Loss) before Tax", "Earning per equity share" — Gowra
+# Leasing, 26 Sep 2026, matched only one of the old fixed phrases) and banks
+# ("Interest earned", "Interest expended", "Operating profit before
+# provisions"). Real text layers are noisy: ESDS and Purple Style show two.
+TABLE_MARKERS = {
+    "income": re.compile(
+        r"revenue\s+from\s+operations|income\s+from\s+operations|total\s+income"
+        r"|total\s+revenue|interest\s+(?:earned|income)|net\s+sales"
+    ),
+    "expenses": re.compile(
+        r"total\s+expenses|finance\s+costs?|interest\s+expended|operating\s+expenses"
+    ),
+    "profit before tax": re.compile(
+        r"(?:profit|loss)\s*(?:/\s*\(?\s*(?:profit|loss)\s*\)?\s*)?"
+        r"(?:from\s+ordinary\s+activities\s+)?before\s+(?:[a-z&]+\s+){0,3}tax"
+        r"|operating\s+profit\s+before\s+provisions"
+    ),
+    "net profit": re.compile(
+        r"net\s+profit|profit\s*(?:/\s*\(?\s*loss\s*\)?\s*)?(?:after\s+tax|for\s+the\s+(?:period|quarter|year))"
+    ),
+    "eps": re.compile(r"earnings?\s+per\s+(?:equity\s+)?share|\beps\b"),
+}
+
+# A page headed like this is a cash flow statement or balance sheet, not
+# the results table, unless its heading also names the results
+NOT_TABLE_HEADINGS = re.compile(r"cash\s+flow|assets\s+and\s+liabilities|balance\s+sheet")
 
 # Checked against the top of each table page, in order of preference
 RESULT_HEADINGS = [
@@ -847,7 +895,7 @@ TABLE_PREFERENCE = ["consolidated", "standalone", "generic", "untitled"]
 def classify_result_page(text: str) -> str | None:
     lower = text.lower()
 
-    if sum(marker in lower for marker in TABLE_MARKERS) < 2:
+    if sum(1 for pattern in TABLE_MARKERS.values() if pattern.search(lower)) < 2:
         return None
 
     heading = " ".join(lower.splitlines()[:HEADING_LINES])
@@ -855,6 +903,9 @@ def classify_result_page(text: str) -> str | None:
     for basis, pattern in RESULT_HEADINGS:
         if pattern.search(heading):
             return basis
+
+    if NOT_TABLE_HEADINGS.search(heading):
+        return None
 
     return "untitled"
 
@@ -894,7 +945,7 @@ def ocr_pages(pdf_bytes: bytes, page_texts: list, indices: list,
     Stops early once a consolidated table and its next page are both readable.
     Adds the time spent to timings["ocr"].
     """
-    log.info(f"    Running OCR on pages {[i + 1 for i in indices]}...")
+    log.debug(f"running OCR on pages {[i + 1 for i in indices]}")
 
     started = time.monotonic()
     page_texts = list(page_texts)
@@ -910,7 +961,7 @@ def ocr_pages(pdf_bytes: bytes, page_texts: list, indices: list,
                 break
 
     except Exception as e:
-        log.warning(f"    OCR extraction failed: {e}")
+        log.warning(f"OCR extraction failed: {e}")
 
     if timings is not None:
         timings["ocr"] = timings.get("ocr", 0) + time.monotonic() - started
@@ -946,7 +997,7 @@ def _find_result_text(pdf_bytes: bytes, ocr_page_limit: int, timings: dict) -> t
     real_chars = sum(len(t.strip()) for t in page_texts)
 
     if real_chars < MIN_TEXT_CHARS:
-        log.info(f"    Only {real_chars} chars of text layer, OCR-ing the whole PDF...")
+        log.debug(f"only {real_chars} chars of text layer, OCR-ing the whole PDF")
         page_texts = ocr_pages(pdf_bytes, page_texts, list(range(min(page_count, ocr_page_limit))), timings)
         selected, basis = find_table_pages(page_texts)
 
@@ -960,7 +1011,7 @@ def _find_result_text(pdf_bytes: bytes, ocr_page_limit: int, timings: dict) -> t
         ]
 
         if not selected and low_text:
-            log.info("    No result table in text layer, OCR-ing low-text pages...")
+            log.debug("no result table in text layer, OCR-ing low-text pages")
             page_texts = ocr_pages(pdf_bytes, page_texts, low_text, timings)
             selected, basis = find_table_pages(page_texts)
 
@@ -974,8 +1025,8 @@ def _find_result_text(pdf_bytes: bytes, ocr_page_limit: int, timings: dict) -> t
         for i in selected
     )
 
-    log.info(
-        f"    Selected pages {[i + 1 for i in selected]} "
+    log.debug(
+        f"selected pages {[i + 1 for i in selected]} "
         f"({reason}, {len(text)} chars)"
     )
 
@@ -1012,14 +1063,14 @@ def parse_period_end(value) -> str | None:
 def normalise_financials(data) -> dict | None:
     """Validate the model's JSON: numbers only, 3 values per metric, amounts in crores."""
     if not isinstance(data, dict):
-        log.warning("    Model returned non-object JSON")
+        log.warning("Model returned non-object JSON")
         return None
 
     unit = str(data.get("unit") or "").strip().lower()
     unit = UNIT_ALIASES.get(unit, unit)
 
     if unit not in UNIT_TO_CRORE:
-        log.warning(f"    Unrecognised unit from model: {data.get('unit')!r}")
+        log.warning(f"Unrecognised unit from model: {data.get('unit')!r}")
         return None
 
     factor = UNIT_TO_CRORE[unit]
@@ -1071,23 +1122,23 @@ def extract_from_text(text: str, model: str, timings: dict | None = None) -> dic
 
         raw = response.choices[0].message.content or ""
         data = json.loads(raw[raw.find("{"):raw.rfind("}") + 1])
-        log.info(f"    {model} extracted: {data}")
+        log.debug(f"{model} extracted: {data}")
 
         fin = normalise_financials(data)
 
         if fin:
-            log.info(
-                f"    Basis: {fin['basis']}, unit: {fin['unit']}, "
+            log.debug(
+                f"basis: {fin['basis']}, unit: {fin['unit']}, "
                 f"period end: {fin['period_end']}"
             )
 
         return fin
 
     except json.JSONDecodeError as e:
-        log.warning(f"    Model JSON parse error: {e}")
+        log.warning(f"Model JSON parse error: {e}")
         return None
     except Exception as e:
-        log.warning(f"    Model extraction failed: {e}")
+        log.warning(f"Model extraction failed: {e}")
         return None
 
 def extract_financials(pdf_bytes: bytes, model: str | None = None,
@@ -1105,14 +1156,14 @@ def extract_financials(pdf_bytes: bytes, model: str | None = None,
             timings
         )
     except Exception as e:
-        log.warning(f"    PDF text extraction failed: {e}")
+        log.warning(f"PDF text extraction failed: {e}")
         return None
 
     if ambiguous:
-        log.info(f"   Ambiguous outcome → results table {'found' if text else 'not found'}")
+        log.debug(f"ambiguous outcome → results table {'found' if text else 'not found'}")
 
     if not text:
-        raise SkipFiling(reason)
+        raise SkipFiling(reason, status="NONE")
 
     return extract_from_text(text, model or EXTRACTION_MODEL, timings)
 
@@ -1407,13 +1458,13 @@ def send_telegram_text(text: str) -> bool:
             timeout=10,
         )
     except requests.RequestException as e:
-        log.warning(f"  Telegram send failed: {e}")
+        log.warning(f"Telegram send failed: {e}")
         return False
 
     if r.status_code == 200:
         return True
 
-    log.warning(f"  Telegram error: {r.text}")
+    log.warning(f"Telegram error: {r.text}")
     return False
 
 def exchange_link(filing: dict) -> str:
@@ -1534,8 +1585,7 @@ def send_telegram(filing,
         f"🔗 {html.escape(exchange_link(filing))}",
     ]
 
-    if send_telegram_text("\n".join(lines)):
-        log.info("  ✅ Telegram sent")
+    return send_telegram_text("\n".join(lines))
 
 
 # ── MAIN ─────────────────────────────────────────────────────
@@ -1546,6 +1596,10 @@ def send_telegram(filing,
 # and runs the model if there is one. The checker never touches scanner
 # state: the main thread applies its finished checks (score, CSV, alert)
 # between polls, so a clear result never waits behind an ambiguous PDF.
+#
+# Terminal output: one POLL line when a cycle's fetches finish, one line per
+# filing (built whole by report(), so threads can't interleave it) and one
+# POLL summary at the end. Everything else about a filing goes to DEBUG.
 
 def has_core_values(fin: dict) -> bool:
     return (
@@ -1558,8 +1612,23 @@ def format_delay(since: datetime) -> str:
     mins, secs = divmod(rest, 60)
     return f"{hours}h {mins}m {secs}s" if hours else f"{mins}m {secs}s"
 
-def log_timings(timings: dict, exchange_dt=None, outcome: str | None = None):
-    """One line per filing: where the time went, plus exchange time → outcome."""
+def short_company(name: str, width: int = COMPANY_WIDTH) -> str:
+    """Company name without Ltd/Limited/-$, cut or padded to a fixed width."""
+    name = re.sub(r"\s*-\s*\$$", "", (name or "Unknown").strip())
+    name = re.sub(r"[\s,]*\b(?:Ltd|Limited)\.?$", "", name, flags=re.I).strip() or "Unknown"
+    return name[:width - 1] + "…" if len(name) > width else name.ljust(width)
+
+def report(status: str, filing: dict, text: str, level: int = logging.INFO):
+    """The one terminal line for a filing: status, exchange, company, text."""
+    log.log(
+        level,
+        f"{filing['exchange']:<3}  {short_company(filing['company'])}  {text}",
+        extra={"status": status},
+    )
+
+def format_timings(timings: dict, exchange_dt=None, outcome: str | None = None) -> str:
+    """"⏱ download 0.5s · page scan 0.3s · OCR 6.1s · model 3.4s · exchange→alert 2m 13s"
+    (dashboard.py parses these phrases)."""
     parts = [
         f"{label} {timings[key]:.1f}s"
         for key, label in [
@@ -1574,78 +1643,88 @@ def log_timings(timings: dict, exchange_dt=None, outcome: str | None = None):
     if outcome and exchange_dt:
         parts.append(f"exchange→{outcome} {format_delay(exchange_dt)}")
 
-    if parts:
-        log.info("   ⏱ " + " · ".join(parts))
+    return "⏱ " + " · ".join(parts) if parts else ""
 
-def obtain_financials(filing: dict, nse: NseClient, ambiguous: bool = False,
-                      timings: dict | None = None) -> dict | None:
-    """Download the PDF and extract validated financials.
+def with_timings(text: str, timings: dict, exchange_dt=None, outcome: str | None = None) -> str:
+    stamp = format_timings(timings, exchange_dt, outcome)
+    return f"{text}  {stamp}" if stamp else text
 
-    Touches no scanner state, so the checker thread can run it too. Returns
-    None on a retryable failure; raises SkipFiling when retrying can't help.
-    """
-    timings = {} if timings is None else timings
+def shorten(text: str, limit: int) -> str:
+    text = " ".join((text or "").split())
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+def log_filing_details(filing: dict, isin):
     exchange_dt = filing["exchange_dt"]
-
-    log.info(
-        f"   Exchange time: "
-        f"{exchange_dt.strftime('%d %b %Y  %H:%M:%S') if exchange_dt else 'N/A'}"
+    log.debug(
+        f"{filing['exchange']} {filing['company']} ({filing['code']}): "
+        f"ISIN {isin or 'unknown'}, {filing['category']}, "
+        f"exchange time {exchange_dt.strftime('%d %b %Y %H:%M:%S') if exchange_dt else 'N/A'}, "
+        f"headline from {'+'.join(filing['headline_fields']) or 'no headline field'}: {filing['headline']!r}"
     )
 
+def obtain_financials(filing: dict, nse: NseClient, ambiguous: bool = False,
+                      timings: dict | None = None) -> dict:
+    """Download the PDF and extract validated financials.
+
+    Touches no scanner state, so the checker thread can run it too. Raises
+    RetryFiling on a failure worth retrying, SkipFiling when retrying can't help.
+    """
+    timings = {} if timings is None else timings
+
     if not filing["attachment_url"]:
-        log.info("   No attachment"); return None
+        raise RetryFiling("no attachment")
 
     started = time.monotonic()
     pdf = download_pdf(filing, nse)
     timings["download"] = time.monotonic() - started
 
     if not pdf:
-        log.info("   PDF download failed"); return None
+        raise RetryFiling("PDF download failed")
 
     if not pdf.startswith(b"%PDF"):
         raise SkipFiling(f"attachment is not a PDF (starts {pdf[:8]!r})")
 
-    pdf_mb = len(pdf) / (1024 * 1024)
-    log.info(f"   PDF: {pdf_mb:.1f} MB — extracting text…")
+    log.debug(f"{filing['exchange']} {filing['company']}: PDF {len(pdf) / (1024 * 1024):.1f} MB")
     fin = extract_financials(pdf, ambiguous=ambiguous, timings=timings)
+
     if not fin:
-        log.info("   Could not extract financials"); return None
+        raise RetryFiling("could not extract financials")
 
     if not has_core_values(fin):
-        log.info("   Missing current-quarter revenue or PAT"); return None
+        raise RetryFiling("missing current-quarter revenue or PAT")
 
     return fin
 
-def score_filing(filing: dict, isin, fin: dict, processed: set, timings: dict) -> str:
-    """Quarter key, duplicate check, score, CSV and alert. Returns the
-    processed key — also when the PDF's period shows it was already scored."""
+def score_filing(filing: dict, isin, fin: dict, processed: set, timings: dict) -> tuple:
+    """Quarter key, duplicate check, score, CSV and alert.
+
+    Returns (processed key, status word, line text); the key is returned too
+    when the PDF's period shows the quarter was already scored. Raises
+    SkipFiling for a quarter before SCORE_FROM_QUARTER.
+    """
     exchange_dt = filing["exchange_dt"]
     filed_on = (exchange_dt or datetime.now()).date()
     from_pdf = pdf_quarter(fin, filed_on)
 
     if from_pdf and quarter_index(from_pdf) < quarter_index(SCORE_FROM_QUARTER):
-        log.info(f"   {from_pdf}: old quarter, ignored (scoring from {SCORE_FROM_QUARTER})")
-        log_timings(timings)
-        raise SkipFiling(f"old quarter ({from_pdf})", model_called=True)
+        raise SkipFiling(
+            f"{from_pdf}: old quarter, ignored (scoring from {SCORE_FROM_QUARTER})",
+            model_called=True,
+            status="OLD",
+        )
 
     quarter = from_pdf or reporting_quarter(filed_on)
     key = processed_key(filing, isin, quarter)
 
     if key in processed:
-        log.info(f"   {key} already scored (quarter from PDF), no alert")
-        log_timings(timings)
-        return key
+        return key, "SKIP", with_timings(f"{key} already scored (quarter from PDF)", timings)
 
     score, bd = compute_pead_score(fin)
-
     save_result_csv(filing, score, fin)
-    log.info(f"   PEAD score: {score} ({key})")
+    summary = f"{score:4.1f}/50  {quarter}  {fin.get('basis', 'unknown')}"
 
     if score >= PEAD_THRESHOLD:
-
-        log.info("   🚀 Above threshold! Sending alert…")
-
-        send_telegram(
+        sent = send_telegram(
             filing,
             score,
             bd,
@@ -1654,31 +1733,20 @@ def score_filing(filing: dict, isin, fin: dict, processed: set, timings: dict) -
             datetime.now().strftime("%d %b %Y  %H:%M:%S"),
             format_delay(exchange_dt) if exchange_dt else "N/A"
         )
-        log_timings(timings, exchange_dt, "alert")
-    else:
-        log.info(f"   Below {PEAD_THRESHOLD}, no alert")
-        log_timings(timings, exchange_dt, "scored")
+        summary += "  Telegram sent" if sent else "  Telegram FAILED"
+        return key, "ALERT", with_timings(summary, timings, exchange_dt, "alert")
 
-    return key
+    return key, "SCORE", with_timings(summary, timings, exchange_dt, "scored")
 
-def process_filing(filing: dict, isin, processed: set, nse: NseClient) -> str | None:
+def process_filing(filing: dict, isin, processed: set, nse: NseClient,
+                   timings: dict | None = None) -> tuple:
     """Clear result filings, on the main thread: obtain financials, then score.
 
-    Returns the processed key, or None on a retryable failure. Raises
-    SkipFiling when retrying can't help (including an old quarter).
+    Returns score_filing's (key, status, text). Raises RetryFiling or
+    SkipFiling like obtain_financials, and SkipFiling for an old quarter.
     """
-    timings = {}
-
-    try:
-        fin = obtain_financials(filing, nse, timings=timings)
-    except SkipFiling:
-        log_timings(timings)
-        raise
-
-    if not fin:
-        log_timings(timings)
-        return None
-
+    timings = {} if timings is None else timings
+    fin = obtain_financials(filing, nse, timings=timings)
     return score_filing(filing, isin, fin, processed, timings)
 
 class AmbiguousChecker:
@@ -1717,15 +1785,17 @@ class AmbiguousChecker:
 
     def _check(self, filing: dict) -> dict:
         timings = {}
-        result = {"filing": filing, "fin": None, "skip": None, "timings": timings}
-        log.info(f"→ Checking {filing['exchange']} {filing['company']}: ambiguous outcome PDF")
+        result = {"filing": filing, "fin": None, "skip": None, "retry": None, "error": None, "timings": timings}
+        log.debug(f"checking {filing['exchange']} {filing['company']}: ambiguous outcome PDF")
 
         try:
             result["fin"] = obtain_financials(filing, self.nse, ambiguous=True, timings=timings)
         except SkipFiling as e:
-            result["skip"] = str(e)
-        except Exception:
-            log.exception("   Unexpected error checking ambiguous outcome")
+            result["skip"] = e
+        except RetryFiling as e:
+            result["retry"] = str(e)
+        except Exception as e:
+            result["error"] = e
 
         return result
 
@@ -1788,34 +1858,34 @@ def filing_kind(filing: dict) -> str:
         return board_meeting_kind(filing["headline"])
     return "results"
 
-def triage(filing: dict, state: ScannerState) -> str | None:
-    """Filter and dedup pre-check. Returns "results" or "ambiguous" for a
-    filing to process now, or None when it is skipped or already handled."""
+def triage(filing: dict, state: ScannerState) -> str:
+    """Filter and dedup pre-check. Returns what happened to the filing:
+
+      "results" / "ambiguous" — process it now
+      "intimation", "not relevant" — skipped quietly (counted in the POLL summary)
+      "duplicate" — company-quarter already scored (a SKIP line)
+      "seen" — already handled on an earlier poll
+    """
     fid = filing["id"]
 
     if not fid or fid in state.seen:
-        return None
+        return "seen"
 
     if filing["category"] not in {
         "Result",
         "Board Meeting"
     }:
-        return None
+        return "not relevant"
 
-    exchange, company = filing["exchange"], filing["company"]
     kind = filing_kind(filing)
 
     if kind in ("intimation", "other"):
-        # The filter reads the full headline; only this log line is shortened
-        shown = filing["headline"]
-        shown = shown if len(shown) <= 120 else shown[:120] + "…"
-        source = "+".join(filing["headline_fields"]) or "no headline field"
-        log.info(
-            f"→ Skip {exchange} board meeting ({kind}): {company} — "
-            f"{shown!r} (headline from {source})"
+        log.debug(
+            f"skip {filing['exchange']} {filing['company']} board meeting ({kind}): "
+            f"{filing['headline']!r} (headline from {'+'.join(filing['headline_fields']) or 'no headline field'})"
         )
         state.finish(fid)
-        return None
+        return "intimation" if kind == "intimation" else "not relevant"
 
     state.learn_isin(filing)
     isin = lookup_isin(filing, state.master)
@@ -1826,95 +1896,117 @@ def triage(filing: dict, state: ScannerState) -> str | None:
     estimated_key = processed_key(filing, isin, reporting_quarter(filed_on))
 
     if estimated_key in state.processed:
-        log.info(f"→ Skip {exchange} {company}: {estimated_key} already scored")
+        report("SKIP", filing, f"{estimated_key} already scored")
         state.finish(fid)
-        return None
+        return "duplicate"
 
     return kind
 
-def describe(filing: dict, isin) -> str:
-    source = "+".join(filing["headline_fields"]) or "no headline field"
-    return (
-        f"{filing['exchange']}: {filing['company']} ({filing['code']}, "
-        f"ISIN {isin or 'unknown'}, {filing['category']}; headline from {source})"
-    )
+def record_success(filing: dict, state: ScannerState, key: str):
+    state.processed.add(key)
+    save_processed_scrips(state.processed)
+    state.finish(filing["id"])
 
-def record_result(filing: dict, state: ScannerState, key: str | None):
-    """Success → processed + seen; failure → retry on a later poll or give up."""
+def record_retry(filing: dict, state: ScannerState, reason: str, timings: dict,
+                 error: BaseException | None = None):
+    """A retryable failure: one RETRY (or ERROR) line, then retry later or give up."""
     fid = filing["id"]
-
-    if key:
-        state.processed.add(key)
-        save_processed_scrips(state.processed)
-        state.finish(fid)
-        return
-
     attempts = state.retries.get(fid, 0) + 1
 
     if attempts > MAX_RETRIES:
-        log.info(f"   Giving up after {attempts} attempts")
+        outcome = f"gave up after {attempts} attempts"
         state.finish(fid)
     else:
+        outcome = f"retry {attempts}/{MAX_RETRIES}"
         state.retries[fid] = attempts
         save_retries(state.retries)
         state.pending[fid] = filing
-        log.info(f"   Will retry next poll (retry {attempts}/{MAX_RETRIES})")
 
-def record_skip(filing: dict, state: ScannerState, reason: str, model_called: bool = False):
-    log.info(f"   Skip: {reason} — {'' if model_called else 'not calling the model, '}not retrying")
+    if error is None:
+        report("RETRY", filing, with_timings(f"{reason} · {outcome}", timings))
+    else:
+        report("ERROR", filing, with_timings(f"unexpected error: {type(error).__name__}: {error} · {outcome}", timings),
+               level=logging.ERROR)
+        log.debug(f"traceback for {filing['exchange']} {filing['company']}", exc_info=error)
+
+def record_skip(filing: dict, state: ScannerState, skip: "SkipFiling", timings: dict,
+                ambiguous: bool = False):
+    """Skipped for good: one NONE / OLD / SKIP line, marked seen, never retried."""
+    text = str(skip)
+
+    if skip.status == "NONE":
+        text = ("ambiguous outcome → " if ambiguous else "") + text
+        if filing["category"] == "Result":
+            # A "Result" filing without a table is worth a look at what it was
+            text += f" · headline: {shorten(filing['headline'], 160)!r}"
+
+    report(skip.status, filing, with_timings(text, timings))
     state.finish(filing["id"])
 
 def handle_clear(filing: dict, state: ScannerState):
     isin = lookup_isin(filing, state.master)
-    log.info(f"→ New {describe(filing, isin)}")
+    log_filing_details(filing, isin)
+    timings = {}
 
     try:
-        key = process_filing(filing, isin, state.processed, state.nse)
+        key, status, text = process_filing(filing, isin, state.processed, state.nse, timings)
     except SkipFiling as e:
-        record_skip(filing, state, str(e), e.model_called)
+        record_skip(filing, state, e, timings)
         return
-    except Exception:
-        log.exception("   Unexpected error processing filing")
-        key = None
+    except RetryFiling as e:
+        record_retry(filing, state, str(e), timings)
+        return
+    except Exception as e:
+        record_retry(filing, state, "", timings, error=e)
+        return
 
-    record_result(filing, state, key)
+    report(status, filing, text)
+    record_success(filing, state, key)
 
-def handle_ambiguous(filing: dict, state: ScannerState):
-    if state.checker.submit(filing):
-        isin = lookup_isin(filing, state.master)
-        log.info(f"→ New {describe(filing, isin)}; ambiguous outcome, queued for a PDF check")
+def handle_ambiguous(filing: dict, state: ScannerState) -> bool:
+    """Queue an ambiguous outcome for the checker; True if newly queued."""
+    if not state.checker.submit(filing):
+        return False
+
+    log_filing_details(filing, lookup_isin(filing, state.master))
+    report("CHECK", filing, "ambiguous outcome → queued for a results-table check")
+    return True
 
 def apply_ambiguous_result(result: dict, state: ScannerState):
     """Main thread: record a finished checker result and score it if it had results."""
     filing = result["filing"]
     fid = filing["id"]
+    timings = result["timings"]
     state.checker.in_flight.discard(fid)
 
     if fid in state.seen:      # e.g. the company's clear filing was scored meanwhile
         return
 
-    isin = lookup_isin(filing, state.master)
-    log.info(f"→ Checked ambiguous outcome {describe(filing, isin)}")
-
     if result["skip"]:
-        log_timings(result["timings"])
-        record_skip(filing, state, result["skip"])
+        record_skip(filing, state, result["skip"], timings, ambiguous=True)
         return
 
-    key = None
+    if result["error"]:
+        record_retry(filing, state, "", timings, error=result["error"])
+        return
 
-    if result["fin"]:
-        try:
-            key = score_filing(filing, isin, result["fin"], state.processed, result["timings"])
-        except SkipFiling as e:
-            record_skip(filing, state, str(e), e.model_called)
-            return
-        except Exception:
-            log.exception("   Unexpected error scoring filing")
-    else:
-        log_timings(result["timings"])
+    if result["retry"]:
+        record_retry(filing, state, result["retry"], timings)
+        return
 
-    record_result(filing, state, key)
+    try:
+        key, status, text = score_filing(
+            filing, lookup_isin(filing, state.master), result["fin"], state.processed, timings
+        )
+    except SkipFiling as e:
+        record_skip(filing, state, e, timings)
+        return
+    except Exception as e:
+        record_retry(filing, state, "", timings, error=e)
+        return
+
+    report(status, filing, text)
+    record_success(filing, state, key)
 
 def drain_checks(state: ScannerState):
     """Apply every checker result that is ready, without waiting."""
@@ -1942,58 +2034,81 @@ def wait_for_checks(state: ScannerState, seconds: float):
 
         apply_ambiguous_result(result, state)
 
+def plural(n: int, word: str, many: str | None = None) -> str:
+    return f"{n} {word if n == 1 else (many or word + 's')}"
+
 def run_cycle(state: ScannerState):
     """One poll. Clear result filings are handled first (oldest first), then
     finished ambiguous checks are applied, then new ambiguous outcomes are
-    queued for the checker (oldest first)."""
+    queued for the checker (oldest first). Ends with the POLL summary line."""
     priority = {"results": 0, "ambiguous": 1}
     filings = sorted(
         poll_exchanges(state),     # already oldest first; sort is stable
         key=lambda f: priority.get(filing_kind(f), 2)
     )
 
+    counts = {}
     ambiguous = []
 
     for filing in filings:
-        kind = triage(filing, state)
+        verdict = triage(filing, state)
+        counts[verdict] = counts.get(verdict, 0) + 1
 
-        if kind == "results":
+        if verdict == "results":
             handle_clear(filing, state)
-        elif kind == "ambiguous":
+        elif verdict == "ambiguous":
             ambiguous.append(filing)
 
     drain_checks(state)
+    queued = sum(handle_ambiguous(filing, state) for filing in ambiguous)
 
-    for filing in ambiguous:
-        handle_ambiguous(filing, state)
+    log.info(
+        " · ".join([
+            "done",
+            plural(counts.get("results", 0), "result filing"),
+            plural(counts.get("intimation", 0), "intimation") + " skipped",
+            f"{queued} ambiguous queued",
+            f"{counts.get('not relevant', 0)} not relevant",
+            f"checker queue: {len(state.checker.in_flight)} pending",
+        ]),
+        extra={"status": "POLL"},
+    )
 
 def poll_exchanges(state: ScannerState) -> list:
     """New filings from both exchanges plus pending retries, oldest first,
-    so whichever exchange published a result first is the one processed."""
-    fresh = []
+    so whichever exchange published a result first is the one processed.
+    Logs the POLL line with both fetch results."""
+    fresh, parts = [], []
 
     try:
         filings, pages = fetch_bse_filings(state.bse_known_ids)
-        log.info(
+        parts.append(
             f"BSE: {len(filings)} new announcements "
             f"(fetch OK, {pages} page{'' if pages == 1 else 's'} read)"
         )
         fresh += filings
     except ExchangeBlocked as e:
         warn_blocked("BSE", str(e))
+        parts.append(f"BSE: fetch FAILED (blocked: {e})")
     except Exception as e:
         log.warning(f"BSE: fetch FAILED ({e}) — announcements not read this poll")
+        parts.append(f"BSE: fetch FAILED ({e})")
 
     try:
         filings = fetch_nse_filings(state.nse)
+        # NSE returns the whole day every poll; only unseen ones go on
         new = [f for f in filings if f["id"] not in state.nse_known_ids]
         state.nse_known_ids.update(f["id"] for f in filings)
-        log.info(f"NSE: {len(new)} new announcements (fetch OK, {len(filings)} today)")
-        fresh += filings
+        parts.append(f"NSE: {len(new)} new announcements (fetch OK, {len(filings)} today)")
+        fresh += new
     except ExchangeBlocked as e:
         warn_blocked("NSE", str(e))
+        parts.append(f"NSE: fetch FAILED (blocked: {e})")
     except Exception as e:
         log.warning(f"NSE: fetch FAILED ({e}) — announcements not read this poll")
+        parts.append(f"NSE: fetch FAILED ({e})")
+
+    log.info(" · ".join(parts), extra={"status": "POLL"})
 
     by_id = {f["id"]: f for f in state.pending.values()}
     by_id.update({f["id"]: f for f in fresh})
@@ -2046,9 +2161,9 @@ def dump_samples():
         )
 
         if rows:
-            log.info(f"   {len(rows)} rows; fields: {sorted(rows[0].keys())}")
+            log.info(f"{exchange}: {len(rows)} rows; fields: {sorted(rows[0].keys())}")
             present = [f for f in headline_fields if f in rows[0]]
-            log.info(f"   headline fields present: {present or 'NONE'} (expected {headline_fields})")
+            log.info(f"{exchange}: headline fields present: {present or 'NONE'} (expected {headline_fields})")
 
     for name, fetch in [
         ("BSE", fetch_bse_master),
@@ -2067,25 +2182,33 @@ def main(argv=None):
         help="save one raw BSE and NSE announcements response "
              "(raw_bse_sample.json, raw_nse_sample.json) and exit",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="show DEBUG detail in the terminal too (pead_tool.log always has it)",
+    )
     args = parser.parse_args(argv)
+
+    if args.verbose:
+        console_handler.setLevel(logging.DEBUG)
 
     if args.dump:
         dump_samples()
         return
 
-    log.info("=" * 55)
-    log.info("  PEAD Tool — BSE + NSE poller + LLM PDF reader")
-    log.info(f"  Model           : {EXTRACTION_MODEL}")
-    log.info(f"  Alert threshold : score >= {PEAD_THRESHOLD}")
-    log.info("=" * 55)
+    log.info(
+        f"PEAD scanner · BSE + NSE · model {EXTRACTION_MODEL} · "
+        f"alert at score ≥ {PEAD_THRESHOLD} · scoring from {SCORE_FROM_QUARTER}"
+    )
 
     initialize_csv()
 
     state = ScannerState(NseClient())
 
-    log.info(f"Loaded {len(state.seen)} previously seen filings")
-    log.info(f"Loaded {len(state.processed)} processed company-quarters")
-    log.info(f"Loaded {len(state.retries)} filings awaiting retry")
+    log.info(
+        f"Loaded {len(state.seen)} seen filings · {len(state.processed)} scored company-quarters · "
+        f"{len(state.retries)} awaiting retry"
+    )
 
     try:
         while True:
@@ -2093,9 +2216,6 @@ def main(argv=None):
                 state.refresh_master()
 
             run_cycle(state)
-
-            log.info(f"checker queue: {len(state.checker.in_flight)} pending")
-            log.info(f"Sleeping {POLL_INTERVAL_SEC}s…\n")
             wait_for_checks(state, POLL_INTERVAL_SEC)
     finally:
         state.checker.stop()

@@ -15,6 +15,7 @@ Post-Earnings Announcement Drift scanner for Indian stocks. It polls BSE and NSE
 
 ```
 python pead_tool.py            # poll forever
+python pead_tool.py --verbose  # same, with DEBUG detail in the terminal too
 python pead_tool.py --dump     # save raw_bse_sample.json + raw_nse_sample.json, log field names and scrip-master counts, exit
 python compare_models.py pdfs/ --model-b <aicredits-model-name>   # --model-a defaults to EXTRACTION_MODEL
 python test_pead.py
@@ -38,14 +39,37 @@ Each poll, `main()` calls `run_cycle()` and then `wait_for_checks()` until the n
 - `AmbiguousChecker` is a single daemon thread named `checker`. It runs `obtain_financials(..., ambiguous=True)`: download, results-table check, and the model only if a table is found.
 - It has its own `NseClient` and **never touches `ScannerState`**. Results go on `checker.done`, and the main thread applies them in `apply_ambiguous_result` (score, CSV, alert, retry bookkeeping), during `wait_for_checks` or `drain_checks`.
 - `in_flight` stops the checker re-queueing a filing (NSE lists it every poll). Only the main thread touches it.
-- Checker log lines are tagged `[checker]` (the `ThreadTag` log filter).
-- Each poll logs "checker queue: N pending", where N is the ambiguous filings queued or being checked (`in_flight`).
+- Non-filing log lines from the checker thread are tagged `[checker]` (by `LineFormatter`).
+- The POLL summary ends with "checker queue: N pending", where N is the ambiguous filings queued or being checked (`in_flight`).
 - `main()` stops the checker in a `finally`.
 - Keep all state changes on the main thread.
 
+**Terminal log (LineFormatter).** Every line is `HH:MM:SS  STATUS  message`.
+- Filing lines come from `report(status, filing, text)`: exchange, `short_company()` (Ltd/Limited/-$ stripped, padded to `COMPANY_WIDTH` 30), then the text. Each is built whole in one call, so threads can't interleave it. Every filing handled gets exactly one line:
+  - `SKIP`: already scored, or not a PDF
+  - `CHECK`: ambiguous outcome queued
+  - `NONE`: no results table; for a "Result" filing the line includes its headline (160 chars)
+  - `SCORE` / `ALERT`: `score/50  quarter  basis`, plus "Telegram sent/FAILED" on alerts
+  - `OLD`: before `SCORE_FROM_QUARTER`
+  - `RETRY`: reason · "retry n/3" or "gave up after n attempts"
+  - `ERROR`: unexpected exception, logged at ERROR level; the traceback goes to DEBUG
+- Each cycle has one `POLL` line with both fetch results ("BSE: N new announcements (fetch OK, P pages read) · NSE: …") and one `POLL` summary: "done · N result filings · N intimations skipped · N ambiguous queued · N not relevant · checker queue: N pending". There is no "Sleeping" line.
+- Intimations and not-relevant filings are only counted. `triage()` returns a verdict (results / ambiguous / intimation / not relevant / duplicate / seen), and `run_cycle` counts it.
+- Other lines use their level word: `INFO` (startup, migrations), `WARN`, `ERROR`, `DEBUG`. Warnings and errors (fetch failures, blocks, model/OCR/Telegram problems) always get their own line.
+- ISIN, headline source and full headline, exchange time, PDF size, OCR/page-selection notes and the model's raw JSON are DEBUG.
+  - The terminal (`console_handler`) shows INFO; `--verbose` lowers it to DEBUG.
+  - `pead_tool.log` always gets DEBUG.
+  - The `pead_tool` logger is at DEBUG and the root logger stays at WARNING, so libraries (httpx, pdfminer) stay quiet.
+- `dashboard.py` parses this layout. If a phrase changes, update its regexes and the "dashboard log parser" tests:
+  - the stage timings "download 0.5s", "page scan", "OCR", "model"
+  - "exchange→alert/scored"
+  - "BSE:/NSE: N new announcements" and "fetch FAILED"
+  - "checker queue: N"
+  - the `⏱` marker
+
 **Timings.**
 - `obtain_financials` records download time, `get_result_text` page-scan and OCR time, and `extract_from_text` model time, all in a `timings` dict.
-- `log_timings` prints one line per filing, e.g. `⏱ download 1.2s · page scan 0.3s · OCR 6.1s · model 3.4s · exchange→alert 2m 13s` ("exchange→scored" when there is no alert).
+- `format_timings` appends them to the filing's line, e.g. `⏱ download 1.2s · page scan 0.3s · OCR 6.1s · model 3.4s · exchange→alert 2m 13s` ("exchange→scored" when there is no alert).
 
 1. **Fetch** (`poll_exchanges`)
    - **BSE**: `fetch_bse_filings(known_ids)` reads `AnnSubCategoryGetData` pages. It stops when a page has no NEWSIDs unseen on earlier polls, or at the row's `TotalPageCnt`, capped at `BSE_MAX_PAGES` (100). It returns only new rows, so `state.pending` re-queues filings awaiting retry.
@@ -67,7 +91,7 @@ Each poll, `main()` calls `run_cycle()` and then `wait_for_checks()` until the n
      - "results" (the word result(s)): process normally
      - "ambiguous" ("outcome" without a result word, e.g. "Outcome of Board Meeting held today"): download and process only if the PDF has a results table, with OCR capped at `AMBIGUOUS_OCR_PAGES` (8). Logged as "Ambiguous outcome → results table found / not found".
      - "other": skip
-   - Headline sources are BSE `NEWSSUB` + `MORE` (the full text when set; `HEADLINE` is cut at about 190 chars with "....") + `SUBCATNAME`, and NSE `desc`/`attchmntText`. Which fields were used is logged. Skip log lines shorten the headline to 120 chars with "…", but the filter itself always reads the full text.
+   - Headline sources are BSE `NEWSSUB` + `MORE` (the full text when set; `HEADLINE` is cut at about 190 chars with "....") + `SUBCATNAME`, and NSE `desc`/`attchmntText`. Which fields were used, and the full headline, go to DEBUG. The filter always reads the full text.
    - Verified against live data on 2026-09-24, as were `seq_id`, `sm_isin`, `exchdisstime` and BSE `NEWSID`/`DT_TM`. `test_pead.py` has real captured rows as fixtures.
    - NSE files results under desc "Outcome of Board Meeting", with the standard text "…has submitted to the Exchange, the financial results for the period ended…".
    - NSE's generic "…Outcome of Board Meeting held on <date>" filings are non-result outcomes, such as buybacks.
@@ -82,7 +106,7 @@ Each poll, `main()` calls `run_cycle()` and then `wait_for_checks()` until the n
    - If that key is already processed, the filing is a duplicate: no score and no alert.
    - Otherwise it scores, writes the CSV and alerts, and returns the key. It returns None on failure.
 6. **Retry or skip**
-   - On a retryable failure (download, model call, missing revenue or PAT, crash), the filing is retried on later polls, up to `MAX_RETRIES` (3) extra attempts. The counts persist in `retry_counts.json`, so restarts don't reset them.
+   - `obtain_financials` raises `RetryFiling(reason)` on a retryable failure: no attachment, download failed, model/extraction failed, or missing revenue or PAT. A crash is treated the same way. The filing is retried on later polls, up to `MAX_RETRIES` (3) extra attempts. The counts persist in `retry_counts.json`, so restarts don't reset them.
    - `SkipFiling` is raised when retrying can't help: "no results table found", or an attachment that isn't a PDF. The filing is then logged, marked seen and never retried, and the model is not called.
    - Success, a skip, or giving up calls `state.finish()`, which marks the filing seen and clears its retry count.
 
@@ -93,7 +117,10 @@ Each poll, `main()` calls `run_cycle()` and then `wait_for_checks()` until the n
 - Otherwise, if no result table is found in the text layer, the pages under `LOW_TEXT_PAGE_CHARS` (200) are OCR'd. That handles a text cover letter with scanned result pages.
 - `ocr_pages()` works one page at a time (Poppler at 250 dpi, then Tesseract) and stops once a consolidated table and its next page are readable. OCR takes about 2s per page.
 - `find_table_pages()`:
-  - A page is a results table if it has at least 2 `TABLE_MARKERS`. Real noisy text layers, like ESDS and Purple Style, match only 2.
+  - A page is a results table if it shows at least 2 of the 5 `TABLE_MARKERS` kinds: income, expenses, profit before tax, net profit and EPS.
+    - Each kind is a regex covering company, NBFC, broker and bank wording, e.g. "Total Revenue", "Profit/(Loss) before Tax", "Earning per equity share", "Interest earned/expended", "Operating profit before provisions".
+    - Gowra Leasing (NBFC, 26 Sep 2026) matched only one of the old four fixed phrases and was wrongly skipped. Real noisy text layers, like ESDS and Purple Style, show just 2 kinds.
+    - A page whose heading matches `NOT_TABLE_HEADINGS` (cash flow, assets and liabilities, balance sheet) is not a table unless the heading also names the results.
   - Its type comes from `RESULT_HEADINGS` in its first 20 lines, and a table with an unrecognised title is "untitled".
   - The first page in `TABLE_PREFERENCE` order (consolidated, standalone, generic, untitled) is sent, together with the next page.
   - There is **no keyword fallback**. If no page is a results table, even after OCR, `get_result_text` returns `(None, "no results table found")` and `extract_financials` raises `SkipFiling`.
@@ -130,7 +157,7 @@ Growth is `_pct(curr, prev) = (curr - prev) / abs(prev) * 100`. `band_score` awa
 | `scrip_master.json` | `{"bse": {code: ISIN}, "nse": {symbol: ISIN}, "updated"}` | ignored |
 | `pead_results.csv` | One row per scored filing | ignored |
 | `raw_bse_sample.json`, `raw_nse_sample.json` | `--dump` output | ignored |
-| `pead_tool.log` (+ `.1`–`.3`) | Same lines as the console, UTF-8, rotating at 5 MB with 3 backups. `setup_file_logging()` is attached only in the `__main__` block, so tests and `compare_models.py` don't write to it. Always lives next to `pead_tool.py`. | ignored |
+| `pead_tool.log` (+ `.1`–`.3`) | The console lines plus DEBUG detail, UTF-8, rotating at 5 MB with 3 backups. `setup_file_logging()` is attached only in the `__main__` block, so tests and `compare_models.py` don't write to it. Always lives next to `pead_tool.py`. | ignored |
 
 - **Scrip master**: built from BSE `ListofScripData` and NSE `EQUITY_L.csv` / `SME_EQUITY_L.csv`, refreshed daily. `updated` is only stamped when both downloads succeed, and failed downloads keep the cached mappings. NSE filings also teach symbol → ISIN (`learn_isin`).
 - **CSV columns**: timestamp, company, scrip (code or symbol), score, revenue/pat/ebitda for cq, pq and ly, eps_cq, eps_ly, exchange, filing_url (the result PDF's `attachment_url`).
@@ -151,8 +178,9 @@ Growth is `_pct(curr, prev) = (curr - prev) / abs(prev) * 100`. `band_score` awa
 
 ## Conventions
 
-- The style is procedural: module-level functions, `log = logging.getLogger`, and f-string logs with leading spaces to indent sub-steps under `→ New ...`. `ScannerState` and `NseClient` are the only classes.
-- Network and parse errors are caught, logged with `log.warning`, and the step returns None or `[]`. `handle_clear` wraps `process_filing` in try/except (and the checker wraps `obtain_financials`), so a crash counts as a failed attempt.
+- The style is procedural: module-level functions and `log = logging.getLogger`. `ScannerState`, `NseClient`, `AmbiguousChecker` and `LineFormatter` are the only classes.
+- Per-filing terminal output goes through `report()` only, once per filing. Put everything else about a filing in `log.debug`. Warnings have no leading indentation.
+- Network and parse errors are caught, logged with `log.warning`, and the step returns None or `[]`. `handle_clear` catches `SkipFiling` (NONE/OLD/SKIP line, never retried), `RetryFiling` (RETRY line) and any other exception (ERROR line, counted as a failed attempt); the checker does the same around `obtain_financials`.
 - After `normalise_financials()`, every `FIN_KEYS` value is a 3-element list of floats or None, in ₹ crore. Add new metrics to `FIN_KEYS` **and** the prompt.
 - Telegram uses `parse_mode: HTML`, so HTML-escape anything dynamic. Company names and NSE symbols contain `&` (e.g. `M&M`).
 - Both exchanges sit behind Akamai. Keep the browser-like headers and don't add request volume casually.

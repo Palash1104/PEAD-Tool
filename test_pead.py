@@ -11,6 +11,7 @@ import io
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -69,17 +70,24 @@ class FakeResponse:
             raise pt.requests.HTTPError(str(self.status_code))
 
 class LogCapture(logging.Handler):
-    """Collects pead_tool log messages inside a `with` block."""
+    """Collects pead_tool log records inside a `with` block."""
     def __enter__(self):
-        self.messages = []
+        self.messages, self.records = [], []
         pt.log.addHandler(self)
         return self
     def __exit__(self, *exc):
         pt.log.removeHandler(self)
     def emit(self, record):
         self.messages.append(record.getMessage())
+        self.records.append((getattr(record, "status", None) or record.levelname, record.levelno, record.getMessage()))
     def has(self, text):
         return any(text in m for m in self.messages)
+    def has_line(self, status, *texts):
+        """A record with this status word whose message contains every text."""
+        return any(st == status and all(t in m for t in texts) for st, _, m in self.records)
+    def terminal(self):
+        """What the terminal shows: (status, message) of INFO and above."""
+        return [(st, m) for st, lvl, m in self.records if lvl >= logging.INFO]
 
 ACCESS_DENIED = FakeResponse(403, text="<HTML><TITLE>Access Denied</TITLE>You don't have permission</HTML>")
 
@@ -400,6 +408,60 @@ check("table without a recognised title -> untitled, ranked last",
 check("'Statement of Standalone Results' heading", pt.classify_result_page("Statement of Standalone Results for the quarter\n" + table) == "standalone")
 check("'Results for the quarter ended' heading", pt.classify_result_page("XYZ Ltd\nResults for the quarter ended 30.06.2026\n" + table) == "generic")
 
+# Sector formats (lines from real filings). Gowra Leasing (NBFC, 26 Sep 2026)
+# matched only one of the old fixed phrases and was skipped as "no results table".
+NBFC_PAGE = """Gowra Leasing & Finance Limited
+CIN: L65910TG1993PLC015349
+Audited Financial Results for the Quarter ended 31.03.2026
+(Rs. In Lakhs)
+I Revenue from operations
+Interest 295.22 286.49 212.15 1130.17 519.74
+Total Revenue from Operations 303.81 286.58 214.96 1138.94 523.70
+III Total Revenue (I + II) 320.64 289.10 305.95 1159.94 767.83
+Finance costs 25.68 74.42 41.25 249.26 80.93
+V Total Expenses 60.57 107.16 72.21 385.85 183.41
+VI Profit/(Loss) before Tax (III-IV) 260.07 181.94 233.74 774.09 584.42
+XII Earning per equity share
+Basic 2.53 2.48 3.84 9.48 10.81"""
+BANK_PAGE = """XYZ BANK LIMITED
+Statement of Unaudited Standalone Financial Results for the quarter ended 30.09.2026
+1 Interest earned (a)+(b)+(c)+(d) 1,234.5
+2 Other Income 210.3
+4 Interest Expended 678.9
+5 Operating Expenses (i)+(ii) 345.6
+7 Operating Profit before Provisions and Contingencies 420.1
+11 Net Profit / (Loss) from Ordinary Activities after tax 250.2
+Basic EPS 4.12"""
+BROKER_PAGE = """ABC SECURITIES LIMITED
+Statement of Audited Results for the Quarter ended 31.03.2026
+Revenue from Operations 12.3
+Total Income 13.1
+Total Expenses 10.2
+Profit / (Loss) before exceptional items and tax 2.9
+Net Profit / (Loss) for the period 2.1
+Earnings per equity share (Basic) 0.45"""
+CASH_FLOW_PAGE = """Gowra Leasing & Finance Limited
+CASH FLOW STATEMENT FOR THE YEAR ENDED 31ST MARCH 2026
+A. Operating activities
+Profit before tax 774.09 584.41
+Adjustments for finance costs 0.00 0.00
+Adjustments for interest income 0.00 0.00"""
+CLARIFICATION_LETTER = """INANI SECURITIES LTD
+Subject: Clarification regarding discrepancy in Cash Flow Statement and non-disclosure of EPS
+the Basic and Diluted EPS figures were inadvertently reported as 0 in the relevant filing."""
+check("NBFC table (Total Revenue, Profit/(Loss) before Tax, Earning per equity share)",
+      pt.classify_result_page(NBFC_PAGE) == "generic", pt.classify_result_page(NBFC_PAGE))
+check("bank table (Interest earned / expended, operating profit before provisions)",
+      pt.classify_result_page(BANK_PAGE) == "standalone", pt.classify_result_page(BANK_PAGE))
+check("broker table ('Statement of Audited Results', Profit / (Loss) before … tax)",
+      pt.classify_result_page(BROKER_PAGE) is not None, pt.classify_result_page(BROKER_PAGE))
+check("cash flow statement isn't a results table", pt.classify_result_page(CASH_FLOW_PAGE) is None)
+check("clarification letter isn't a results table", pt.classify_result_page(CLARIFICATION_LETTER) is None)
+check("results page preferred over its cash flow page",
+      pt.find_table_pages([CLARIFICATION_LETTER, NBFC_PAGE, CASH_FLOW_PAGE]) == ([1, 2], "generic"))
+check("a results heading beats a cash-flow word in it",
+      pt.classify_result_page("Statement of Audited Financial Results and Cash Flow for the quarter\n" + table) == "generic")
+
 # ─────────────────────────────────────────────────────────────
 section("normalise_financials")
 
@@ -517,7 +579,7 @@ class Stop(Exception):
     pass
 
 def run_main(polls, bse=lambda known: [], nse=lambda client: [], extract=None, master=None,
-             download=None, on_wait=None):
+             download=None, on_wait=None, argv=()):
     """Run pt.main() for a number of polls with everything external mocked.
 
     Between polls the default waits for queued ambiguous checks to finish and
@@ -540,11 +602,11 @@ def run_main(polls, bse=lambda known: [], nse=lambda client: [], extract=None, m
          mock.patch.object(pt, "fetch_nse_master", lambda client: dict((master or {}).get("nse", {}))), \
          mock.patch.object(pt, "download_pdf", download or (lambda filing, client: b"%PDF-" + filing["attachment_url"].encode())), \
          mock.patch.object(pt, "extract_financials", extract), \
-         mock.patch.object(pt, "send_telegram", lambda filing, *a: alerts.append(filing["exchange"] + ":" + filing["company"])), \
+         mock.patch.object(pt, "send_telegram", lambda filing, *a: alerts.append(filing["exchange"] + ":" + filing["company"]) or True), \
          mock.patch.object(pt, "send_telegram_text", lambda text: True), \
          mock.patch.object(pt, "wait_for_checks", fake_wait):
         try:
-            pt.main([])
+            pt.main(list(argv))
         except Stop:
             pass
     return alerts
@@ -630,7 +692,7 @@ check("no ISIN -> BSE fallback key", "BSE-222_Q1FY27" in set(json.load(open(pt.P
 fresh_state_dir()
 no_table = pt.normalise_bse(bse_raw("t1", 666, "Result", "2026-09-24T10:00:00"))
 zipped = pt.normalise_nse(nse_raw("z1", "ZIPCO", "INE777A01017", "24-Sep-2026 10:00:00"))
-extract, calls = counting_extract({no_table["attachment_url"]: pt.SkipFiling("no results table found")})
+extract, calls = counting_extract({no_table["attachment_url"]: pt.SkipFiling("no results table found", status="NONE")})
 def download(filing, client):
     if filing["exchange"] == "NSE":
         return b"PK\x03\x04zipdata"
@@ -650,8 +712,8 @@ saraswati = pt.normalise_bse(REAL_BSE_SARASWATI)
 vague_nse = pt.normalise_nse(REAL_NSE_OTHER_OUTCOME)
 alfa = pt.normalise_bse(REAL_BSE_INTIMATION)
 extract, calls = counting_extract({
-    gacm["attachment_url"]: pt.SkipFiling("no results table found"),        # like the real PDF
-    saraswati["attachment_url"]: pt.SkipFiling("no results table found"),   # like the real PDF
+    gacm["attachment_url"]: pt.SkipFiling("no results table found", status="NONE"),        # like the real PDF
+    saraswati["attachment_url"]: pt.SkipFiling("no results table found", status="NONE"),   # like the real PDF
     vague_nse["attachment_url"]: good_fin,                                   # results inside
 })
 with LogCapture() as logs:
@@ -664,9 +726,16 @@ check("ambiguous without table: once, seen, no retry",
       and {gacm["id"], saraswati["id"]} <= seen and not os.path.exists(pt.RETRIES_FILE))
 check("ambiguous with table: scored and alerted", alerts == ["NSE:Global Education Limited"], alerts)
 check("intimation still skipped by headline", alfa["attachment_url"] not in calls and alfa["id"] in seen)
-check("log says ambiguous outcome is queued for a check", logs.has("ambiguous outcome, queued for a PDF check"))
-check("checker logs the table check result", logs.has("→ Checked ambiguous outcome BSE: GACM Technologies Ltd"))
-check("skip log names the reason", logs.has("→ Skip BSE board meeting (intimation): Alfa Ica India Ltd"))
+check("CHECK line when an ambiguous outcome is queued",
+      logs.has_line("CHECK", "GACM Technologies", "ambiguous outcome → queued for a results-table check"))
+check("NONE line once the check finds no table",
+      logs.has_line("NONE", "GACM Technologies", "ambiguous outcome → no results table found", "⏱ download"))
+check("ambiguous NONE line has no headline (only Result filings get one)",
+      not logs.has_line("NONE", "GACM Technologies", "headline:"))
+check("intimation not printed, only counted",
+      not any("Alfa Ica" in m for _, m in logs.terminal())
+      and logs.has_line("DEBUG", "Alfa Ica India Ltd board meeting (intimation)")
+      and logs.has_line("POLL", "1 intimation skipped"), logs.terminal())
 
 # Priority: clear results first (oldest first), ambiguous outcomes after, on the checker thread
 fresh_state_dir()
@@ -746,8 +815,9 @@ try:
     processed = set(json.load(open(pt.PROCESSED_SCRIPS_FILE)))
     csv_scrips = [r["scrip"] for r in csv.DictReader(open(pt.RESULTS_CSV, encoding="utf-8"))]
     check("old quarter logged as ignored", logs.has("Q1FY27: old quarter, ignored (scoring from Q2FY27)"), logs.messages)
-    check("old quarter skip doesn't claim the model wasn't called",
-          logs.has("Skip: old quarter (Q1FY27) — not retrying") and not logs.has("old quarter (Q1FY27) — not calling the model"))
+    check("OLD line with the model's timing on it",
+          logs.has_line("OLD", "Co 801", "Q1FY27: old quarter, ignored (scoring from Q2FY27)")
+          and logs.has_line("OLD", "OLDQ", "old quarter, ignored") and not logs.has("not calling the model"), logs.terminal())
     check("old-quarter filings marked seen, not scored, not processed, no retry",
           {old_q["id"], old_amb["id"]} <= seen and "801" not in csv_scrips and "OLDQ" not in csv_scrips
           and not any("801" in k or "INE802A01010" in k for k in processed)
@@ -763,8 +833,58 @@ timed = pt.normalise_bse(bse_raw("t9", 909, "Result", "2026-09-24T10:00:00"))
 extract, calls = counting_extract({timed["attachment_url"]: good_fin})
 with LogCapture() as logs:
     run_main(1, bse=lambda k: [timed], extract=extract)
-check("timing line with download and exchange→alert",
-      any(m.startswith("   ⏱ download ") and "exchange→alert" in m for m in logs.messages), [m for m in logs.messages if "⏱" in m])
+check("ALERT line carries score, quarter, basis and timing",
+      logs.has_line("ALERT", "Co 909", "49.0/50  Q1FY27  unknown  Telegram sent  ⏱ download ", "exchange→alert"), logs.terminal())
+check("exactly one terminal line per processed filing",
+      sum("Co 909" in m for _, m in logs.terminal()) == 1, logs.terminal())
+check("filing details go to DEBUG, not the terminal",
+      logs.has_line("DEBUG", "BSE Co 909 (909): ISIN unknown, Result, exchange time 24 Sep 2026 10:00:00, headline from")
+      and logs.has_line("DEBUG", "BSE Co 909: PDF")
+      and not any("ISIN" in m or "headline from" in m or "MB" in m for _, m in logs.terminal()), logs.terminal())
+check("POLL lines open and close the cycle",
+      [st for st, _ in logs.terminal()][-3:] == ["POLL", "ALERT", "POLL"]
+      and logs.has_line("POLL", "BSE: 1 new announcements (fetch OK, 1 page read) · NSE: 0 new announcements (fetch OK, 0 today)")
+      and logs.has_line("POLL", "done · 1 result filing · 0 intimations skipped · 0 ambiguous queued · 0 not relevant · checker queue: 0 pending"),
+      logs.terminal())
+check("no 'Sleeping' lines", not logs.has("Sleeping"))
+
+# Retry and error lines
+fresh_state_dir()
+flaky = pt.normalise_bse(bse_raw("r1", 911, "Result", "2026-09-24T10:00:00"))
+boom_f = pt.normalise_bse(bse_raw("r2", 912, "Result", "2026-09-24T10:00:00"))
+extract, calls = counting_extract({flaky["attachment_url"]: mk(pat=[1, 1, 1]), boom_f["attachment_url"]: RuntimeError("kaboom")})
+with LogCapture() as logs:
+    run_main(4, bse=lambda k: [flaky, boom_f], extract=extract)
+check("RETRY line: reason and retry count",
+      logs.has_line("RETRY", "Co 911", "missing current-quarter revenue or PAT · retry 1/3"), logs.terminal())
+check("RETRY line when giving up", logs.has_line("RETRY", "Co 911", "gave up after 4 attempts"))
+check("crash: one ERROR line at ERROR level, traceback only in DEBUG",
+      any(st == "ERROR" and lvl == logging.ERROR and "Co 912" in m and "unexpected error: RuntimeError: kaboom · retry 1/3" in m
+          for st, lvl, m in logs.records)
+      and not any("Traceback" in m for _, m in logs.terminal()), logs.terminal())
+
+# A "Result" filing without a table names its headline
+fresh_state_dir()
+no_tab = pt.normalise_bse(bse_raw("n1", 913, "Result", "2026-09-26T17:32:26",
+                                  sub="Results- Financial Results For 31St March, 2026 (31-03-2026)"))
+extract, calls = counting_extract({no_tab["attachment_url"]: pt.SkipFiling("no results table found", status="NONE")})
+with LogCapture() as logs:
+    run_main(1, bse=lambda k: [no_tab], extract=extract)
+check("NONE line for a Result filing shows its headline",
+      logs.has_line("NONE", "Co 913", "no results table found · headline: 'Results- Financial Results For 31St March, 2026 (31-03-2026)'"),
+      logs.terminal())
+
+# --verbose shows DEBUG in the terminal
+fresh_state_dir()
+try:
+    run_main(1, argv=["--verbose"])
+    check("--verbose lowers the terminal to DEBUG", pt.console_handler.level == logging.DEBUG)
+finally:
+    pt.console_handler.setLevel(logging.INFO)
+check("terminal shows INFO by default", pt.console_handler.level == logging.INFO)
+check("libraries stay quiet (root logger at WARNING)",
+      logging.getLogger("pdfminer").getEffectiveLevel() >= logging.WARNING
+      and logging.getLogger("httpx").getEffectiveLevel() >= logging.WARNING)
 
 # Poll logs distinguish "0 new" from a failed fetch
 fresh_state_dir()
@@ -830,7 +950,8 @@ check("NSE ISIN learned into master", json.load(open(pt.SCRIP_MASTER_FILE))["nse
 fresh_state_dir()
 with LogCapture() as logs:
     run_main(3)
-check("checker queue logged once per poll", sum(m == "checker queue: 0 pending" for m in logs.messages) == 3,
+check("checker queue logged once per poll, in the POLL summary",
+      sum(st == "POLL" and m.endswith("checker queue: 0 pending") for st, _, m in logs.records) == 3,
       [m for m in logs.messages if "checker queue" in m])
 
 started, release = threading.Event(), threading.Event()
@@ -866,8 +987,30 @@ finally:
     handler.close()
 lines = open(log_path, encoding="utf-8").read().splitlines()
 check("file log gets console-format lines in UTF-8",
-      len(lines) == 2 and lines[0].endswith("INFO  → Skip NSE board meeting (intimation): Mahindra & Mahindra — ⏱ ₹ test"), lines)
-check("file log keeps the [checker] tag", lines[1].endswith("INFO  [checker]    Ambiguous outcome → results table found"), lines)
+      len(lines) == 2 and lines[0][8:] == "  INFO   → Skip NSE board meeting (intimation): Mahindra & Mahindra — ⏱ ₹ test", lines)
+check("file log keeps the [checker] tag", lines[1][8:] == "  INFO   [checker]    Ambiguous outcome → results table found", lines)
+
+handler = pt.setup_file_logging(log_path)
+try:
+    pt.report("SCORE", nse_filing, "10.0/50  Q2FY27  consolidated")
+    pt.log.debug("debug detail")
+    worker = threading.Thread(target=lambda: pt.report("NONE", nse_filing, "no results table found"), name="checker")
+    worker.start()
+    worker.join()
+    handler.flush()
+finally:
+    logging.getLogger().removeHandler(handler)
+    handler.close()
+lines = open(log_path, encoding="utf-8").read().splitlines()[2:]
+check("filing line: time, status, exchange, padded company, text",
+      re.fullmatch(r"\d{2}:\d{2}:\d{2}  SCORE  NSE  Mahindra & Mahindra {11}  10\.0/50  Q2FY27  consolidated", lines[0]) is not None, lines)
+check("file log has DEBUG lines too", re.fullmatch(r"\d{2}:\d{2}:\d{2}  DEBUG  debug detail", lines[1]) is not None, lines)
+check("checker-thread filing lines use their status, no [checker] tag",
+      lines[2][8:] == f"  NONE   NSE  {pt.short_company('Mahindra & Mahindra Limited')}  no results table found", lines)
+handler = pt.setup_file_logging(log_path)
+check("file handler takes DEBUG", handler.level == logging.DEBUG)
+logging.getLogger().removeHandler(handler)
+handler.close()
 check("file log rotates at 5 MB with 3 backups",
       handler.maxBytes == 5 * 1024 * 1024 and handler.backupCount == 3 and handler.encoding == "utf-8")
 check("default log path is pead_tool.log next to the script",
@@ -879,7 +1022,7 @@ try:
 finally:
     logging.getLogger().removeHandler(handler)
     handler.close()
-check("file log appends across restarts", open(log_path, encoding="utf-8").read().count("\n") == 3)
+check("file log appends across restarts", open(log_path, encoding="utf-8").read().count("\n") == 6)
 
 # ─────────────────────────────────────────────────────────────
 section("dashboard /filing")
@@ -935,6 +1078,63 @@ try:
 finally:
     server.shutdown()
     server.server_close()
+
+# ─────────────────────────────────────────────────────────────
+section("dashboard log parser")
+
+def parse_log(text):
+    folder = tempfile.mkdtemp(prefix="pead_dash_")
+    with open(os.path.join(folder, dashboard.LOG_FILE), "w", encoding="utf-8") as fh:
+        fh.write(text)
+    with mock.patch.object(dashboard, "BASE_DIR", folder):
+        return dashboard.read_log()
+
+NEW_LOG = """21:30:53  INFO   PEAD scanner · BSE + NSE · model anthropic/claude-haiku-4-5 · alert at score ≥ 35 · scoring from Q2FY27
+21:31:01  POLL   BSE: 3 new announcements (fetch OK, 2 pages read) · NSE: 5 new announcements (fetch OK, 931 today)
+21:31:01  DEBUG  BSE ESDS Software Solution Ltd (544898): ISIN INE0DRI01029, Board Meeting, headline from NEWSSUB+HEADLINE+SUBCATNAME: 'x'
+21:31:05  ALERT  BSE  ESDS Software Solution          41.0/50  Q2FY27  consolidated  Telegram sent  ⏱ download 0.5s · page scan 0.3s · model 3.4s · exchange→alert 2m 13s
+21:31:09  SCORE  NSE  Purple Style Labs               10.0/50  Q2FY27  consolidated  ⏱ download 1.2s · page scan 0.4s · OCR 6.1s · model 2.9s · exchange→scored 1h 2m 3s
+21:31:10  CHECK  NSE  Global Education                ambiguous outcome → queued for a results-table check
+21:31:12  NONE   NSE  Global Education                ambiguous outcome → no results table found  ⏱ download 0.4s · page scan 0.2s
+21:31:12  DEBUG  traceback for BSE Co
+Traceback (most recent call last):
+  File "x.py", line 1, in <module>
+21:31:13  POLL   done · 1 result filing · 3 intimations skipped · 1 ambiguous queued · 40 not relevant · checker queue: 1 pending
+21:31:43  WARN   NSE: fetch FAILED (Read timed out) — announcements not read this poll
+21:31:43  ERROR  🚫 NSE BLOCKED (HTTP 403 on announcements) — its announcements were NOT read this poll; this is not 'zero announcements'
+21:31:43  POLL   BSE: 0 new announcements (fetch OK, 1 page read) · NSE: fetch FAILED (blocked: HTTP 403 on announcements)
+21:31:44  POLL   done · 0 result filings · 0 intimations skipped · 0 ambiguous queued · 0 not relevant · checker queue: 0 pending
+"""
+parsed = parse_log(NEW_LOG)
+check("both exchanges read from one POLL line",
+      parsed["exchanges"]["BSE"]["ok"] and parsed["exchanges"]["BSE"]["message"] == "0 new announcements (fetch OK, 1 page read)", parsed["exchanges"])
+check("blocked NSE shows as not OK", parsed["exchanges"]["NSE"]["ok"] is False, parsed["exchanges"]["NSE"])
+check("an earlier POLL line parses per exchange",
+      [f.group(1) + ": " + f.group(2).strip() for f in dashboard.FETCH_RE.finditer(NEW_LOG.splitlines()[1])]
+      == ["BSE: 3 new announcements (fetch OK, 2 pages read)", "NSE: 5 new announcements (fetch OK, 931 today)"])
+check("checker queue from the POLL summary", parsed["checker_queue"] == 0)
+t = parsed["timings"]
+check("three timing entries from filing lines", len(t) == 3, t)
+check("ALERT timing: stages, kind, delay, context",
+      t[0] == {"time": "21:31:05", "context": "ALERT BSE ESDS Software Solution", "status": "ALERT",
+               "download": 0.5, "page_scan": 0.3, "model": 3.4, "kind": "alert", "delay": 133}, t[0])
+check("SCORE timing with OCR and an hour-long delay",
+      t[1]["ocr"] == 6.1 and t[1]["kind"] == "scored" and t[1]["delay"] == 3723 and t[1]["context"] == "SCORE NSE Purple Style Labs", t[1])
+check("NONE timing has stages but no delay", t[2]["download"] == 0.4 and "delay" not in t[2], t[2])
+check("log panel hides DEBUG lines and their tracebacks",
+      not any("DEBUG" in l or "Traceback" in l or "x.py" in l for l in parsed["lines"]) and len(parsed["lines"]) == 11, parsed["lines"])
+
+OLD_LOG = """21:30:55  ERROR  🚫 BSE BLOCKED (HTTP 403 on announcements page 1) — its announcements were NOT read this poll
+21:31:01  INFO  NSE: 919 announcements fetched
+21:31:05  INFO  → New NSE: ESDS Software Solution Limited (ESDS, ISIN INE0DRI01029, Board Meeting; headline from desc+attchmntText)
+21:31:32  INFO     ⏱ download 1.1s · page scan 0.2s · model 2.0s · exchange→scored 1m 30s
+21:31:40  INFO  checker queue: 2 pending
+"""
+parsed = parse_log(OLD_LOG)
+check("older log layout still parses",
+      parsed["exchanges"]["BSE"]["ok"] is False and parsed["exchanges"]["NSE"]["ok"]
+      and parsed["checker_queue"] == 2 and parsed["timings"][0]["delay"] == 90
+      and parsed["timings"][0]["context"].startswith("→ New NSE: ESDS"), parsed)
 
 # ─────────────────────────────────────────────────────────────
 section("--dump")
@@ -1083,7 +1283,7 @@ with mock.patch.object(pt.client.chat.completions, "create", fake_create):
     sent_requests.clear()
     with LogCapture() as logs:
         pt.extract_financials(text_pdf(PAGES), ambiguous=True)
-    check("ambiguous with table: logged found, model called", logs.has("Ambiguous outcome → results table found") and len(sent_requests) == 1)
+    check("ambiguous with table: logged found, model called", logs.has_line("DEBUG", "ambiguous outcome → results table found") and len(sent_requests) == 1)
 
     sent_requests.clear()
     with LogCapture() as logs:
@@ -1093,7 +1293,7 @@ with mock.patch.object(pt.client.chat.completions, "create", fake_create):
         except pt.SkipFiling:
             skipped = True
     check("ambiguous without table: logged not found, skipped, no model call",
-          skipped and logs.has("Ambiguous outcome → results table not found") and not sent_requests)
+          skipped and logs.has_line("DEBUG", "ambiguous outcome → results table not found") and not sent_requests)
 
     ocr_seen = []
     def fake_ocr(pdf_bytes, page_num):

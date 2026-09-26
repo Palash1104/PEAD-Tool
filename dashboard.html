@@ -875,7 +875,10 @@ function renderLog() {
   }
   const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 30;
   el.innerHTML = (log.lines || []).map((l) => {
-    const c = /ERROR|FAILED|Access Denied/i.test(l) ? "e" : /WARNING/.test(l) ? "w" : /Above threshold|Telegram sent/.test(l) ? "a" : "";
+    // Colour by the status word after the time: ERROR/BLOCKED, WARN/RETRY, ALERT
+    const c = /^\S+\s+ERROR\b|FAILED|BLOCKED|Access Denied/.test(l) ? "e"
+      : /^\S+\s+(WARN|WARNING|RETRY)\b/.test(l) ? "w"
+      : /^\S+\s+ALERT\b|Above threshold|Telegram sent/.test(l) ? "a" : "";
     return c ? `<span class="${c}">${esc(l)}</span>` : esc(l);
   }).join("\n");
   if (atBottom) el.scrollTop = el.scrollHeight;

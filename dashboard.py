@@ -104,11 +104,20 @@ def read_results():
 
 # ── Log parsing ───────────────────────────────────────────────
 
-LINE_RE  = re.compile(r"^(?:(\d{4}-\d{2}-\d{2})\s+)?(\d{2}:\d{2}:\d{2})\s+([A-Z]+)\s+(.*)$")
-STAGE_RE = re.compile(r"(download|page scan|OCR|model)\s+([\d.]+)s")
-DELAY_RE = re.compile(r"exchange→(alert|scored)\s+((?:\d+h\s*)?(?:\d+m\s*)?(?:\d+s)?)")
-FETCH_RE = re.compile(r"\b(BSE|NSE):\s+(fetch FAILED.*|\d+ new announcements.*|\d+ announcements fetched.*)")
-QUEUE_RE = re.compile(r"checker queue:\s*(\d+)")
+# Scanner log lines look like
+#   22:48:33  POLL   BSE: 3 new announcements (fetch OK, 2 pages read) · NSE: 1 new announcements (fetch OK, 931 today)
+#   22:48:35  ALERT  BSE  ESDS Software Solution          41.0/50  Q2FY27  consolidated  Telegram sent  ⏱ download 0.5s · page scan 0.3s · model 3.4s · exchange→alert 2m 13s
+#   22:48:40  POLL   done · 2 result filings · … · checker queue: 1 pending
+# The word after the time is a status (POLL, SCORE, ALERT, …) or a level
+# (INFO, WARN, ERROR, DEBUG). Older logs had one exchange per fetch line and
+# timings on their own "⏱" line; both still parse.
+LINE_RE    = re.compile(r"^(?:(\d{4}-\d{2}-\d{2})\s+)?(\d{2}:\d{2}:\d{2})\s+([A-Z]+)\s+(.*)$")
+FILING_RE  = re.compile(r"^(BSE|NSE)\s{2}(\S.*?)\s{2,}")      # exchange + padded company
+STAGE_RE   = re.compile(r"(download|page scan|OCR|model)\s+([\d.]+)s")
+DELAY_RE   = re.compile(r"exchange→(alert|scored)\s+((?:\d+h\s*)?(?:\d+m\s*)?(?:\d+s)?)")
+FETCH_RE   = re.compile(r"\b(BSE|NSE):\s+(fetch FAILED[^·]*|\d+ new announcements[^·]*|\d+ announcements fetched[^·]*)")
+BLOCKED_RE = re.compile(r"\b(BSE|NSE)\b[^·]*?(?:Access Denied|BLOCKED|blocked:)")
+QUEUE_RE   = re.compile(r"checker queue:\s*(\d+)")
 
 
 def duration_to_seconds(text: str):
@@ -145,19 +154,28 @@ def read_log():
 
     lines = [ln.rstrip("\r") for ln in text.split("\n") if ln.strip()]
 
-    timings, exchanges = [], {}
-    queue, context = None, None
+    timings, exchanges, shown = [], {}, []
+    queue, context, status = None, None, None
 
     for line in lines:
-        m   = LINE_RE.match(line)
-        t   = m.group(2) if m else None
-        msg = m.group(4) if m else line
+        m      = LINE_RE.match(line)
+        t      = m.group(2) if m else None
+        status = m.group(3) if m else status      # traceback lines follow their record
+        msg    = m.group(4) if m else line
 
-        if "→" in msg and "exchange→" not in msg:
+        # pead_tool.log carries DEBUG detail; the panel shows what the terminal shows
+        if status == "DEBUG":
+            continue
+        shown.append(line)
+
+        filing = FILING_RE.match(msg)
+        if filing:
+            context = f"{status} {filing.group(1)} {filing.group(2)}"
+        elif "→" in msg and "exchange→" not in msg:          # older log layout
             context = msg.strip()[:140]
 
         if "⏱" in msg:
-            entry = {"time": t, "context": context}
+            entry = {"time": t, "context": context, "status": status}
             for stage, val in STAGE_RE.findall(msg):
                 entry[stage.replace(" ", "_").lower()] = float(val)
             d = DELAY_RE.search(msg)
@@ -166,17 +184,14 @@ def read_log():
                 entry["delay"] = duration_to_seconds(d.group(2))
             timings.append(entry)
 
-        f = FETCH_RE.search(msg)
-        if f:
+        for f in FETCH_RE.finditer(msg):
             exchanges[f.group(1)] = {
                 "time": t,
                 "message": f.group(2).strip(),
                 "ok": "FAILED" not in f.group(2),
             }
-        if "Access Denied" in msg:
-            for ex in ("BSE", "NSE"):
-                if ex in msg:
-                    exchanges[ex] = {"time": t, "message": "Access Denied", "ok": False}
+        for b in BLOCKED_RE.finditer(msg):
+            exchanges[b.group(1)] = {"time": t, "message": "blocked (Access Denied)", "ok": False}
 
         q = QUEUE_RE.search(msg)
         if q:
@@ -186,7 +201,7 @@ def read_log():
         "available": True,
         "mtime": mtime,
         "age_sec": max(0.0, time.time() - mtime),
-        "lines": lines[-LOG_LINES_SHOWN:],
+        "lines": shown[-LOG_LINES_SHOWN:],
         "timings": timings[-200:],
         "exchanges": exchanges,
         "checker_queue": queue,
