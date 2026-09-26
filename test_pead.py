@@ -25,6 +25,11 @@ for var in ["AICREDITS_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"]:
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pead_tool as pt
 import compare_models
+import dashboard
+
+# Most fixtures are Q1FY27 results; the quarter-cutoff tests set the real value back
+CONFIGURED_SCORE_FROM_QUARTER = pt.SCORE_FROM_QUARTER
+pt.SCORE_FROM_QUARTER = "Q1FY20"
 
 fails = 0
 
@@ -485,15 +490,25 @@ section("CSV")
 d = fresh_state_dir()
 with open(pt.RESULTS_CSV, "w", newline="", encoding="utf-8") as fh:
     w = csv.writer(fh)
-    w.writerow(pt.CSV_HEADER[:-1])
+    w.writerow(pt.CSV_HEADER[:-2])                         # pre-NSE file: no exchange, no filing_url
     w.writerow(["2026-05-27 23:40:34", "Old Co", "540026", "0.0"] + [""] * 11)
 pt.initialize_csv()
 pt.save_result_csv(nse_filing, 40.0, mk(**GOOD))
 rows = list(csv.reader(open(pt.RESULTS_CSV, encoding="utf-8")))
-check("legacy CSV gains exchange column", rows[0][-1] == "exchange" and rows[1][-1] == "BSE", rows[1])
-check("new row records exchange", rows[2][-1] == "NSE" and len(rows[2]) == len(pt.CSV_HEADER), rows[2])
+check("pre-NSE CSV gains exchange + filing_url columns", rows[0][-2:] == ["exchange", "filing_url"] and rows[1][-2:] == ["BSE", ""], rows[1])
+check("new row records exchange and the filing link",
+      rows[2][-2:] == ["NSE", nse_filing["attachment_url"]] and len(rows[2]) == len(pt.CSV_HEADER), rows[2])
 pt.initialize_csv()
-check("migration is idempotent", list(csv.reader(open(pt.RESULTS_CSV, encoding="utf-8")))[0].count("exchange") == 1)
+check("migration is idempotent", list(csv.reader(open(pt.RESULTS_CSV, encoding="utf-8")))[0] == pt.CSV_HEADER)
+
+d = fresh_state_dir()
+with open(pt.RESULTS_CSV, "w", newline="", encoding="utf-8") as fh:
+    w = csv.writer(fh)
+    w.writerow(pt.CSV_HEADER[:-1])                         # file from before filing_url
+    w.writerow(["2026-09-24 21:31:06", "Purple Style Labs Limited", "PERNIASPOP", "0.0"] + [""] * 11 + ["NSE"])
+pt.initialize_csv()
+rows = list(csv.reader(open(pt.RESULTS_CSV, encoding="utf-8")))
+check("exchange column kept, only filing_url added", rows[0] == pt.CSV_HEADER and rows[1][-2:] == ["NSE", ""], rows)
 
 # ─────────────────────────────────────────────────────────────
 section("main loop")
@@ -702,6 +717,46 @@ check("clear result scored while the ambiguous check was still running",
 check("clear alert first, ambiguous alert once its check finished", alerts == ["BSE:Co 750", "NSE:Co SLOW"], alerts)
 check("in-flight ambiguous filing not resubmitted when NSE lists it again", len(amb_calls) == 1, amb_calls)
 
+# Quarter cutoff: results the PDF dates before SCORE_FROM_QUARTER are ignored
+check("configured cutoff is Q2FY27", CONFIGURED_SCORE_FROM_QUARTER == "Q2FY27", CONFIGURED_SCORE_FROM_QUARTER)
+check("quarter_index orders quarters",
+      pt.quarter_index("Q4FY26") < pt.quarter_index("Q1FY27") < pt.quarter_index("Q2FY27") < pt.quarter_index("Q1FY28"))
+try:
+    pt.quarter_index("Q5FY27")
+    check("bad quarter label rejected", False)
+except ValueError:
+    check("bad quarter label rejected", True)
+
+pt.SCORE_FROM_QUARTER = "Q2FY27"
+try:
+    fresh_state_dir()
+    old_q = pt.normalise_bse(bse_raw("q1", 801, "Result", "2026-09-26T10:00:00"))
+    old_amb = pt.normalise_nse(nse_raw("q2", "OLDQ", "INE802A01010", "26-Sep-2026 10:05:00", desc="Outcome of Board Meeting"))
+    new_q = pt.normalise_bse(bse_raw("q3", 803, "Result", "2026-10-20T10:00:00"))
+    no_period = pt.normalise_bse(bse_raw("q4", 804, "Result", "2026-09-26T11:00:00"))
+    extract, calls = counting_extract({
+        old_q["attachment_url"]: mk(period_end="2026-06-30", **GOOD),        # Q1FY27
+        old_amb["attachment_url"]: mk(period_end="2026-06-30", **GOOD),      # Q1FY27, via the checker
+        new_q["attachment_url"]: mk(period_end="2026-09-30", **GOOD),        # Q2FY27
+        no_period["attachment_url"]: mk(**GOOD),                             # no period_end
+    })
+    with LogCapture() as logs:
+        alerts = run_main(1, bse=lambda k: [old_q, new_q, no_period], nse=lambda c: [old_amb], extract=extract)
+    seen = set(json.load(open(pt.SEEN_FILE)))
+    processed = set(json.load(open(pt.PROCESSED_SCRIPS_FILE)))
+    csv_scrips = [r["scrip"] for r in csv.DictReader(open(pt.RESULTS_CSV, encoding="utf-8"))]
+    check("old quarter logged as ignored", logs.has("Q1FY27: old quarter, ignored (scoring from Q2FY27)"), logs.messages)
+    check("old quarter skip doesn't claim the model wasn't called",
+          logs.has("Skip: old quarter (Q1FY27) — not retrying") and not logs.has("old quarter (Q1FY27) — not calling the model"))
+    check("old-quarter filings marked seen, not scored, not processed, no retry",
+          {old_q["id"], old_amb["id"]} <= seen and "801" not in csv_scrips and "OLDQ" not in csv_scrips
+          and not any("801" in k or "INE802A01010" in k for k in processed)
+          and (not os.path.exists(pt.RETRIES_FILE) or json.load(open(pt.RETRIES_FILE)) == {}), (seen, processed, csv_scrips))
+    check("Q2FY27 result and one without period_end are scored and alerted",
+          alerts == ["BSE:Co 804", "BSE:Co 803"] and processed == {"BSE-803_Q2FY27", "BSE-804_Q1FY27"}, (alerts, processed))  # oldest first
+finally:
+    pt.SCORE_FROM_QUARTER = "Q1FY20"
+
 # Timing line per processed filing
 fresh_state_dir()
 timed = pt.normalise_bse(bse_raw("t9", 909, "Result", "2026-09-24T10:00:00"))
@@ -825,6 +880,61 @@ finally:
     logging.getLogger().removeHandler(handler)
     handler.close()
 check("file log appends across restarts", open(log_path, encoding="utf-8").read().count("\n") == 3)
+
+# ─────────────────────────────────────────────────────────────
+section("dashboard /filing")
+
+LIVE = "https://www.bseindia.com/xml-data/corpfiling/AttachLive/"
+HIS = "https://www.bseindia.com/xml-data/corpfiling/AttachHis/"
+old_name = "64c0e26e-8713-48ab-98a1-847f560b8ada.pdf"     # a May 2026 filing: gone from AttachLive
+new_name = "49f77c3e-fb28-4a64-a1f6-084126c99675.pdf"     # a Sept 2026 filing: still in AttachLive
+
+def fake_is_pdf(available):
+    asked = []
+    def is_pdf(url):
+        asked.append(url)
+        return url in available
+    return is_pdf, asked
+
+dashboard._filing_cache.clear()
+is_pdf, asked = fake_is_pdf({HIS + old_name, LIVE + new_name})
+with mock.patch.object(dashboard, "is_pdf", is_pdf):
+    check("old BSE filing: AttachLive missing → AttachHis",
+          dashboard.resolve_filing(LIVE + old_name, "BSE", "543273") == HIS + old_name and asked == [LIVE + old_name, HIS + old_name], asked)
+    asked.clear()
+    check("resolved link is cached", dashboard.resolve_filing(LIVE + old_name, "BSE", "543273") == HIS + old_name and asked == [])
+    check("recent BSE filing stays on AttachLive", dashboard.resolve_filing(LIVE + new_name, "BSE", "544901") == LIVE + new_name)
+    check("missing from both → company page",
+          dashboard.resolve_filing(LIVE + "0000.pdf", "BSE", "544901") == "https://www.bseindia.com/stock-share-price/x/x/544901/")
+    nse_url = "https://nsearchives.nseindia.com/corporate/ESDS_24092026202831_ESDS_BM_Outcome_BSE_NSE_Intimation.pdf"
+    asked.clear()
+    check("NSE archive link passed through unchecked", dashboard.resolve_filing(nse_url, "NSE", "ESDS") == nse_url and asked == [])
+    check("NSE fallback is the NSE quote page, & escaped",
+          dashboard.resolve_filing("", "NSE", "M&M") == "https://www.nseindia.com/get-quotes/equity?symbol=M%26M")
+    asked.clear()
+    check("non-exchange URL never fetched → company page",
+          dashboard.resolve_filing("https://example.com/x.pdf", "BSE", "532386") == "https://www.bseindia.com/stock-share-price/x/x/532386/" and asked == [])
+    check("BSE URL with a path trick rejected",
+          dashboard.resolve_filing(LIVE + "../../etc/x.pdf", "BSE", "532386").startswith("https://www.bseindia.com/stock-share-price/"))
+    check("bad scrip → dashboard home", dashboard.resolve_filing("", "BSE", "<script>") == "/")
+
+import http.client
+server = dashboard.ThreadingHTTPServer(("127.0.0.1", 0), dashboard.Handler)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+try:
+    dashboard._filing_cache.clear()
+    is_pdf, asked = fake_is_pdf({HIS + old_name})
+    with mock.patch.object(dashboard, "is_pdf", is_pdf):
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
+        query = "url=" + dashboard.quote(LIVE + old_name, safe="") + "&exchange=BSE&scrip=543273"
+        conn.request("GET", "/filing?" + query)
+        resp = conn.getresponse()
+        check("/filing answers 302 to where the PDF is now",
+              resp.status == 302 and resp.getheader("Location") == HIS + old_name, (resp.status, resp.getheader("Location")))
+        conn.close()
+finally:
+    server.shutdown()
+    server.server_close()
 
 # ─────────────────────────────────────────────────────────────
 section("--dump")

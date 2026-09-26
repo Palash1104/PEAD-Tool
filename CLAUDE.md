@@ -8,6 +8,7 @@ Post-Earnings Announcement Drift scanner for Indian stocks. It polls BSE and NSE
 |---|---|
 | [pead_tool.py](pead_tool.py) | The scanner. It is one procedural module with no package structure. |
 | [compare_models.py](compare_models.py) | Runs a folder of saved PDFs through two models and prints the extracted values side by side. |
+| [dashboard.py](dashboard.py) + [dashboard.html](dashboard.html) | Local read-only dashboard (`py dashboard.py`, http://127.0.0.1:8050). Standard library only. Reads the state files and `pead_tool.log`. Its one outbound request is `/filing` (below). |
 | [test_pead.py](test_pead.py) | Offline tests. Run `python test_pead.py` and expect `FAILURES: 0`. Network, model and Telegram are mocked, and state files go to a temp dir. The PDF section uses the real pdfplumber, Poppler and Tesseract (about 15s of OCR). Keep it passing and extend it with any change. |
 
 ## Running
@@ -77,6 +78,7 @@ Each poll, `main()` calls `run_cycle()` and then `wait_for_checks()` until the n
    - If the key is already in `processed_scrips`, the filing is marked seen and skipped.
 5. **`process_filing()`** = `obtain_financials()` + `score_filing()`. The first downloads (NSE via the session), extracts and checks `has_core_values` (current revenue **and** PAT); it touches no state, so the checker thread shares it. The second computes the real key, scores, writes the CSV and alerts, on the main thread only.
    - The real quarter comes from the PDF's `period_end` via `filing_quarter`. It is only trusted if it falls 0–400 days before the filing date; otherwise the filing-date estimate is used.
+   - If the PDF's quarter is before `SCORE_FROM_QUARTER` ("Q2FY27"), `score_filing` logs "<quarter>: old quarter, ignored" and raises `SkipFiling(model_called=True)`. The filing is marked seen, and it isn't scored, alerted, added to processed or retried. This only applies when `period_end` gives the quarter; a filing-date estimate never triggers it.
    - If that key is already processed, the filing is a duplicate: no score and no alert.
    - Otherwise it scores, writes the CSV and alerts, and returns the key. It returns None on failure.
 6. **Retry or skip**
@@ -123,7 +125,7 @@ Growth is `_pct(curr, prev) = (curr - prev) / abs(prev) * 100`. `band_score` awa
 | File | Purpose | Git |
 |---|---|---|
 | `seen.json` | Filing ids finished with. Bare legacy ids load as `BSE:` ids. | ignored |
-| `processed_scrips.json` | `{ISIN}_{quarter}` keys (or the `{EXCHANGE}-{code}_{quarter}` fallback). `migrate_processed_keys()` upgrades legacy or fallback keys at startup and at the daily master refresh. It logs "Migrated N processed keys to ISIN format" and lists the keys still without an ISIN. `BSE-509084_Q4FY26` (Photon Capital) is not in BSE's active scrip list. | **tracked** |
+| `processed_scrips.json` | `{ISIN}_{quarter}` keys (or the `{EXCHANGE}-{code}_{quarter}` fallback). `migrate_processed_keys()` upgrades legacy or fallback keys at startup and at the daily master refresh. It logs "Migrated N processed keys to ISIN format" and lists the keys still without an ISIN. | ignored (untracked 2026-09-26) |
 | `retry_counts.json` | filing id → failed attempts | ignored |
 | `scrip_master.json` | `{"bse": {code: ISIN}, "nse": {symbol: ISIN}, "updated"}` | ignored |
 | `pead_results.csv` | One row per scored filing | ignored |
@@ -131,14 +133,18 @@ Growth is `_pct(curr, prev) = (curr - prev) / abs(prev) * 100`. `band_score` awa
 | `pead_tool.log` (+ `.1`–`.3`) | Same lines as the console, UTF-8, rotating at 5 MB with 3 backups. `setup_file_logging()` is attached only in the `__main__` block, so tests and `compare_models.py` don't write to it. Always lives next to `pead_tool.py`. | ignored |
 
 - **Scrip master**: built from BSE `ListofScripData` and NSE `EQUITY_L.csv` / `SME_EQUITY_L.csv`, refreshed daily. `updated` is only stamped when both downloads succeed, and failed downloads keep the cached mappings. NSE filings also teach symbol → ISIN (`learn_isin`).
-- **CSV columns**: timestamp, company, scrip (code or symbol), score, revenue/pat/ebitda for cq, pq and ly, eps_cq, eps_ly, exchange.
-  - `initialize_csv()` adds the `exchange` column to older files and marks old rows BSE.
-  - Some rows from 27–28 May 2026 came from an older scoring version (scores above 50).
-  - Rows before 2026-09-24 relied on the LLM to convert units.
+- **CSV columns**: timestamp, company, scrip (code or symbol), score, revenue/pat/ebitda for cq, pq and ly, eps_cq, eps_ly, exchange, filing_url (the result PDF's `attachment_url`).
+  - `initialize_csv()` appends any `CSV_ADDED_COLUMNS` an older file lacks: `exchange` (old rows marked BSE) and `filing_url` (blank for rows scored before 2026-09-26).
+  - `dashboard.html` links the Exch. cell to `/filing?url=<filing_url>&exchange=&scrip=`, or straight to the company's exchange page (dotted underline) when `filing_url` is blank. It only accepts https links on bseindia.com / nseindia.com.
+- **`/filing` in dashboard.py**: BSE moves result PDFs from `AttachLive` to `AttachHis` after a few months. Checked 2026-09-26: May filings 404 on AttachLive and load from AttachHis, mid-August ones are in both, and today's are only on AttachLive.
+  - `resolve_filing()` checks AttachLive, then AttachHis, by fetching the first 8 bytes and looking for `%PDF`. It redirects (302) to the first one that works, else to the company page.
+  - Results are cached for 6h. NSE archive links pass through unchecked. Any other URL is never fetched.
+- **Data reset 2026-09-26**: the Q1FY27 run (results CSV, seen, processed, log) was moved to `archive/q1fy27/`, which is gitignored. `pead_results.csv` restarted empty with the current header. `scrip_master.json` was kept.
 
 ## Config (top of `pead_tool.py`)
 
 - `PEAD_THRESHOLD = 35`, `POLL_INTERVAL_SEC = 30`, `MAX_RETRIES = 3`, `BLOCKED_ALERT_SEC = 3600`
+- `SCORE_FROM_QUARTER = "Q2FY27"`: earlier quarters, by the PDF's period_end, are ignored. `test_pead.py` sets it to "Q1FY20" for its Q1FY27 fixtures, and the cutoff tests restore the real value.
 - `SMALL_BASE_PAT_CR = 1`, `SMALL_BASE_REV_CR = 10`
 - The Telegram emoji tiers are hardcoded separately in `send_telegram` (🚀 ≥40, ✅ ≥30).
 - Exchange constants sit in the EXCHANGES section, and extraction tuning sits next to `EXTRACTION_PROMPT`.

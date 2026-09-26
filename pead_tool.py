@@ -64,6 +64,10 @@ POLL_INTERVAL_SEC  = 30
 MAX_RETRIES        = 3      # extra attempts per failed filing, one per poll
 BLOCKED_ALERT_SEC  = 3600   # Telegram at most hourly about an exchange blocking us
 
+# Results whose PDF period_end falls in an earlier quarter are ignored:
+# logged as "old quarter, ignored", marked seen, never scored or alerted
+SCORE_FROM_QUARTER = "Q2FY27"
+
 # Growth factors are skipped when last year's base is this small (Rs. Cr)
 SMALL_BASE_PAT_CR  = 1
 SMALL_BASE_REV_CR  = 10
@@ -179,7 +183,14 @@ CSV_HEADER = [
     "eps_ly",
 
     "exchange",
+    "filing_url",   # the result PDF on the exchange
 ]
+
+# Columns added after the CSV existed, with the value older rows get
+CSV_ADDED_COLUMNS = {
+    "exchange": "BSE",      # every row before NSE support came from BSE
+    "filing_url": "",       # not recorded before this column existed
+}
 
 def initialize_csv():
 
@@ -188,29 +199,34 @@ def initialize_csv():
             csv.writer(f).writerow(CSV_HEADER)
         return
 
-    # Files from before NSE support lack the exchange column — add it
+    # Older files lack columns added since — append them to every row
     try:
         with open(RESULTS_CSV, newline="", encoding="utf-8") as f:
             rows = list(csv.reader(f))
 
-        if not rows or "exchange" in rows[0]:
+        if not rows:
             return
 
-        rows[0].append("exchange")
+        missing = [c for c in CSV_ADDED_COLUMNS if c not in rows[0]]
+
+        if not missing:
+            return
+
+        rows[0].extend(missing)
 
         for row in rows[1:]:
             if row:
-                row.append("BSE")
+                row.extend(CSV_ADDED_COLUMNS[c] for c in missing)
 
         tmp = RESULTS_CSV + ".tmp"
         with open(tmp, "w", newline="", encoding="utf-8") as f:
             csv.writer(f).writerows(rows)
         os.replace(tmp, RESULTS_CSV)
 
-        log.info(f"Added exchange column to {RESULTS_CSV} (existing rows marked BSE)")
+        log.info(f"Added {', '.join(missing)} column{'' if len(missing) == 1 else 's'} to {RESULTS_CSV}")
 
     except OSError as e:
-        log.warning(f"Could not add exchange column to {RESULTS_CSV}: {e}")
+        log.warning(f"Could not add new columns to {RESULTS_CSV}: {e}")
 
 def save_result_csv(filing, score, fin):
 
@@ -243,6 +259,7 @@ def save_result_csv(filing, score, fin):
                 eps[2],
 
                 filing["exchange"],
+                filing["attachment_url"],
             ])
     except OSError as e:
         # e.g. CSV open in Excel — don't let logging block the alert
@@ -259,8 +276,13 @@ class ExchangeBlocked(Exception):
     """Access Denied / 401 / 403 — must never be read as 'no announcements'."""
 
 class SkipFiling(Exception):
-    """The filing can never yield results (no results table, not a PDF):
-    skip it for good — no model call, no retry."""
+    """The filing can never yield a score (no results table, not a PDF, old
+    quarter): skip it for good, no retry. model_called says whether the model
+    had already read it (only for an old quarter)."""
+
+    def __init__(self, reason: str, model_called: bool = False):
+        super().__init__(reason)
+        self.model_called = model_called
 
 def is_blocked_response(r) -> bool:
     return r.status_code in (401, 403) or "access denied" in r.text[:2000].lower()
@@ -556,8 +578,8 @@ def reporting_quarter(filed_on: date) -> str:
         m, y = m + 12, y - 1
     return quarter_label(date(y, m, 1))
 
-def filing_quarter(fin: dict, filed_on: date) -> str:
-    """Quarter from the PDF's period_end, else from the filing date."""
+def pdf_quarter(fin: dict, filed_on: date) -> str | None:
+    """Quarter from the PDF's period_end, or None if missing or implausible."""
     period_end = fin.get("period_end")
 
     if period_end:
@@ -568,7 +590,18 @@ def filing_quarter(fin: dict, filed_on: date) -> str:
 
         log.warning(f"   period_end {period_end} implausible for a filing on {filed_on}, using filing date")
 
-    return reporting_quarter(filed_on)
+    return None
+
+def filing_quarter(fin: dict, filed_on: date) -> str:
+    """Quarter from the PDF's period_end, else from the filing date."""
+    return pdf_quarter(fin, filed_on) or reporting_quarter(filed_on)
+
+def quarter_index(label: str) -> int:
+    """Sortable number for "Q2FY27"-style labels."""
+    m = re.fullmatch(r"Q([1-4])FY(\d{2})", label)
+    if not m:
+        raise ValueError(f"bad quarter label {label!r}")
+    return int(m.group(2)) * 4 + int(m.group(1))
 
 def fetch_bse_master() -> dict:
     r = requests.get(BSE_MASTER_URL, headers=HEADERS, timeout=60)
@@ -1587,7 +1620,15 @@ def score_filing(filing: dict, isin, fin: dict, processed: set, timings: dict) -
     """Quarter key, duplicate check, score, CSV and alert. Returns the
     processed key — also when the PDF's period shows it was already scored."""
     exchange_dt = filing["exchange_dt"]
-    quarter = filing_quarter(fin, (exchange_dt or datetime.now()).date())
+    filed_on = (exchange_dt or datetime.now()).date()
+    from_pdf = pdf_quarter(fin, filed_on)
+
+    if from_pdf and quarter_index(from_pdf) < quarter_index(SCORE_FROM_QUARTER):
+        log.info(f"   {from_pdf}: old quarter, ignored (scoring from {SCORE_FROM_QUARTER})")
+        log_timings(timings)
+        raise SkipFiling(f"old quarter ({from_pdf})", model_called=True)
+
+    quarter = from_pdf or reporting_quarter(filed_on)
     key = processed_key(filing, isin, quarter)
 
     if key in processed:
@@ -1624,7 +1665,7 @@ def process_filing(filing: dict, isin, processed: set, nse: NseClient) -> str | 
     """Clear result filings, on the main thread: obtain financials, then score.
 
     Returns the processed key, or None on a retryable failure. Raises
-    SkipFiling when retrying can't help.
+    SkipFiling when retrying can't help (including an old quarter).
     """
     timings = {}
 
@@ -1819,8 +1860,8 @@ def record_result(filing: dict, state: ScannerState, key: str | None):
         state.pending[fid] = filing
         log.info(f"   Will retry next poll (retry {attempts}/{MAX_RETRIES})")
 
-def record_skip(filing: dict, state: ScannerState, reason: str):
-    log.info(f"   Skip: {reason} — not calling the model, not retrying")
+def record_skip(filing: dict, state: ScannerState, reason: str, model_called: bool = False):
+    log.info(f"   Skip: {reason} — {'' if model_called else 'not calling the model, '}not retrying")
     state.finish(filing["id"])
 
 def handle_clear(filing: dict, state: ScannerState):
@@ -1830,7 +1871,7 @@ def handle_clear(filing: dict, state: ScannerState):
     try:
         key = process_filing(filing, isin, state.processed, state.nse)
     except SkipFiling as e:
-        record_skip(filing, state, str(e))
+        record_skip(filing, state, str(e), e.model_called)
         return
     except Exception:
         log.exception("   Unexpected error processing filing")
@@ -1865,6 +1906,9 @@ def apply_ambiguous_result(result: dict, state: ScannerState):
     if result["fin"]:
         try:
             key = score_filing(filing, isin, result["fin"], state.processed, result["timings"])
+        except SkipFiling as e:
+            record_skip(filing, state, str(e), e.model_called)
+            return
         except Exception:
             log.exception("   Unexpected error scoring filing")
     else:

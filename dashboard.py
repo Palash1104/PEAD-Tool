@@ -18,6 +18,10 @@ It only READS these files from this folder (it never writes anything):
 
 No extra packages needed. Standard library only.
 The server listens on 127.0.0.1, so it is only reachable from this computer.
+
+Its only outbound requests come from /filing, when you click an exchange link
+in the results table: for a BSE filing it checks which folder still holds the
+PDF (see resolve_filing) and redirects you there.
 """
 
 import argparse
@@ -27,9 +31,11 @@ import os
 import re
 import threading
 import time
+import urllib.request
 import webbrowser
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, quote, urlsplit
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -211,6 +217,84 @@ def build_payload():
     }
 
 
+# ── Filing links ──────────────────────────────────────────────
+#
+# BSE serves new result PDFs from AttachLive and later moves them to
+# AttachHis (checked 2026-09-26: May filings 404 on AttachLive but load from
+# AttachHis; mid-August ones are in both; today's only in AttachLive). The
+# scanner records the AttachLive URL, so /filing finds where the PDF is now.
+
+BSE_FILING_RE = re.compile(
+    r"^https://www\.bseindia\.com/xml-data/corpfiling/(?:AttachLive|AttachHis)/([A-Za-z0-9._-]+\.pdf)$",
+    re.I,
+)
+BSE_FOLDERS = ("AttachLive", "AttachHis")
+NSE_FILING_HOSTS = {"nsearchives.nseindia.com", "archives.nseindia.com", "www.nseindia.com"}
+SCRIP_RE = re.compile(r"^[A-Za-z0-9&._-]{1,20}$")
+
+BSE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    ),
+    "Referer": "https://www.bseindia.com/",
+    "Origin": "https://www.bseindia.com",
+    "Accept": "application/pdf,*/*",
+}
+
+FILING_CACHE_SEC = 6 * 3600          # a PDF can move from AttachLive later
+_filing_cache = {}                   # attachment name → (url, checked at)
+
+
+def company_page(exchange: str, scrip: str) -> str:
+    """The company's page on its exchange; the last resort for a filing link."""
+    if not SCRIP_RE.match(scrip or ""):
+        return "/"
+    if (exchange or "").upper() == "NSE":
+        return f"https://www.nseindia.com/get-quotes/equity?symbol={quote(scrip)}"
+    return f"https://www.bseindia.com/stock-share-price/x/x/{quote(scrip)}/"
+
+
+def is_pdf(url: str) -> bool:
+    """True if the URL answers with a PDF (only the first bytes are fetched)."""
+    req = urllib.request.Request(url, headers={**BSE_HEADERS, "Range": "bytes=0-7"})
+    try:
+        with urllib.request.urlopen(req, timeout=8) as r:
+            return r.read(8).startswith(b"%PDF")
+    except Exception:
+        return False
+
+
+def resolve_filing(url: str, exchange: str, scrip: str) -> str:
+    """Where a recorded filing link should go now.
+
+    BSE: AttachLive, then AttachHis, then the company page. NSE archive links
+    are passed through. Anything else goes to the company page.
+    """
+    m = BSE_FILING_RE.match(url or "")
+
+    if m:
+        name = m.group(1)
+        cached = _filing_cache.get(name)
+
+        if cached and time.time() - cached[1] < FILING_CACHE_SEC:
+            return cached[0]
+
+        for folder in BSE_FOLDERS:
+            candidate = f"https://www.bseindia.com/xml-data/corpfiling/{folder}/{name}"
+            if is_pdf(candidate):
+                _filing_cache[name] = (candidate, time.time())
+                return candidate
+
+        return company_page(exchange, scrip)
+
+    parts = urlsplit(url or "")
+    if parts.scheme == "https" and parts.hostname in NSE_FILING_HOSTS:
+        return url
+
+    return company_page(exchange, scrip)
+
+
 # ── HTTP server ───────────────────────────────────────────────
 
 class Handler(BaseHTTPRequestHandler):
@@ -235,6 +319,17 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 body = json.dumps({"error": str(e)}).encode("utf-8")
                 self._send(500, body, "application/json; charset=utf-8")
+
+        elif route == "/filing":
+            # /filing?url=<recorded filing_url>&exchange=BSE&scrip=532386
+            q = parse_qs(urlsplit(self.path).query)
+            first = lambda k: (q.get(k) or [""])[0]
+            target = resolve_filing(first("url"), first("exchange"), first("scrip"))
+            self.send_response(302)
+            self.send_header("Location", target)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
 
         elif route == "/favicon.ico":
             self._send(204, b"", "text/plain")

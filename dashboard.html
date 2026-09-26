@@ -168,9 +168,13 @@ button.icon:hover { color: var(--text-primary); }
 .card-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; margin-bottom: 10px; }
 
 /* 3D skyline */
-#skyline { position: relative; height: 420px; border-radius: 12px; overflow: hidden; cursor: grab; }
+/* The card stretches to the detail card's height; the 3D view fills whatever is
+   left below the header, so it reaches the bottom of the section */
+.sky-card { display: flex; flex-direction: column; }
+#skyline { position: relative; flex: 1 1 0; min-height: 420px; border-radius: 12px; overflow: hidden; cursor: grab; }
 #skyline:active { cursor: grabbing; }
-#skyline canvas { display: block; width: 100% !important; height: 100% !important; }
+/* Absolute so the canvas never feeds back into the box's own height */
+#skyline canvas { position: absolute; inset: 0; display: block; width: 100% !important; height: 100% !important; }
 .legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--text-secondary); }
 .legend .sw { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
 .hint-3d { position: absolute; left: 12px; bottom: 10px; font-size: 11px; color: var(--text-muted); pointer-events: none; }
@@ -232,6 +236,10 @@ table.results tbody tr.sel { background: color-mix(in srgb, var(--accent) 12%, t
 .scorebar .mini span.hit { background: var(--accent); }
 .co { max-width: 280px; overflow: hidden; text-overflow: ellipsis; display: inline-block; vertical-align: bottom; }
 .up { color: var(--good); } .down { color: var(--bad); }
+/* Exch. text stays as it was, with an underline marking it as a link */
+.ex-link { color: inherit; text-decoration: underline; text-decoration-color: var(--text-muted); text-underline-offset: 3px; }
+.ex-link.fallback { text-decoration-style: dotted; }
+.ex-link:hover { color: var(--accent); text-decoration-color: var(--accent); }
 .more { text-align: center; margin-top: 10px; }
 
 /* Log */
@@ -258,7 +266,7 @@ table.results tbody tr.sel { background: color-mix(in srgb, var(--accent) 12%, t
 @media (max-width: 600px) {
   .wrap { padding: 14px 16px 30px; }
   .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  #skyline { height: 320px; }
+  #skyline { min-height: 320px; }
   .filters input[type=search] { min-width: 0; flex: 1; }
   .factor { grid-template-columns: 100px 1fr 50px; }
 }
@@ -320,7 +328,7 @@ table.results tbody tr.sel { background: color-mix(in srgb, var(--accent) 12%, t
   </section>
 
   <section class="grid-hero">
-    <div class="card">
+    <div class="card sky-card">
       <div class="card-head">
         <div>
           <h2>Score skyline</h2>
@@ -477,6 +485,25 @@ const lerpColor = (a, b, t) => {
 };
 
 /* ─────────────── Row normalisation ─────────────── */
+// Only exchange-hosted https links make it into an href
+function safeFilingUrl(u) {
+  u = (u || "").trim();
+  return /^https:\/\/([a-z0-9-]+\.)*(bseindia|nseindia)\.com\//i.test(u) ? u : "";
+}
+
+// The company's page on its exchange; the fallback for rows without a filing link
+function companyPage(r) {
+  return r.exchange === "BSE"
+    ? `https://www.bseindia.com/stock-share-price/x/x/${encodeURIComponent(r.scrip)}/`
+    : `https://www.nseindia.com/get-quotes/equity?symbol=${encodeURIComponent(r.scrip)}`;
+}
+
+// Via dashboard.py's /filing, which finds where BSE keeps the PDF now
+// (AttachLive, then AttachHis) and falls back to the company page
+function filingLink(r) {
+  return `/filing?url=${encodeURIComponent(r.filingUrl)}&exchange=${encodeURIComponent(r.exchange)}&scrip=${encodeURIComponent(r.scrip)}`;
+}
+
 function normalise(raw, i) {
   const g = (k) => raw[k] ?? raw[k.toUpperCase()] ?? null;
   const tsStr = g("timestamp") || "";
@@ -495,6 +522,7 @@ function normalise(raw, i) {
     patCq: num(g("pat_cq")), patPq: num(g("pat_pq")), patLy: num(g("pat_ly")),
     ebCq: num(g("ebitda_cq")), ebPq: num(g("ebitda_pq")), ebLy: num(g("ebitda_ly")),
     epsCq: num(g("eps_cq")), epsLy: num(g("eps_ly")),
+    filingUrl: safeFilingUrl(g("filing_url")),
   };
   r.empty = r.revCq == null && r.patCq == null && r.epsCq == null;
   r.revYoy = pct(r.revCq, r.revLy);
@@ -658,10 +686,7 @@ function renderDetail() {
   $("d-badge").className = "badge" + (hit ? " alert" : "");
   $("d-name").textContent = r.company;
   $("d-name").title = r.company;
-  const link = r.exchange === "BSE"
-    ? `https://www.bseindia.com/stock-share-price/x/x/${encodeURIComponent(r.scrip)}/`
-    : `https://www.nseindia.com/get-quotes/equity?symbol=${encodeURIComponent(r.scrip)}`;
-  $("d-meta").innerHTML = `${esc(r.exchange)} · <a href="${link}" target="_blank" rel="noopener" style="color:var(--accent)">${esc(r.scrip)}</a> · ${esc(r.tsStr)}`;
+  $("d-meta").innerHTML = `${esc(r.exchange)} · <a href="${esc(companyPage(r))}" target="_blank" rel="noopener" style="color:var(--accent)">${esc(r.scrip)}</a> · ${esc(r.tsStr)}`;
   Gauge.set(r.score, hit);
 
   const sc = scorecard(r);
@@ -708,7 +733,9 @@ function renderTable() {
     return `<tr data-id="${esc(r.id)}" class="${r.id === S.selectedId ? "sel" : ""}">
       <td class="mono">${esc(r.tsStr.slice(5, 16))}</td>
       <td><span class="co" title="${esc(r.company)}">${esc(r.company)}</span></td>
-      <td>${esc(r.exchange)}</td>
+      <td>${r.filingUrl
+        ? `<a class="ex-link" href="${esc(filingLink(r))}" target="_blank" rel="noopener" title="Open the result filing on ${esc(r.exchange)}">${esc(r.exchange)}</a>`
+        : `<a class="ex-link fallback" href="${esc(companyPage(r))}" target="_blank" rel="noopener" title="Filing link wasn't recorded for this row; opens the company's ${esc(r.exchange)} page">${esc(r.exchange)}</a>`}</td>
       <td class="num"><span class="scorebar"><span>${hit ? "▲ " : ""}${fmtScore(r.score)}</span><span class="mini"><span class="${hit ? "hit" : ""}" style="width:${Math.min(100, r.score / MAX_SCORE * 100)}%"></span></span></span></td>
       <td class="num ${cls(r.revYoy)}">${fmtPct(r.revYoy)}</td>
       <td class="num ${cls(r.patYoy)}">${fmtPct(r.patYoy)}</td>
@@ -888,8 +915,12 @@ const Skyline = (() => {
 
   let bars = [], floor = null, plane = null, planeEdge = null, grid = null, selRing = null;
   let rotY = -0.55, rotX = 0.52, targetY = rotY, dragging = false, lastX = 0, lastY = 0, moved = 0;
-  let hovered = null, radius = 30;
+  let hovered = null;
   const HMAX = 12;
+  // Size of everything drawn (floor footprint + tallest tower); the camera fits this
+  let dims = { w: 12, d: 12, h: HMAX };
+  // Older CSV rows used a different scale (scores up to 90), so cap the tower at 50
+  const towerHeight = (score) => Math.max(0.12, Math.min(score, MAX_SCORE) / MAX_SCORE * HMAX);
   const ray = new THREE.Raycaster(), mouse = new THREE.Vector2();
 
   function colors() {
@@ -920,7 +951,11 @@ const Skyline = (() => {
     const rowsN = Math.ceil(data.length / cols);
     const step = 1.55, size = 1.05;
     const w = (cols - 1) * step, d = (rowsN - 1) * step;
-    radius = Math.max(17, Math.max(w, d) * 1.3 + 8);
+    dims = {
+      w: w + 3,
+      d: d + 3,
+      h: Math.max(threshold / MAX_SCORE * HMAX, ...data.map((r) => towerHeight(r.score))),
+    };
 
     // floor
     const fg = new THREE.BoxGeometry(w + 3, 0.3, d + 3);
@@ -931,7 +966,7 @@ const Skyline = (() => {
     data.forEach((r, i) => {
       // oldest at the back row, newest at the front
       const row = Math.floor(i / cols), col = i % cols;
-      const h = Math.max(0.12, r.score / MAX_SCORE * HMAX);
+      const h = towerHeight(r.score);
       const hit = r.score >= threshold;
       const t = Math.max(0, Math.min(1, r.score / MAX_SCORE));
       const base = hit ? new THREE.Color(lerpColor(C.lo, C.hi, 0.35 + t * 0.65)) : C.below.clone();
@@ -983,8 +1018,15 @@ const Skyline = (() => {
 
   function placeCamera() {
     world.rotation.y = rotY;
-    camera.position.set(0, Math.sin(rotX) * radius, Math.cos(rotX) * radius);
-    camera.lookAt(0, HMAX * 0.2, 0);
+    // Fit the scene's bounding sphere inside both the vertical and horizontal
+    // field of view, so no rotation, tilt or aspect ratio pushes it off-screen
+    const R = 0.5 * Math.hypot(dims.w, dims.d, dims.h);
+    const vHalf = THREE.MathUtils.degToRad(camera.fov) / 2;
+    const hHalf = Math.atan(Math.tan(vHalf) * camera.aspect);
+    const dist = R / Math.sin(Math.min(vHalf, hHalf)) * 1.04;
+    const cy = dims.h / 2;
+    camera.position.set(0, cy + Math.sin(rotX) * dist, Math.cos(rotX) * dist);
+    camera.lookAt(0, cy, 0);
   }
 
   let visible = true, raf = null, lastT = 0;
