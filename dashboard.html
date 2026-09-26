@@ -1,0 +1,1252 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PEAD Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<style>
+:root {
+  color-scheme: light;
+  --bg:            #f3f3f1;
+  --surface-1:     #fcfcfb;
+  --surface-2:     #f0efec;
+  --border:        #e2e1dc;
+  --text-primary:  #0b0b0b;
+  --text-secondary:#52514e;
+  --text-muted:    #7d7c77;
+  --grid:          #e6e5e0;
+  --accent:        #2a78d6;
+  --accent-soft:   #cde2fb;
+  --below:         #b9b8b1;
+  --good:          #008300;
+  --warn:          #b36b00;
+  --bad:           #d03b3b;
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100;
+  --ramp-lo: #9ec5f4; --ramp-hi: #104281;
+  --shadow: 0 1px 2px rgba(0,0,0,.05), 0 6px 20px rgba(0,0,0,.05);
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --bg:            #111110;
+    --surface-1:     #1a1a19;
+    --surface-2:     #222220;
+    --border:        #2e2e2b;
+    --text-primary:  #ffffff;
+    --text-secondary:#c3c2b7;
+    --text-muted:    #8f8e86;
+    --grid:          #2c2c29;
+    --accent:        #3987e5;
+    --accent-soft:   #1c3556;
+    --below:         #55544f;
+    --good:          #3fbf5a;
+    --warn:          #e0a030;
+    --bad:           #e66767;
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;
+    --ramp-lo: #5598e7; --ramp-hi: #cde2fb;
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.35);
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg:            #111110;
+  --surface-1:     #1a1a19;
+  --surface-2:     #222220;
+  --border:        #2e2e2b;
+  --text-primary:  #ffffff;
+  --text-secondary:#c3c2b7;
+  --text-muted:    #8f8e86;
+  --grid:          #2c2c29;
+  --accent:        #3987e5;
+  --accent-soft:   #1c3556;
+  --below:         #55544f;
+  --good:          #3fbf5a;
+  --warn:          #e0a030;
+  --bad:           #e66767;
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;
+  --ramp-lo: #5598e7; --ramp-hi: #cde2fb;
+  --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.35);
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body {
+  background: var(--bg);
+  color: var(--text-primary);
+  font: 14px/1.45 Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+.mono { font-family: "JetBrains Mono", ui-monospace, Consolas, monospace; }
+.wrap { max-width: 1440px; margin: 0 auto; padding: 20px 24px 40px; }
+
+/* Header */
+header.top {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 16px; flex-wrap: wrap; margin-bottom: 18px;
+}
+.brand { display: flex; align-items: center; gap: 12px; }
+.logo {
+  width: 36px; height: 36px; border-radius: 10px;
+  background: linear-gradient(135deg, var(--accent), var(--ramp-hi));
+  display: grid; place-items: center; color: #fff; font-weight: 700; font-size: 13px;
+  box-shadow: var(--shadow);
+}
+.brand h1 { font-size: 18px; margin: 0; font-weight: 700; letter-spacing: -.01em; }
+.brand .sub { font-size: 12px; color: var(--text-muted); }
+.status-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 5px 10px; border-radius: 999px; font-size: 12px; font-weight: 500;
+  background: var(--surface-1); border: 1px solid var(--border); color: var(--text-secondary);
+  white-space: nowrap;
+}
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--below); flex: none; }
+.dot.good { background: var(--good); box-shadow: 0 0 0 3px color-mix(in srgb, var(--good) 22%, transparent); }
+.dot.warn { background: var(--warn); }
+.dot.bad  { background: var(--bad); }
+.dot.pulse { animation: pulse 2s infinite; }
+@keyframes pulse { 50% { opacity: .45; } }
+button.icon {
+  background: var(--surface-1); border: 1px solid var(--border); color: var(--text-secondary);
+  border-radius: 8px; padding: 5px 10px; font: inherit; font-size: 12px; cursor: pointer;
+}
+button.icon:hover { color: var(--text-primary); }
+
+/* Banner */
+.banner {
+  display: none; padding: 10px 14px; border-radius: 10px; margin-bottom: 14px;
+  background: color-mix(in srgb, var(--bad) 12%, var(--surface-1));
+  border: 1px solid color-mix(in srgb, var(--bad) 35%, var(--border));
+  color: var(--text-primary); font-size: 13px;
+}
+.banner.show { display: block; }
+
+/* Filters */
+.filters {
+  display: flex; gap: 10px; flex-wrap: wrap; align-items: center;
+  margin-bottom: 14px;
+}
+.seg {
+  display: inline-flex; background: var(--surface-1); border: 1px solid var(--border);
+  border-radius: 9px; padding: 2px;
+}
+.seg button {
+  border: 0; background: transparent; color: var(--text-secondary); font: inherit; font-size: 12px;
+  padding: 5px 11px; border-radius: 7px; cursor: pointer;
+}
+.seg button.on { background: var(--surface-2); color: var(--text-primary); font-weight: 600; }
+.filters input[type=search], .filters select {
+  background: var(--surface-1); border: 1px solid var(--border); color: var(--text-primary);
+  border-radius: 9px; padding: 6px 10px; font: inherit; font-size: 13px;
+}
+.filters input[type=search] { min-width: 220px; }
+.filters .count { font-size: 12px; color: var(--text-muted); margin-left: auto; }
+
+/* KPI tiles */
+.kpis { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 12px; margin-bottom: 14px; }
+.tile {
+  background: var(--surface-1); border: 1px solid var(--border); border-radius: 14px;
+  padding: 14px 16px; box-shadow: var(--shadow);
+  transform-style: preserve-3d; transition: transform .25s ease;
+}
+.tile .label { font-size: 12px; color: var(--text-secondary); font-weight: 500; }
+.tile .value { font-size: 26px; font-weight: 700; letter-spacing: -.02em; margin-top: 4px; font-variant-numeric: tabular-nums; }
+.tile .hint { font-size: 11.5px; color: var(--text-muted); margin-top: 2px; }
+
+/* Cards */
+.grid-hero { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); gap: 14px; margin-bottom: 14px; }
+.grid-two  { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; margin-bottom: 14px; }
+.card {
+  background: var(--surface-1); border: 1px solid var(--border); border-radius: 16px;
+  padding: 16px 18px; box-shadow: var(--shadow); min-width: 0; position: relative;
+}
+.card h2 { font-size: 14px; margin: 0; font-weight: 600; }
+.card .desc { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+.card-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; margin-bottom: 10px; }
+
+/* 3D skyline */
+#skyline { position: relative; height: 420px; border-radius: 12px; overflow: hidden; cursor: grab; }
+#skyline:active { cursor: grabbing; }
+#skyline canvas { display: block; width: 100% !important; height: 100% !important; }
+.legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--text-secondary); }
+.legend .sw { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+.hint-3d { position: absolute; left: 12px; bottom: 10px; font-size: 11px; color: var(--text-muted); pointer-events: none; }
+.empty {
+  position: absolute; inset: 0; display: none; place-items: center; text-align: center;
+  color: var(--text-muted); font-size: 13px; padding: 20px;
+}
+.empty.show { display: grid; }
+
+/* Gauge + detail */
+#gauge { position: relative; height: 210px; }
+#gauge canvas { display: block; width: 100% !important; height: 100% !important; }
+.gauge-num {
+  position: absolute; inset: 0; display: grid; place-items: center; pointer-events: none; text-align: center;
+}
+.gauge-num .big { font-size: 40px; font-weight: 700; letter-spacing: -.03em; line-height: 1; font-variant-numeric: tabular-nums; }
+.gauge-num .of { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
+.detail-title { font-size: 15px; font-weight: 600; margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.detail-meta { font-size: 12px; color: var(--text-muted); margin-bottom: 10px; }
+.badge {
+  display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; font-weight: 600;
+  padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); color: var(--text-secondary);
+}
+.badge.alert { color: var(--good); border-color: color-mix(in srgb, var(--good) 45%, var(--border)); }
+.factors { display: grid; gap: 7px; margin-top: 8px; }
+.factor { display: grid; grid-template-columns: 128px 1fr 58px; gap: 8px; align-items: center; font-size: 12px; }
+.factor .fname { color: var(--text-secondary); }
+.factor .fval { color: var(--text-muted); font-size: 11px; }
+.factor .track { display: block; height: 8px; background: var(--surface-2); border-radius: 4px; overflow: hidden; }
+.factor .fill { display: block; height: 100%; background: var(--accent); border-radius: 4px; transition: width .5s ease; }
+.factor .pts { text-align: right; font-variant-numeric: tabular-nums; color: var(--text-primary); }
+.note { font-size: 11px; color: var(--text-muted); margin-top: 10px; }
+.fin { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 12px; font-variant-numeric: tabular-nums; }
+.fin th, .fin td { padding: 4px 6px; text-align: right; border-bottom: 1px solid var(--grid); }
+.fin th:first-child, .fin td:first-child { text-align: left; color: var(--text-secondary); }
+.fin th { color: var(--text-muted); font-weight: 500; }
+
+/* SVG charts */
+svg text { font-family: Inter, system-ui, sans-serif; }
+.axis text { fill: var(--text-muted); font-size: 11px; }
+.axis line, .axis path { stroke: var(--grid); }
+.chart-box { position: relative; }
+
+/* Table */
+.table-wrap { overflow-x: auto; }
+table.results { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+table.results th {
+  text-align: left; font-size: 12px; color: var(--text-muted); font-weight: 500;
+  padding: 8px 10px; border-bottom: 1px solid var(--border); cursor: pointer; white-space: nowrap; user-select: none;
+}
+table.results th.num, table.results td.num { text-align: right; }
+table.results td { padding: 8px 10px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+table.results tbody tr { cursor: pointer; }
+table.results tbody tr:hover { background: var(--surface-2); }
+table.results tbody tr.sel { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.scorebar { display: inline-flex; align-items: center; gap: 8px; justify-content: flex-end; }
+.scorebar .mini { width: 60px; height: 6px; border-radius: 3px; background: var(--surface-2); overflow: hidden; }
+.scorebar .mini span { display: block; height: 100%; background: var(--below); border-radius: 3px; }
+.scorebar .mini span.hit { background: var(--accent); }
+.co { max-width: 280px; overflow: hidden; text-overflow: ellipsis; display: inline-block; vertical-align: bottom; }
+.up { color: var(--good); } .down { color: var(--bad); }
+.more { text-align: center; margin-top: 10px; }
+
+/* Log */
+.log {
+  background: var(--surface-2); border-radius: 10px; padding: 10px 12px; height: 300px; overflow: auto;
+  font-size: 11.5px; line-height: 1.55; color: var(--text-secondary); white-space: pre-wrap; word-break: break-word;
+}
+.log .w { color: var(--warn); } .log .e { color: var(--bad); } .log .a { color: var(--good); font-weight: 600; }
+
+/* Tooltip */
+.tip {
+  position: fixed; z-index: 50; pointer-events: none; opacity: 0; transition: opacity .1s;
+  background: var(--surface-1); border: 1px solid var(--border); box-shadow: var(--shadow);
+  border-radius: 10px; padding: 8px 10px; font-size: 12px; max-width: 280px; color: var(--text-primary);
+}
+.tip.show { opacity: 1; }
+.tip .t1 { font-weight: 600; margin-bottom: 2px; }
+.tip .t2 { color: var(--text-secondary); }
+
+@media (max-width: 1100px) {
+  .kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .grid-hero, .grid-two { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 600px) {
+  .wrap { padding: 14px 16px 30px; }
+  .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  #skyline { height: 320px; }
+  .filters input[type=search] { min-width: 0; flex: 1; }
+  .factor { grid-template-columns: 100px 1fr 50px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .tile, .factor .fill { transition: none; }
+  .dot.pulse { animation: none; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="top">
+    <div class="brand">
+      <div class="logo">PD</div>
+      <div>
+        <h1>PEAD Scanner</h1>
+        <div class="sub">Quarterly results from BSE and NSE, scored out of 50</div>
+      </div>
+    </div>
+    <div class="status-row">
+      <span class="pill" id="pill-scanner"><span class="dot"></span><span>Scanner</span></span>
+      <span class="pill" id="pill-bse"><span class="dot"></span><span>BSE</span></span>
+      <span class="pill" id="pill-nse"><span class="dot"></span><span>NSE</span></span>
+      <span class="pill" id="pill-refresh"><span>Loading…</span></span>
+      <button class="icon" id="theme-btn" title="Switch light / dark">Theme</button>
+    </div>
+  </header>
+
+  <div class="banner" id="banner"></div>
+
+  <div class="filters" role="group" aria-label="Filters">
+    <input type="search" id="f-search" placeholder="Search company or code" aria-label="Search">
+    <div class="seg" id="f-range">
+      <button data-v="1">Today</button>
+      <button data-v="7">7 days</button>
+      <button data-v="30">30 days</button>
+      <button data-v="0" class="on">All</button>
+    </div>
+    <div class="seg" id="f-kind">
+      <button data-v="all" class="on">All results</button>
+      <button data-v="alerts">Alerts only</button>
+    </div>
+    <select id="f-ex" aria-label="Exchange">
+      <option value="all">Both exchanges</option>
+      <option value="BSE">BSE</option>
+      <option value="NSE">NSE</option>
+    </select>
+    <span class="count" id="f-count"></span>
+  </div>
+
+  <section class="kpis">
+    <div class="tile"><div class="label">Results scored</div><div class="value" id="k-scored">–</div><div class="hint" id="k-scored-h">in current filter</div></div>
+    <div class="tile"><div class="label">Alerts sent</div><div class="value" id="k-alerts">–</div><div class="hint" id="k-alerts-h">score ≥ threshold</div></div>
+    <div class="tile"><div class="label">Average score</div><div class="value" id="k-avg">–</div><div class="hint">out of 50</div></div>
+    <div class="tile"><div class="label">Exchange → alert</div><div class="value" id="k-delay">–</div><div class="hint" id="k-delay-h">median, from log</div></div>
+    <div class="tile"><div class="label">Awaiting retry</div><div class="value" id="k-retry">–</div><div class="hint" id="k-retry-h">failed extractions</div></div>
+    <div class="tile"><div class="label">Filings handled</div><div class="value" id="k-seen">–</div><div class="hint" id="k-seen-h">in seen.json</div></div>
+  </section>
+
+  <section class="grid-hero">
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <h2>Score skyline</h2>
+          <div class="desc">Each tower is one scored result, newest at the front. Height is the score; the glass plane is the alert threshold.</div>
+        </div>
+        <div class="legend">
+          <span><span class="sw" style="background:var(--accent)"></span>Alert</span>
+          <span><span class="sw" style="background:var(--below)"></span>Below threshold</span>
+        </div>
+      </div>
+      <div id="skyline">
+        <div class="empty" id="skyline-empty">No scored results in this filter yet.</div>
+        <div class="hint-3d">Drag to rotate · click a tower for details</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <h2>Result detail</h2>
+          <div class="desc">Latest result, or whichever you click</div>
+        </div>
+        <span class="badge" id="d-badge">–</span>
+      </div>
+      <div id="gauge">
+        <div class="gauge-num"><div><div class="big" id="d-score">–</div><div class="of">of 50</div></div></div>
+      </div>
+      <div class="detail-title" id="d-name">–</div>
+      <div class="detail-meta" id="d-meta">–</div>
+      <div class="factors" id="d-factors"></div>
+      <table class="fin" id="d-fin"></table>
+      <div class="note" id="d-note"></div>
+    </div>
+  </section>
+
+  <section class="grid-two">
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <h2>Score distribution</h2>
+          <div class="desc">How many results landed in each 5-point band</div>
+        </div>
+      </div>
+      <div class="chart-box" id="hist"></div>
+    </div>
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <h2>Where the time goes</h2>
+          <div class="desc" id="timing-desc">Median seconds per step, from the scanner's timing lines</div>
+        </div>
+      </div>
+      <div class="chart-box" id="timing"></div>
+    </div>
+  </section>
+
+  <section class="card" style="margin-bottom:14px">
+    <div class="card-head">
+      <div>
+        <h2>Scored results</h2>
+        <div class="desc">Click a row to see it in the detail panel. Click a column to sort.</div>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table class="results" id="tbl">
+        <thead>
+          <tr>
+            <th data-k="ts">Time</th>
+            <th data-k="company">Company</th>
+            <th data-k="exchange">Exch.</th>
+            <th data-k="score" class="num">Score</th>
+            <th data-k="revYoy" class="num">Revenue YoY</th>
+            <th data-k="patYoy" class="num">PAT YoY</th>
+            <th data-k="epsYoy" class="num">EPS YoY</th>
+            <th data-k="rev" class="num">Revenue ₹ Cr</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="more"><button class="icon" id="more-btn" style="display:none">Show more</button></div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <div>
+        <h2>Scanner log</h2>
+        <div class="desc" id="log-desc">Last lines of pead_tool.log</div>
+      </div>
+    </div>
+    <div class="log mono" id="log"></div>
+  </section>
+</div>
+
+<div class="tip" id="tip"></div>
+
+<script>
+(() => {
+"use strict";
+
+/* ─────────────── State ─────────────── */
+const S = {
+  data: null,
+  rows: [],
+  filtered: [],
+  threshold: 35,
+  selectedId: null,
+  sortKey: "ts",
+  sortDir: -1,
+  shown: 20,
+  f: { q: "", days: 0, kind: "all", ex: "all" },
+  lastSig: "",
+};
+const MAX_SCORE = 50;
+const $ = (id) => document.getElementById(id);
+const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+/* ─────────────── Helpers ─────────────── */
+const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const num = (v) => {
+  if (v === null || v === undefined) return null;
+  const s = String(v).trim();
+  if (!s || s.toLowerCase() === "none" || s.toLowerCase() === "nan") return null;
+  const n = parseFloat(s.replace(/,/g, ""));
+  return Number.isFinite(n) ? n : null;
+};
+const pct = (c, p) => (c == null || p == null || p === 0) ? null : (c - p) / Math.abs(p) * 100;
+const fmtPct = (v) => v == null ? "–" : (v > 0 ? "+" : "") + v.toFixed(1) + "%";
+const fmtNum = (v, d = 2) => v == null ? "–" : v.toLocaleString("en-IN", { maximumFractionDigits: d, minimumFractionDigits: d });
+const fmtScore = (v) => v == null ? "–" : (Math.round(v * 10) / 10).toString();
+const fmtDur = (s) => {
+  if (s == null) return "–";
+  s = Math.round(s);
+  if (s < 60) return s + "s";
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60;
+  return h ? `${h}h ${m}m` : `${m}m ${r}s`;
+};
+const median = (a) => {
+  if (!a.length) return null;
+  const b = [...a].sort((x, y) => x - y), m = Math.floor(b.length / 2);
+  return b.length % 2 ? b[m] : (b[m - 1] + b[m]) / 2;
+};
+const quantile = (a, q) => {
+  if (!a.length) return null;
+  const b = [...a].sort((x, y) => x - y);
+  return b[Math.min(b.length - 1, Math.floor(q * (b.length - 1) + 0.5))];
+};
+const lerpColor = (a, b, t) => {
+  const pa = parseInt(a.slice(1), 16), pb = parseInt(b.slice(1), 16);
+  const ch = (x, s) => (x >> s) & 255;
+  const mix = (s) => Math.round(ch(pa, s) + (ch(pb, s) - ch(pa, s)) * t);
+  return "#" + ((1 << 24) | (mix(16) << 16) | (mix(8) << 8) | mix(0)).toString(16).slice(1);
+};
+
+/* ─────────────── Row normalisation ─────────────── */
+function normalise(raw, i) {
+  const g = (k) => raw[k] ?? raw[k.toUpperCase()] ?? null;
+  const tsStr = g("timestamp") || "";
+  const ts = tsStr ? new Date(tsStr.replace(" ", "T")) : null;
+  const scrip = (g("scrip") || "").trim();
+  let exchange = (g("exchange") || "").trim().toUpperCase();
+  if (!exchange) exchange = /^\d+$/.test(scrip) ? "BSE" : "NSE";
+  const r = {
+    id: i + "|" + tsStr + "|" + scrip,
+    ts: ts && !isNaN(ts) ? ts : null,
+    tsStr,
+    company: (g("company") || "Unknown").trim(),
+    scrip, exchange,
+    score: num(g("score")),
+    revCq: num(g("revenue_cq")), revPq: num(g("revenue_pq")), revLy: num(g("revenue_ly")),
+    patCq: num(g("pat_cq")), patPq: num(g("pat_pq")), patLy: num(g("pat_ly")),
+    ebCq: num(g("ebitda_cq")), ebPq: num(g("ebitda_pq")), ebLy: num(g("ebitda_ly")),
+    epsCq: num(g("eps_cq")), epsLy: num(g("eps_ly")),
+  };
+  r.empty = r.revCq == null && r.patCq == null && r.epsCq == null;
+  r.revYoy = pct(r.revCq, r.revLy);
+  r.patYoy = pct(r.patCq, r.patLy);
+  r.epsYoy = pct(r.epsCq, r.epsLy);
+  r.rev = r.revCq;
+  return r;
+}
+
+/* ─────────────── Scorecard (mirrors compute_pead_score) ─────────────── */
+function band(v, bands) {
+  if (v == null) return 0;
+  for (const [t, s] of bands) if (v >= t) return s;
+  return 0;
+}
+function scorecard(r) {
+  const out = [];
+  const neg = [["Current PAT", r.patCq], ["Current EBITDA", r.ebCq], ["Current EPS", r.epsCq]].find(([, v]) => v != null && v < 0);
+  if (neg) return { rejected: neg[0] + " is negative", factors: [], total: 0 };
+
+  const smallPat = r.patLy != null && Math.abs(r.patLy) < 1;
+  const turnPat = r.patLy != null && r.patLy < 0 && r.patCq != null && r.patCq > 0;
+  const turnEps = r.epsLy != null && r.epsLy < 0 && r.epsCq != null && r.epsCq > 0;
+
+  const add = (name, val, pts, max, tag) => out.push({ name, val, pts, max, tag });
+
+  // 1. EPS growth (15)
+  if (smallPat) add("EPS growth YoY", fmtPct(r.epsYoy), 0, 15, "small base");
+  else {
+    let s = band(r.epsYoy, [[100, 15], [70, 13], [50, 11], [30, 8], [15, 5], [5, 2]]);
+    if (turnEps) s = s / 2;
+    add("EPS growth YoY", turnEps ? "Turnaround" : fmtPct(r.epsYoy), s, 15);
+  }
+  // 2. PAT growth (10)
+  if (smallPat) add("PAT growth YoY", fmtPct(r.patYoy), 0, 10, "small base");
+  else {
+    let s = band(r.patYoy, [[80, 10], [50, 8], [30, 6], [15, 4], [5, 2]]);
+    if (turnPat) s = s / 2;
+    add("PAT growth YoY", turnPat ? "Turnaround" : fmtPct(r.patYoy), s, 10);
+  }
+  // 3. Revenue YoY (10)
+  if (r.revLy != null && r.revLy < 10) add("Revenue YoY", fmtPct(r.revYoy), 0, 10, "small base");
+  else add("Revenue YoY", fmtPct(r.revYoy), band(r.revYoy, [[50, 10], [30, 8], [20, 6], [10, 4], [5, 2]]), 10);
+  // 4. EBITDA margin expansion (5)
+  if (r.revCq && r.revLy && r.ebCq != null && r.ebLy != null) {
+    const d = (r.ebCq / r.revCq - r.ebLy / r.revLy) * 100;
+    add("EBITDA margin", (d > 0 ? "+" : "") + d.toFixed(1) + "pp", band(d, [[5, 5], [3, 4], [2, 3], [1, 2], [0.5, 1]]), 5);
+  } else add("EBITDA margin", "–", 0, 5);
+  // 5. Revenue QoQ (5)
+  const qoq = pct(r.revCq, r.revPq);
+  if (r.revPq != null && r.revPq < 10) add("Revenue QoQ", fmtPct(qoq), 0, 5, "small base");
+  else add("Revenue QoQ", fmtPct(qoq), band(qoq, [[25, 5], [15, 4], [10, 3], [5, 2]]), 5);
+  // 6. Net margin (5)
+  if (r.patCq != null && r.revCq > 0) {
+    const nm = r.patCq / r.revCq * 100;
+    add("Net margin", nm.toFixed(1) + "%", band(nm, [[25, 5], [18, 4], [12, 3], [8, 2]]), 5);
+  } else add("Net margin", "–", 0, 5);
+
+  return { factors: out, total: out.reduce((a, f) => a + f.pts, 0), turnaround: turnPat || turnEps };
+}
+
+/* ─────────────── Filtering ─────────────── */
+function applyFilters() {
+  const { q, days, kind, ex } = S.f;
+  const now = new Date();
+  const qq = q.trim().toLowerCase();
+  S.filtered = S.rows.filter((r) => {
+    if (r.score == null || r.empty) return false;
+    if (kind === "alerts" && r.score < S.threshold) return false;
+    if (ex !== "all" && r.exchange !== ex) return false;
+    if (days && r.ts) {
+      if (days === 1) {
+        if (r.ts.toDateString() !== now.toDateString()) return false;
+      } else if ((now - r.ts) / 86400000 > days) return false;
+    }
+    if (qq && !(r.company.toLowerCase().includes(qq) || r.scrip.toLowerCase().includes(qq))) return false;
+    return true;
+  });
+  $("f-count").textContent = `${S.filtered.length} of ${S.rows.filter((r) => r.score != null && !r.empty).length} results`;
+}
+
+/* ─────────────── KPIs ─────────────── */
+function renderKpis() {
+  const d = S.data, list = S.filtered;
+  const alerts = list.filter((r) => r.score >= S.threshold).length;
+  $("k-scored").textContent = list.length.toLocaleString("en-IN");
+  $("k-alerts").textContent = alerts.toLocaleString("en-IN");
+  $("k-alerts-h").textContent = `score ≥ ${fmtScore(S.threshold)}` + (list.length ? ` · ${Math.round(alerts / list.length * 100)}% hit rate` : "");
+  const avg = list.length ? list.reduce((a, r) => a + r.score, 0) / list.length : null;
+  $("k-avg").textContent = avg == null ? "–" : avg.toFixed(1);
+
+  const failed = S.rows.filter((r) => r.empty).length;
+  $("k-scored-h").textContent = failed ? `${failed} empty extractions hidden` : "in current filter";
+
+  $("k-retry").textContent = d.retry_pending ?? 0;
+  $("k-retry-h").textContent = "failed extractions";
+  $("k-seen").textContent = (d.seen_count ?? 0).toLocaleString("en-IN");
+  $("k-seen-h").textContent = `${(d.processed || []).length} company-quarters scored`;
+
+  const log = d.log || {};
+  const delays = (log.timings || []).filter((t) => t.kind === "alert" && t.delay != null).map((t) => t.delay);
+  const all = (log.timings || []).filter((t) => t.delay != null).map((t) => t.delay);
+  const use = delays.length ? delays : all;
+  $("k-delay").textContent = use.length ? fmtDur(median(use)) : "–";
+  $("k-delay-h").textContent = use.length
+    ? `median of ${use.length}${delays.length ? " alerts" : " filings"} · p90 ${fmtDur(quantile(use, 0.9))}`
+    : (log.available ? "no timing lines yet" : "needs pead_tool.log");
+}
+
+/* ─────────────── Status pills ─────────────── */
+function setPill(id, cls, text, title) {
+  const p = $(id);
+  p.querySelector(".dot").className = "dot " + cls;
+  p.lastElementChild.textContent = text;
+  p.title = title || "";
+}
+function renderStatus() {
+  const log = S.data.log || {};
+  if (!log.available) {
+    setPill("pill-scanner", "", "Scanner: no log", "pead_tool.log not found. See the note in dashboard.py.");
+    setPill("pill-bse", "", "BSE: unknown");
+    setPill("pill-nse", "", "NSE: unknown");
+  } else {
+    const age = log.age_sec;
+    if (age < 120) setPill("pill-scanner", "good pulse", "Scanner live", `Log updated ${Math.round(age)}s ago`);
+    else if (age < 900) setPill("pill-scanner", "warn", "Scanner quiet", `Log updated ${fmtDur(age)} ago`);
+    else setPill("pill-scanner", "bad", "Scanner stopped?", `Log last updated ${fmtDur(age)} ago`);
+    for (const ex of ["BSE", "NSE"]) {
+      const s = (log.exchanges || {})[ex];
+      if (!s) setPill("pill-" + ex.toLowerCase(), "", ex + ": –", "No fetch line in the log yet");
+      else setPill("pill-" + ex.toLowerCase(), s.ok ? "good" : "bad", ex + (s.ok ? " OK" : " blocked"), `${s.time || ""} ${s.message}`);
+    }
+  }
+  const q = log.checker_queue;
+  const t = new Date(S.data.generated_at.replace(" ", "T"));
+  $("pill-refresh").lastElementChild.textContent =
+    "Updated " + t.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", second: "2-digit" }) +
+    (q != null ? ` · checker queue ${q}` : "");
+}
+
+/* ─────────────── Detail panel ─────────────── */
+function selected() {
+  return S.filtered.find((r) => r.id === S.selectedId) || S.rows.find((r) => r.id === S.selectedId) || null;
+}
+function latest(list) {
+  return [...list].sort((a, b) => (b.ts || 0) - (a.ts || 0))[0] || null;
+}
+function renderDetail() {
+  let r = selected();
+  if (!r) { r = latest(S.filtered); S.selectedId = r ? r.id : null; }
+  if (!r) {
+    $("d-score").textContent = "–"; $("d-name").textContent = "No result selected";
+    $("d-meta").textContent = ""; $("d-factors").innerHTML = ""; $("d-fin").innerHTML = "";
+    $("d-note").textContent = ""; $("d-badge").textContent = "–"; $("d-badge").className = "badge";
+    Gauge.set(0, false);
+    return;
+  }
+  const hit = r.score >= S.threshold;
+  $("d-score").textContent = fmtScore(r.score);
+  $("d-badge").textContent = hit ? "▲ Alert sent" : "No alert";
+  $("d-badge").className = "badge" + (hit ? " alert" : "");
+  $("d-name").textContent = r.company;
+  $("d-name").title = r.company;
+  const link = r.exchange === "BSE"
+    ? `https://www.bseindia.com/stock-share-price/x/x/${encodeURIComponent(r.scrip)}/`
+    : `https://www.nseindia.com/get-quotes/equity?symbol=${encodeURIComponent(r.scrip)}`;
+  $("d-meta").innerHTML = `${esc(r.exchange)} · <a href="${link}" target="_blank" rel="noopener" style="color:var(--accent)">${esc(r.scrip)}</a> · ${esc(r.tsStr)}`;
+  Gauge.set(r.score, hit);
+
+  const sc = scorecard(r);
+  if (sc.rejected) {
+    $("d-factors").innerHTML = `<div class="factor"><span class="fname">Rejected</span><span class="fval">${esc(sc.rejected)}</span><span class="pts">0</span></div>`;
+  } else {
+    $("d-factors").innerHTML = sc.factors.map((f) => `
+      <div class="factor" title="${esc(f.tag || "")}">
+        <span class="fname">${esc(f.name)}<br><span class="fval">${esc(f.val)}${f.tag ? " · " + esc(f.tag) : ""}</span></span>
+        <span class="track"><span class="fill" style="width:${(f.pts / f.max * 100).toFixed(0)}%"></span></span>
+        <span class="pts">${fmtScore(f.pts)}/${f.max}</span>
+      </div>`).join("");
+  }
+  const rowsF = [
+    ["Revenue", r.revCq, r.revPq, r.revLy],
+    ["EBITDA", r.ebCq, r.ebPq, r.ebLy],
+    ["PAT", r.patCq, r.patPq, r.patLy],
+    ["EPS (₹)", r.epsCq, null, r.epsLy],
+  ];
+  $("d-fin").innerHTML = `<thead><tr><th>₹ Cr</th><th>This qtr</th><th>Last qtr</th><th>Year ago</th></tr></thead><tbody>` +
+    rowsF.map(([n, a, b, c]) => `<tr><td>${n}</td><td>${fmtNum(a)}</td><td>${fmtNum(b)}</td><td>${fmtNum(c)}</td></tr>`).join("") + "</tbody>";
+
+  let note = "Breakdown recomputed from the figures in pead_results.csv.";
+  if (!sc.rejected && Math.abs(sc.total - r.score) > 0.6) note += ` It gives ${fmtScore(sc.total)}, not the logged ${fmtScore(r.score)}: this row was scored by an older scoring version.`;
+  if (sc.turnaround) note += " Loss-to-profit turnaround: growth factors earn half points.";
+  $("d-note").textContent = note;
+}
+
+/* ─────────────── Table ─────────────── */
+function renderTable() {
+  const k = S.sortKey, d = S.sortDir;
+  const list = [...S.filtered].sort((a, b) => {
+    let x = a[k], y = b[k];
+    if (x == null && y == null) return 0;
+    if (x == null) return 1;
+    if (y == null) return -1;
+    if (typeof x === "string") return x.localeCompare(y) * d;
+    return (x - y) * d;
+  });
+  const cls = (v) => v == null ? "" : v > 0 ? "up" : v < 0 ? "down" : "";
+  const shown = list.slice(0, S.shown);
+  $("tbl").querySelector("tbody").innerHTML = shown.map((r) => {
+    const hit = r.score >= S.threshold;
+    return `<tr data-id="${esc(r.id)}" class="${r.id === S.selectedId ? "sel" : ""}">
+      <td class="mono">${esc(r.tsStr.slice(5, 16))}</td>
+      <td><span class="co" title="${esc(r.company)}">${esc(r.company)}</span></td>
+      <td>${esc(r.exchange)}</td>
+      <td class="num"><span class="scorebar"><span>${hit ? "▲ " : ""}${fmtScore(r.score)}</span><span class="mini"><span class="${hit ? "hit" : ""}" style="width:${Math.min(100, r.score / MAX_SCORE * 100)}%"></span></span></span></td>
+      <td class="num ${cls(r.revYoy)}">${fmtPct(r.revYoy)}</td>
+      <td class="num ${cls(r.patYoy)}">${fmtPct(r.patYoy)}</td>
+      <td class="num ${cls(r.epsYoy)}">${fmtPct(r.epsYoy)}</td>
+      <td class="num">${fmtNum(r.rev)}</td>
+    </tr>`;
+  }).join("") || `<tr><td colspan="8" style="text-align:center;color:var(--text-muted);padding:24px">No results match these filters.</td></tr>`;
+  $("more-btn").style.display = list.length > S.shown ? "inline-block" : "none";
+  $("more-btn").textContent = `Show more (${list.length - S.shown} hidden)`;
+  document.querySelectorAll("#tbl th").forEach((th) => {
+    const base = th.textContent.replace(/ [▲▼]$/, "");
+    th.textContent = base + (th.dataset.k === k ? (d > 0 ? " ▲" : " ▼") : "");
+  });
+}
+
+/* ─────────────── Tooltip ─────────────── */
+const tip = $("tip");
+function showTip(x, y, html) {
+  tip.innerHTML = html;
+  tip.classList.add("show");
+  const w = tip.offsetWidth, h = tip.offsetHeight;
+  let left = x + 14, top = y + 14;
+  if (left + w > innerWidth - 8) left = x - w - 14;
+  if (top + h > innerHeight - 8) top = y - h - 14;
+  tip.style.left = Math.max(8, left) + "px";
+  tip.style.top = Math.max(8, top) + "px";
+}
+const hideTip = () => tip.classList.remove("show");
+
+/* ─────────────── Histogram (SVG) ─────────────── */
+function renderHist() {
+  const box = $("hist");
+  const W = Math.max(280, box.clientWidth), H = 230, m = { l: 34, r: 10, t: 12, b: 28 };
+  const bins = Array.from({ length: 10 }, (_, i) => ({ lo: i * 5, hi: i * 5 + 5, n: 0 }));
+  for (const r of S.filtered) bins[Math.min(9, Math.max(0, Math.floor(r.score / 5)))].n++;
+  const maxN = Math.max(1, ...bins.map((b) => b.n));
+  const iw = W - m.l - m.r, ih = H - m.t - m.b, bw = iw / bins.length;
+  const y = (v) => m.t + ih - v / maxN * ih;
+  const ticks = [0, Math.round(maxN / 2), maxN].filter((v, i, a) => a.indexOf(v) === i);
+  const tx = m.l + S.threshold / MAX_SCORE * iw;
+  let s = `<svg width="${W}" height="${H}" role="img" aria-label="Score distribution">`;
+  s += `<g class="axis">`;
+  for (const t of ticks) s += `<line x1="${m.l}" x2="${W - m.r}" y1="${y(t)}" y2="${y(t)}"/><text x="${m.l - 6}" y="${y(t) + 4}" text-anchor="end">${t}</text>`;
+  for (let i = 0; i <= 10; i += 2) s += `<text x="${m.l + i * bw}" y="${H - 8}" text-anchor="middle">${i * 5}</text>`;
+  s += `</g>`;
+  bins.forEach((b, i) => {
+    const x = m.l + i * bw + 1, w = bw - 2, top = y(b.n), hgt = m.t + ih - top;
+    const r = Math.min(4, w / 2, hgt);
+    if (b.n) s += `<path d="M${x},${m.t + ih} V${top + r} Q${x},${top} ${x + r},${top} H${x + w - r} Q${x + w},${top} ${x + w},${top + r} V${m.t + ih} Z" fill="${b.lo >= S.threshold ? css("--accent") : css("--below")}"/>`;
+    s += `<rect x="${m.l + i * bw}" y="${m.t}" width="${bw}" height="${ih}" fill="transparent" data-i="${i}"/>`;
+  });
+  s += `<line x1="${tx}" x2="${tx}" y1="${m.t - 4}" y2="${m.t + ih}" stroke="${css("--text-secondary")}" stroke-width="1.5" stroke-dasharray="4 3"/>`;
+  s += `<text x="${tx + 5}" y="${m.t + 8}" fill="${css("--text-secondary")}" font-size="11">Alert at ${fmtScore(S.threshold)}</text>`;
+  s += `<line x1="${m.l}" x2="${W - m.r}" y1="${m.t + ih}" y2="${m.t + ih}" stroke="${css("--text-muted")}"/>`;
+  s += `</svg>`;
+  box.innerHTML = s;
+  box.querySelectorAll("rect[data-i]").forEach((el) => {
+    const b = bins[+el.dataset.i];
+    el.addEventListener("mousemove", (e) => showTip(e.clientX, e.clientY,
+      `<div class="t1">Score ${b.lo}–${b.hi}</div><div class="t2">${b.n} result${b.n === 1 ? "" : "s"}${b.lo >= S.threshold ? " · alerted" : ""}</div>`));
+    el.addEventListener("mouseleave", hideTip);
+  });
+}
+
+/* ─────────────── Timing (stacked bars, SVG) ─────────────── */
+function renderTiming() {
+  const box = $("timing");
+  const log = S.data.log || {};
+  const T = (log.timings || []);
+  const stages = [
+    { k: "download", n: "Download", c: css("--s1") },
+    { k: "page_scan", n: "Page scan", c: css("--s2") },
+    { k: "ocr", n: "OCR", c: css("--s3") },
+    { k: "model", n: "Model", c: css("--s4") },
+  ];
+  if (!T.length) {
+    box.innerHTML = `<div style="height:230px;display:grid;place-items:center;color:var(--text-muted);font-size:13px;text-align:center;padding:0 20px">${
+      log.available ? "No timing lines in the log yet. They appear once filings are processed." :
+      "Timing needs the scanner to write pead_tool.log. See the setup note in dashboard.py."}</div>`;
+    $("timing-desc").textContent = "Median seconds per step";
+    return;
+  }
+  // Two rows: clear filings vs. filings needing OCR
+  const groups = [
+    { n: "Text PDFs", items: T.filter((t) => !t.ocr) },
+    { n: "Scanned (OCR)", items: T.filter((t) => t.ocr) },
+  ].filter((g) => g.items.length);
+  groups.forEach((g) => {
+    g.vals = stages.map((s) => median(g.items.map((t) => t[s.k] || 0)) || 0);
+    g.total = g.vals.reduce((a, b) => a + b, 0);
+  });
+  const maxT = Math.max(1, ...groups.map((g) => g.total));
+  const W = Math.max(280, box.clientWidth), m = { l: 104, r: 50, t: 36 }, rowH = 34, gap = 22;
+  const H = m.t + groups.length * (rowH + gap) + 10;
+  const iw = W - m.l - m.r;
+  let s = `<svg width="${W}" height="${H}" role="img" aria-label="Median time per step">`;
+  // legend
+  let lx = 0;
+  stages.forEach((st) => {
+    s += `<rect x="${lx}" y="4" width="10" height="10" rx="3" fill="${st.c}"/><text x="${lx + 15}" y="13" font-size="12" fill="${css("--text-secondary")}">${st.n}</text>`;
+    lx += st.n.length * 7 + 34;
+  });
+  groups.forEach((g, gi) => {
+    const yy = m.t + gi * (rowH + gap);
+    s += `<text x="0" y="${yy + rowH / 2 + 4}" font-size="12" fill="${css("--text-secondary")}">${g.n}</text>`;
+    s += `<text x="0" y="${yy + rowH / 2 + 18}" font-size="10.5" fill="${css("--text-muted")}">${g.items.length} filings</text>`;
+    let x = m.l;
+    g.vals.forEach((v, si) => {
+      const w = v / maxT * iw;
+      if (w < 0.5) return;
+      const ww = Math.max(0, w - 2);
+      s += `<rect x="${x}" y="${yy}" width="${ww}" height="${rowH}" rx="4" fill="${stages[si].c}" data-g="${gi}" data-s="${si}"/>`;
+      if (ww > 34) s += `<text x="${x + ww / 2}" y="${yy + rowH / 2 + 4}" text-anchor="middle" font-size="11" fill="#fff" pointer-events="none">${v.toFixed(1)}s</text>`;
+      x += w;
+    });
+    s += `<text x="${x + 6}" y="${yy + rowH / 2 + 4}" font-size="12" font-weight="600" fill="${css("--text-primary")}">${g.total.toFixed(1)}s</text>`;
+  });
+  s += `</svg>`;
+  box.innerHTML = s;
+  box.querySelectorAll("rect[data-g]").forEach((el) => {
+    const g = groups[+el.dataset.g], st = stages[+el.dataset.s], v = g.vals[+el.dataset.s];
+    el.addEventListener("mousemove", (e) => showTip(e.clientX, e.clientY,
+      `<div class="t1">${st.n} · ${g.n}</div><div class="t2">Median ${v.toFixed(2)}s of ${g.total.toFixed(1)}s total</div>`));
+    el.addEventListener("mouseleave", hideTip);
+  });
+  $("timing-desc").textContent = `Median seconds per step, over the last ${T.length} processed filings`;
+}
+
+/* ─────────────── Log ─────────────── */
+function renderLog() {
+  const log = S.data.log || {};
+  const el = $("log");
+  if (!log.available) {
+    el.innerHTML = esc("No pead_tool.log found in this folder.\n\nTo see live status, timings and this log, make the scanner write its log to a file (see the note that came with this dashboard).");
+    $("log-desc").textContent = "Scanner log unavailable";
+    return;
+  }
+  const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 30;
+  el.innerHTML = (log.lines || []).map((l) => {
+    const c = /ERROR|FAILED|Access Denied/i.test(l) ? "e" : /WARNING/.test(l) ? "w" : /Above threshold|Telegram sent/.test(l) ? "a" : "";
+    return c ? `<span class="${c}">${esc(l)}</span>` : esc(l);
+  }).join("\n");
+  if (atBottom) el.scrollTop = el.scrollHeight;
+  $("log-desc").textContent = `Last ${(log.lines || []).length} lines of pead_tool.log`;
+}
+
+/* ═════════════════ 3D: shared ═════════════════ */
+const HAS3D = (() => {
+  try {
+    if (typeof THREE === "undefined") return false;
+    const c = document.createElement("canvas");
+    return !!(c.getContext("webgl") || c.getContext("experimental-webgl"));
+  } catch { return false; }
+})();
+
+/* ═════════════════ 3D: Skyline ═════════════════ */
+const Skyline = (() => {
+  const host = $("skyline");
+  if (!HAS3D) {
+    const e = $("skyline-empty");
+    e.textContent = "3D view needs WebGL and an internet connection to load three.js. The table and charts below still work.";
+    e.classList.add("show");
+    return { update() {}, theme() {}, select() {}, resize() {} };
+  }
+  const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+  renderer.setPixelRatio(Math.min(2, devicePixelRatio));
+  host.prepend(renderer.domElement);
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(38, 1, 0.1, 400);
+  const world = new THREE.Group();
+  scene.add(world);
+
+  const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, 0.75);
+  const dir = new THREE.DirectionalLight(0xffffff, 0.75);
+  dir.position.set(12, 30, 18);
+  scene.add(hemi, dir);
+
+  let bars = [], floor = null, plane = null, planeEdge = null, grid = null, selRing = null;
+  let rotY = -0.55, rotX = 0.52, targetY = rotY, dragging = false, lastX = 0, lastY = 0, moved = 0;
+  let hovered = null, radius = 30;
+  const HMAX = 12;
+  const ray = new THREE.Raycaster(), mouse = new THREE.Vector2();
+
+  function colors() {
+    return {
+      accent: new THREE.Color(css("--accent")),
+      below: new THREE.Color(css("--below")),
+      lo: css("--ramp-lo"), hi: css("--ramp-hi"),
+      floor: new THREE.Color(css("--surface-2")),
+      grid: new THREE.Color(css("--grid")),
+      text: new THREE.Color(css("--text-secondary")),
+    };
+  }
+
+  function clear() {
+    for (const b of bars) { world.remove(b.mesh); b.mesh.geometry.dispose(); b.mesh.material.dispose(); }
+    bars = [];
+    for (const o of [floor, plane, planeEdge, grid, selRing]) if (o) { world.remove(o); o.geometry && o.geometry.dispose(); o.material && o.material.dispose(); }
+    floor = plane = planeEdge = grid = selRing = null;
+  }
+
+  function update(list, threshold) {
+    clear();
+    const data = [...list].sort((a, b) => (a.ts || 0) - (b.ts || 0)).slice(-120);
+    $("skyline-empty").classList.toggle("show", data.length === 0);
+    if (!data.length) { draw(); return; }
+    const C = colors();
+    const cols = Math.min(15, Math.max(5, Math.ceil(Math.sqrt(data.length * 1.6))));
+    const rowsN = Math.ceil(data.length / cols);
+    const step = 1.55, size = 1.05;
+    const w = (cols - 1) * step, d = (rowsN - 1) * step;
+    radius = Math.max(17, Math.max(w, d) * 1.3 + 8);
+
+    // floor
+    const fg = new THREE.BoxGeometry(w + 3, 0.3, d + 3);
+    floor = new THREE.Mesh(fg, new THREE.MeshStandardMaterial({ color: C.floor, roughness: 0.95 }));
+    floor.position.y = -0.15;
+    world.add(floor);
+
+    data.forEach((r, i) => {
+      // oldest at the back row, newest at the front
+      const row = Math.floor(i / cols), col = i % cols;
+      const h = Math.max(0.12, r.score / MAX_SCORE * HMAX);
+      const hit = r.score >= threshold;
+      const t = Math.max(0, Math.min(1, r.score / MAX_SCORE));
+      const base = hit ? new THREE.Color(lerpColor(C.lo, C.hi, 0.35 + t * 0.65)) : C.below.clone();
+      const mat = new THREE.MeshStandardMaterial({
+        color: base, roughness: 0.45, metalness: 0.1,
+        emissive: hit ? base.clone().multiplyScalar(0.25) : new THREE.Color(0x000000),
+      });
+      const geo = new THREE.BoxGeometry(size, h, size);
+      const m = new THREE.Mesh(geo, mat);
+      m.position.set(col * step - w / 2, reduceMotion ? h / 2 : 0.001, row * step - d / 2);
+      m.scale.y = reduceMotion ? 1 : 0.001;
+      m.userData = { r, h, base: base.clone(), grow: reduceMotion ? 1 : 0, delay: i * 8 };
+      world.add(m);
+      bars.push({ mesh: m, r });
+    });
+
+    // threshold plane (glass)
+    const ty = threshold / MAX_SCORE * HMAX;
+    const pg = new THREE.PlaneGeometry(w + 2.2, d + 2.2);
+    plane = new THREE.Mesh(pg, new THREE.MeshBasicMaterial({ color: C.accent, transparent: true, opacity: 0.12, side: THREE.DoubleSide, depthWrite: false }));
+    plane.rotation.x = -Math.PI / 2; plane.position.y = ty;
+    world.add(plane);
+    planeEdge = new THREE.LineSegments(new THREE.EdgesGeometry(pg), new THREE.LineBasicMaterial({ color: C.accent, transparent: true, opacity: 0.6 }));
+    planeEdge.rotation.x = -Math.PI / 2; planeEdge.position.y = ty;
+    world.add(planeEdge);
+
+    select(S.selectedId);
+    draw();
+  }
+
+  function select(id) {
+    if (selRing) { world.remove(selRing); selRing.geometry.dispose(); selRing.material.dispose(); selRing = null; }
+    const b = bars.find((x) => x.r.id === id);
+    if (!b) return;
+    const g = new THREE.EdgesGeometry(new THREE.BoxGeometry(1.25, b.mesh.userData.h + 0.2, 1.25));
+    selRing = new THREE.LineSegments(g, new THREE.LineBasicMaterial({ color: new THREE.Color(css("--text-primary")) }));
+    selRing.position.set(b.mesh.position.x, b.mesh.userData.h / 2, b.mesh.position.z);
+    world.add(selRing);
+  }
+
+  function resize() {
+    const w = host.clientWidth, h = host.clientHeight;
+    if (!w || !h) return;
+    renderer.setSize(w, h, false);
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
+    draw();
+  }
+
+  function placeCamera() {
+    world.rotation.y = rotY;
+    camera.position.set(0, Math.sin(rotX) * radius, Math.cos(rotX) * radius);
+    camera.lookAt(0, HMAX * 0.2, 0);
+  }
+
+  let visible = true, raf = null, lastT = 0;
+  function frame(t) {
+    raf = null;
+    const dt = Math.min(50, t - (lastT || t)); lastT = t;
+    let animating = false;
+    for (const b of bars) {
+      const u = b.mesh.userData;
+      if (u.grow < 1) {
+        if (u.delay > 0) { u.delay -= dt; animating = true; continue; }
+        u.grow = Math.min(1, u.grow + dt / 650);
+        const e = 1 - Math.pow(1 - u.grow, 3);
+        b.mesh.scale.y = Math.max(0.001, e);
+        b.mesh.position.y = u.h * e / 2;
+        animating = true;
+      }
+    }
+    if (!dragging && !reduceMotion) { targetY += dt * 0.00006; animating = true; }
+    rotY += (targetY - rotY) * 0.12;
+    if (Math.abs(targetY - rotY) > 0.0005) animating = true;
+    placeCamera();
+    renderer.render(scene, camera);
+    if (animating && visible) raf = requestAnimationFrame(frame);
+  }
+  function draw() { if (!raf && visible) { lastT = 0; raf = requestAnimationFrame(frame); } }
+
+  new IntersectionObserver((es) => { visible = es[0].isIntersecting; if (visible) draw(); }).observe(host);
+  new ResizeObserver(resize).observe(host);
+
+  function pick(e) {
+    const rect = renderer.domElement.getBoundingClientRect();
+    mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+    mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+    ray.setFromCamera(mouse, camera);
+    const hit = ray.intersectObjects(bars.map((b) => b.mesh))[0];
+    return hit ? bars.find((b) => b.mesh === hit.object) : null;
+  }
+  function setHover(b) {
+    if (hovered && hovered !== b) hovered.mesh.material.emissive.copy(hovered.r.score >= S.threshold ? hovered.mesh.userData.base.clone().multiplyScalar(0.25) : new THREE.Color(0));
+    hovered = b;
+    if (b) b.mesh.material.emissive.copy(b.mesh.userData.base.clone().multiplyScalar(0.55));
+    draw();
+  }
+
+  const el = renderer.domElement;
+  el.addEventListener("pointerdown", (e) => { dragging = true; moved = 0; lastX = e.clientX; lastY = e.clientY; el.setPointerCapture(e.pointerId); });
+  el.addEventListener("pointermove", (e) => {
+    if (dragging) {
+      const dx = e.clientX - lastX, dy = e.clientY - lastY;
+      moved += Math.abs(dx) + Math.abs(dy);
+      targetY += dx * 0.008;
+      rotX = Math.max(0.18, Math.min(1.25, rotX + dy * 0.005));
+      lastX = e.clientX; lastY = e.clientY;
+      hideTip(); draw();
+      return;
+    }
+    const b = pick(e);
+    setHover(b);
+    if (b) {
+      const r = b.r;
+      showTip(e.clientX, e.clientY, `<div class="t1">${esc(r.company)}</div><div class="t2">Score ${fmtScore(r.score)} of 50${r.score >= S.threshold ? " · alerted" : ""}</div><div class="t2">${esc(r.exchange)} ${esc(r.scrip)} · ${esc(r.tsStr.slice(0, 16))}</div>`);
+      el.style.cursor = "pointer";
+    } else { hideTip(); el.style.cursor = ""; }
+  });
+  el.addEventListener("pointerup", (e) => {
+    dragging = false;
+    if (moved < 5) { const b = pick(e); if (b) choose(b.r.id); }
+    draw();
+  });
+  el.addEventListener("pointerleave", () => { setHover(null); hideTip(); });
+
+  resize();
+  return { update, select, resize, theme() { update(S.filtered, S.threshold); } };
+})();
+
+/* ═════════════════ 3D: Gauge ═════════════════ */
+const Gauge = (() => {
+  const host = $("gauge");
+  if (!HAS3D) return { set(v) {}, theme() {} };
+  const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+  renderer.setPixelRatio(Math.min(2, devicePixelRatio));
+  host.prepend(renderer.domElement);
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(35, 1, 0.1, 50);
+  camera.position.set(0, 0, 9);
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x666666, 0.8));
+  const dl = new THREE.DirectionalLight(0xffffff, 0.7); dl.position.set(3, 5, 6); scene.add(dl);
+  const group = new THREE.Group(); scene.add(group);
+
+  let track, arc, tick, cur = 0, target = 0, hit = false, raf = null, t0 = performance.now();
+  const R = 2.3, TUBE = 0.24, START = Math.PI * 1.25, SPAN = Math.PI * 1.5;
+
+  function mats() {
+    return {
+      track: new THREE.MeshStandardMaterial({ color: new THREE.Color(css("--surface-2")), roughness: 0.9 }),
+      arc: new THREE.MeshStandardMaterial({ color: new THREE.Color(hit ? css("--accent") : css("--below")), roughness: 0.35, metalness: 0.15 }),
+      tick: new THREE.MeshBasicMaterial({ color: new THREE.Color(css("--text-secondary")) }),
+    };
+  }
+  function build() {
+    for (const o of [track, arc, tick]) if (o) { group.remove(o); o.geometry.dispose(); o.material.dispose(); }
+    const M = mats();
+    track = new THREE.Mesh(new THREE.TorusGeometry(R, TUBE, 20, 120, SPAN), M.track);
+    track.rotation.z = START - SPAN;
+    group.add(track);
+    const a = Math.max(0.001, SPAN * Math.min(1, cur / MAX_SCORE));
+    arc = new THREE.Mesh(new THREE.TorusGeometry(R, TUBE * 1.12, 20, 120, a), M.arc);
+    arc.rotation.z = START - a;
+    group.add(arc);
+    // threshold tick
+    const ang = START - SPAN * (S.threshold / MAX_SCORE);
+    tick = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.95, 0.6), M.tick);
+    tick.position.set(Math.cos(ang) * R, Math.sin(ang) * R, 0);
+    tick.rotation.z = ang;
+    group.add(tick);
+  }
+  function resize() {
+    const w = host.clientWidth, h = host.clientHeight;
+    if (!w || !h) return;
+    renderer.setSize(w, h, false);
+    camera.aspect = w / h; camera.updateProjectionMatrix();
+    kick();
+  }
+  function frame(now) {
+    raf = null;
+    const done = Math.abs(target - cur) < 0.05;
+    cur = done ? target : cur + (target - cur) * 0.12;
+    build();
+    const t = (now - t0) / 1000;
+    group.rotation.x = reduceMotion ? -0.35 : -0.35 + Math.sin(t * 0.6) * 0.06;
+    group.rotation.y = reduceMotion ? 0.25 : 0.25 + Math.sin(t * 0.45) * 0.12;
+    renderer.render(scene, camera);
+    if (!reduceMotion || !done) raf = requestAnimationFrame(frame);
+  }
+  function kick() { if (!raf) raf = requestAnimationFrame(frame); }
+  new ResizeObserver(resize).observe(host);
+  resize();
+  return {
+    set(v, h) { target = v || 0; hit = !!h; if (reduceMotion) cur = target; kick(); },
+    theme() { kick(); },
+  };
+})();
+
+/* ─────────────── Interaction wiring ─────────────── */
+function choose(id) {
+  S.selectedId = id;
+  renderDetail();
+  Skyline.select(id);
+  document.querySelectorAll("#tbl tbody tr").forEach((tr) => tr.classList.toggle("sel", tr.dataset.id === id));
+}
+$("tbl").querySelector("tbody").addEventListener("click", (e) => {
+  const tr = e.target.closest("tr[data-id]");
+  if (tr && !e.target.closest("a")) choose(tr.dataset.id);
+});
+document.querySelectorAll("#tbl th").forEach((th) => th.addEventListener("click", () => {
+  const k = th.dataset.k;
+  if (S.sortKey === k) S.sortDir *= -1; else { S.sortKey = k; S.sortDir = (k === "company" || k === "exchange") ? 1 : -1; }
+  renderTable();
+}));
+$("more-btn").addEventListener("click", () => { S.shown += 30; renderTable(); });
+
+function segWire(id, key, parse) {
+  $(id).addEventListener("click", (e) => {
+    const b = e.target.closest("button"); if (!b) return;
+    $(id).querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b));
+    S.f[key] = parse(b.dataset.v);
+    refilter();
+  });
+}
+segWire("f-range", "days", Number);
+segWire("f-kind", "kind", String);
+$("f-ex").addEventListener("change", (e) => { S.f.ex = e.target.value; refilter(); });
+let qTimer;
+$("f-search").addEventListener("input", (e) => { clearTimeout(qTimer); qTimer = setTimeout(() => { S.f.q = e.target.value; refilter(); }, 180); });
+
+function refilter() {
+  applyFilters();
+  S.shown = 20;
+  if (!S.filtered.some((r) => r.id === S.selectedId)) S.selectedId = null;
+  renderAllResults();
+}
+function renderAllResults() {
+  renderKpis();
+  renderDetail();
+  renderTable();
+  renderHist();
+  Skyline.update(S.filtered, S.threshold);
+}
+
+// KPI tiles: subtle 3D tilt on hover
+if (!reduceMotion) document.querySelectorAll(".tile").forEach((t) => {
+  t.addEventListener("mousemove", (e) => {
+    const r = t.getBoundingClientRect();
+    const x = (e.clientX - r.left) / r.width - 0.5, y = (e.clientY - r.top) / r.height - 0.5;
+    t.style.transform = `perspective(600px) rotateX(${(-y * 8).toFixed(2)}deg) rotateY(${(x * 10).toFixed(2)}deg) translateZ(4px)`;
+  });
+  t.addEventListener("mouseleave", () => { t.style.transform = ""; });
+});
+
+// Theme toggle
+function applyTheme(t) {
+  if (t) document.documentElement.dataset.theme = t; else delete document.documentElement.dataset.theme;
+  try { t ? localStorage.setItem("pead-theme", t) : localStorage.removeItem("pead-theme"); } catch {}
+  if (S.data) { renderAllResults(); renderTiming(); }
+  Gauge.theme();
+}
+try { const t = localStorage.getItem("pead-theme"); if (t) document.documentElement.dataset.theme = t; } catch {}
+$("theme-btn").addEventListener("click", () => {
+  const dark = document.documentElement.dataset.theme
+    ? document.documentElement.dataset.theme === "dark"
+    : matchMedia("(prefers-color-scheme: dark)").matches;
+  applyTheme(dark ? "light" : "dark");
+});
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { if (!document.documentElement.dataset.theme && S.data) applyTheme(null); });
+
+let rT;
+addEventListener("resize", () => { clearTimeout(rT); rT = setTimeout(() => { if (S.data) { renderHist(); renderTiming(); } }, 150); });
+
+/* ─────────────── Data loading ─────────────── */
+async function load() {
+  let d;
+  try {
+    const res = await fetch("/api/data", { cache: "no-store" });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    d = await res.json();
+    if (d.error) throw new Error(d.error);
+  } catch (e) {
+    const b = $("banner");
+    b.innerHTML = location.protocol === "file:"
+      ? "Open this dashboard with <b class='mono'>py dashboard.py</b> in the scanner folder, not by double-clicking the HTML file."
+      : "Can't reach the dashboard server (" + esc(e.message) + "). Is <span class='mono'>dashboard.py</span> still running?";
+    b.classList.add("show");
+    return;
+  }
+  const banner = $("banner");
+  if (d.csv_error) { banner.textContent = d.csv_error + " Close it in Excel if it's open."; banner.classList.add("show"); }
+  else banner.classList.remove("show");
+
+  S.data = d;
+  const resultsSig = d.results.length + "|" + (d.results.at(-1) ? JSON.stringify(d.results.at(-1)) : "") + "|" + d.threshold;
+  const changed = resultsSig !== S.lastSig;
+  S.lastSig = resultsSig;
+  S.threshold = d.threshold;
+
+  if (changed) {
+    S.rows = d.results.map(normalise);
+    applyFilters();
+    if (!S.filtered.some((r) => r.id === S.selectedId)) S.selectedId = null;
+    renderAllResults();
+  } else {
+    renderKpis();
+  }
+  renderStatus();
+  renderTiming();
+  renderLog();
+}
+
+load();
+setInterval(() => { if (!document.hidden) load(); }, 10000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) load(); });
+})();
+</script>
+</body>
+</html>
