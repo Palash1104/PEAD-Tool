@@ -27,6 +27,7 @@ from pdf2image import convert_from_bytes
 import csv
 import time
 import logging
+from logging.handlers import RotatingFileHandler
 import requests
 import pdfplumber
 import io
@@ -74,10 +75,14 @@ RETRIES_FILE = "retry_counts.json"                # filing id → failed attempt
 SCRIP_MASTER_FILE = "scrip_master.json"           # BSE code / NSE symbol → ISIN
 # ─────────────────────────────────────────────────────────────
 
+LOG_FORMAT  = "%(asctime)s  %(levelname)s  %(tag)s%(message)s"
+LOG_DATEFMT = "%H:%M:%S"
+LOG_FILE    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pead_tool.log")
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s  %(levelname)s  %(tag)s%(message)s",
-    datefmt="%H:%M:%S",
+    format=LOG_FORMAT,
+    datefmt=LOG_DATEFMT,
 )
 
 class ThreadTag(logging.Filter):
@@ -90,6 +95,23 @@ for _handler in logging.getLogger().handlers:
     _handler.addFilter(ThreadTag())
 
 log = logging.getLogger(__name__)
+
+def setup_file_logging(path: str = LOG_FILE) -> logging.Handler:
+    """Also write every log line to a UTF-8 file, rotating at 5 MB with 3 backups.
+
+    Called only when run as a script, so tests and compare_models.py that
+    import this module don't write to the scanner's log.
+    """
+    handler = RotatingFileHandler(
+        path,
+        maxBytes=5 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=LOG_DATEFMT))
+    handler.addFilter(ThreadTag())
+    logging.getLogger().addHandler(handler)
+    return handler
 
 client = OpenAI(
     api_key=AICREDITS_API_KEY,
@@ -2028,15 +2050,12 @@ def main(argv=None):
 
             run_cycle(state)
 
-            queued = len(state.checker.in_flight)
-            log.info(
-                f"Sleeping {POLL_INTERVAL_SEC}s…"
-                + (f" ({queued} ambiguous outcome{'' if queued == 1 else 's'} being checked)" if queued else "")
-                + "\n"
-            )
+            log.info(f"checker queue: {len(state.checker.in_flight)} pending")
+            log.info(f"Sleeping {POLL_INTERVAL_SEC}s…\n")
             wait_for_checks(state, POLL_INTERVAL_SEC)
     finally:
         state.checker.stop()
 
 if __name__ == "__main__":
+    setup_file_logging()
     main()

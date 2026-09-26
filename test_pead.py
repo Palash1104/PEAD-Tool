@@ -771,6 +771,61 @@ extract, calls = counting_extract({nse_ok["attachment_url"]: good_fin})
 run_main(1, nse=lambda c: [nse_ok], extract=extract)
 check("NSE ISIN learned into master", json.load(open(pt.SCRIP_MASTER_FILE))["nse"].get("XYZ") == "INE999A01019")
 
+# Checker queue size logged once per poll
+fresh_state_dir()
+with LogCapture() as logs:
+    run_main(3)
+check("checker queue logged once per poll", sum(m == "checker queue: 0 pending" for m in logs.messages) == 3,
+      [m for m in logs.messages if "checker queue" in m])
+
+started, release = threading.Event(), threading.Event()
+def blocked_extract(pdf, ambiguous=False, timings=None):
+    started.set()
+    release.wait(10)
+    return None
+def count_then_release(state, poll):
+    started.wait(10)
+    release.set()
+    state.checker.todo.join()
+    pt.drain_checks(state)
+fresh_state_dir()
+with LogCapture() as logs:
+    run_main(1, nse=lambda c: [pt.normalise_nse(REAL_NSE_OTHER_OUTCOME)], extract=blocked_extract, on_wait=count_then_release)
+check("checker queue counts an in-flight ambiguous check", logs.has("checker queue: 1 pending"),
+      [m for m in logs.messages if "checker queue" in m])
+
+# ─────────────────────────────────────────────────────────────
+section("file log")
+
+log_dir = tempfile.mkdtemp(prefix="pead_log_")
+log_path = os.path.join(log_dir, "pead_tool.log")
+handler = pt.setup_file_logging(log_path)
+try:
+    pt.log.info("→ Skip NSE board meeting (intimation): Mahindra & Mahindra — ⏱ ₹ test")
+    worker = threading.Thread(target=lambda: pt.log.info("   Ambiguous outcome → results table found"), name="checker")
+    worker.start()
+    worker.join()
+    handler.flush()
+finally:
+    logging.getLogger().removeHandler(handler)
+    handler.close()
+lines = open(log_path, encoding="utf-8").read().splitlines()
+check("file log gets console-format lines in UTF-8",
+      len(lines) == 2 and lines[0].endswith("INFO  → Skip NSE board meeting (intimation): Mahindra & Mahindra — ⏱ ₹ test"), lines)
+check("file log keeps the [checker] tag", lines[1].endswith("INFO  [checker]    Ambiguous outcome → results table found"), lines)
+check("file log rotates at 5 MB with 3 backups",
+      handler.maxBytes == 5 * 1024 * 1024 and handler.backupCount == 3 and handler.encoding == "utf-8")
+check("default log path is pead_tool.log next to the script",
+      pt.LOG_FILE == os.path.join(os.path.dirname(os.path.abspath(pt.__file__)), "pead_tool.log"))
+handler = pt.setup_file_logging(log_path)
+try:
+    pt.log.info("second run")
+    handler.flush()
+finally:
+    logging.getLogger().removeHandler(handler)
+    handler.close()
+check("file log appends across restarts", open(log_path, encoding="utf-8").read().count("\n") == 3)
+
 # ─────────────────────────────────────────────────────────────
 section("--dump")
 

@@ -6,3 +6,4 @@ retry_counts.json
 scrip_master.json
 raw_bse_sample.json
 raw_nse_sample.json
+pead_tool.log*

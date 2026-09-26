@@ -38,6 +38,7 @@ Each poll, `main()` calls `run_cycle()` and then `wait_for_checks()` until the n
 - It has its own `NseClient` and **never touches `ScannerState`**. Results go on `checker.done`, and the main thread applies them in `apply_ambiguous_result` (score, CSV, alert, retry bookkeeping), during `wait_for_checks` or `drain_checks`.
 - `in_flight` stops the checker re-queueing a filing (NSE lists it every poll). Only the main thread touches it.
 - Checker log lines are tagged `[checker]` (the `ThreadTag` log filter).
+- Each poll logs "checker queue: N pending", where N is the ambiguous filings queued or being checked (`in_flight`).
 - `main()` stops the checker in a `finally`.
 - Keep all state changes on the main thread.
 
@@ -127,6 +128,7 @@ Growth is `_pct(curr, prev) = (curr - prev) / abs(prev) * 100`. `band_score` awa
 | `scrip_master.json` | `{"bse": {code: ISIN}, "nse": {symbol: ISIN}, "updated"}` | ignored |
 | `pead_results.csv` | One row per scored filing | ignored |
 | `raw_bse_sample.json`, `raw_nse_sample.json` | `--dump` output | ignored |
+| `pead_tool.log` (+ `.1`–`.3`) | Same lines as the console, UTF-8, rotating at 5 MB with 3 backups. `setup_file_logging()` is attached only in the `__main__` block, so tests and `compare_models.py` don't write to it. Always lives next to `pead_tool.py`. | ignored |
 
 - **Scrip master**: built from BSE `ListofScripData` and NSE `EQUITY_L.csv` / `SME_EQUITY_L.csv`, refreshed daily. `updated` is only stamped when both downloads succeed, and failed downloads keep the cached mappings. NSE filings also teach symbol → ISIN (`learn_isin`).
 - **CSV columns**: timestamp, company, scrip (code or symbol), score, revenue/pat/ebitda for cq, pq and ly, eps_cq, eps_ly, exchange.
