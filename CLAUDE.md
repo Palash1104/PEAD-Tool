@@ -8,7 +8,7 @@ Post-Earnings Announcement Drift scanner for Indian stocks. It polls BSE and NSE
 |---|---|
 | [pead_tool.py](pead_tool.py) | The scanner. It is one procedural module with no package structure. |
 | [compare_models.py](compare_models.py) | Runs a folder of saved PDFs through two models and prints the extracted values side by side. |
-| [dashboard.py](dashboard.py) + [dashboard.html](dashboard.html) | Local read-only dashboard (`py dashboard.py`, http://127.0.0.1:8050). Standard library only. Reads the state files and `pead_tool.log`. Its one outbound request is `/filing` (below). |
+| [dashboard.py](dashboard.py) + [dashboard.html](dashboard.html) | Local read-only dashboard (`py dashboard.py`, http://127.0.0.1:8050). Standard library only. Reads the state files, `archive/*/pead_results.csv` and `pead_tool.log`. Its one outbound request is `/filing` (below). |
 | [test_pead.py](test_pead.py) | Offline tests. Run `python test_pead.py` and expect `FAILURES: 0`. Network, model and Telegram are mocked, and state files go to a temp dir. The PDF section uses the real pdfplumber, Poppler and Tesseract (about 15s of OCR). Keep it passing and extend it with any change. |
 
 ## Running
@@ -170,10 +170,17 @@ Growth is `_pct(curr, prev) = (curr - prev) / abs(prev) * 100`. `band_score` awa
     - `filing_url`: blank for rows scored before 2026-09-26
     - `period_end`, `quarter`, `basis`, `unit`: blank for rows scored before 2026-10-05
   - `save_result_csv(filing, score, fin, quarter)` writes them.
-- **Dashboard quarters**:
-  - `dashboard.py` sends `SCORE_FROM_QUARTER` as `current_quarter`.
-  - The results table has a Quarter column. The detail panel shows the quarter, the quarter-end date and the basis.
-  - Rows whose quarter isn't the current one (UNKNOWN, blank or another quarter) get an amber ⚠ pill and a left stripe.
+- **Dashboard quarter selector** (the grouping lives in `dashboard.py`, where `test_pead.py` covers it):
+  - `read_all_results()` merges `archive/*/pead_results.csv` and `pead_results.csv` (archives first). Each row is tagged with `_quarter`, `_quarter_from` and `_source`.
+  - `row_quarter()` takes the quarter column (incl. `UNKNOWN`), else `period_end`, else the timestamp via the filing-date mapping. `quarter_label` / `reporting_quarter` mirror `pead_tool.py`, and a test checks they match.
+  - The `archive/q1fy27` run is mostly Apr–Jun filings (Q4FY26: 165 scored results). Only a few rows are Q1FY27.
+  - Rows scoring above 50 come from the old 100-point scale. They are dropped and counted per quarter (`hidden_old_scale`); the count line says "N rows from the old scoring scale hidden".
+  - `group_quarters()` builds the dropdown options: newest first, "Quarter unknown" last, and the current quarter (`SCORE_FROM_QUARTER`, sent as `current_quarter`) always present. Labels read "Q2 FY27 · Jul–Sep 2026 (12 results)", where the count is non-empty scored rows.
+  - The selected quarter filters the KPIs (results, alerts, average), skyline, detail panel, distribution and table.
+  - Unfiltered parts are marked `live`: status lights, Exchange → alert, Awaiting retry, Filings handled, the timing chart and the log.
+  - A past quarter shows a "Past quarter" tag, disables Today / 7 days / 30 days and resets the range to All.
+  - The choice is kept in the URL (`?quarter=Q1FY27`, removed for the current quarter); an unknown value falls back to the current quarter.
+  - There is no Quarter column in the table. The detail panel shows the quarter, the quarter-end date (or "quarter from filing date") and the basis.
   - `alerted(r)` is score ≥ threshold and quarter not UNKNOWN. It drives "Alerts sent", "Alerts only", ▲, the badge and the skyline colours.
   - `dashboard.html` links the Exch. cell to `/filing?url=<filing_url>&exchange=&scrip=`, or straight to the company's exchange page (dotted underline) when `filing_url` is blank. It only accepts https links on bseindia.com / nseindia.com.
 - **`/filing` in dashboard.py**: BSE moves result PDFs from `AttachLive` to `AttachHis` after a few months. Checked 2026-09-26: May filings 404 on AttachLive and load from AttachHis, mid-August ones are in both, and today's are only on AttachLive.

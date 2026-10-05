@@ -1219,6 +1219,94 @@ with mock.patch.object(dashboard, "BASE_DIR", tempfile.mkdtemp(prefix="pead_dash
     check("no pead_tool.py → empty current quarter", dashboard.read_current_quarter() == "")
 
 # ─────────────────────────────────────────────────────────────
+section("dashboard quarters")
+
+months = [date(y, m, d) for y in (2025, 2026, 2027) for m in range(1, 13) for d in (1, 28)]
+check("dashboard quarter maths matches pead_tool for every month 2025–2027",
+      all(dashboard.quarter_label(x) == pt.quarter_label(x) and dashboard.reporting_quarter(x) == pt.reporting_quarter(x)
+          for x in months))
+for q, want in [("Q1FY27", "Q1 FY27 · Apr–Jun 2026"), ("Q2FY27", "Q2 FY27 · Jul–Sep 2026"),
+                ("Q3FY27", "Q3 FY27 · Oct–Dec 2026"), ("Q4FY26", "Q4 FY26 · Jan–Mar 2026"), ("UNKNOWN", "Quarter unknown")]:
+    check(f"quarter_name {q}", dashboard.quarter_name(q) == want, dashboard.quarter_name(q))
+
+# Old rows: the quarter column first, then period_end, then the filing-date mapping
+for row, want in [
+    ({"quarter": "Q2FY27", "period_end": "2026-06-30", "timestamp": "2026-05-29 12:00:00"}, ("Q2FY27", "csv")),
+    ({"quarter": "q2fy27"}, ("Q2FY27", "csv")),
+    ({"quarter": "UNKNOWN", "timestamp": "2026-10-20 10:00:00"}, ("UNKNOWN", "csv")),
+    ({"quarter": "", "period_end": "2026-06-30", "timestamp": "2026-09-24 21:31:06"}, ("Q1FY27", "period_end")),
+    ({"timestamp": "2026-05-29 12:38:10"}, ("Q4FY26", "filed")),     # the Q1 archive's Apr–Jun filings
+    ({"timestamp": "2026-06-30 23:59:59"}, ("Q4FY26", "filed")),
+    ({"timestamp": "2026-07-20 23:24:50"}, ("Q1FY27", "filed")),
+    ({"timestamp": "2026-09-24 21:31:06"}, ("Q1FY27", "filed")),
+    ({"timestamp": "2026-10-20 11:00:00"}, ("Q2FY27", "filed")),
+    ({"timestamp": "2027-01-15 09:00:00"}, ("Q3FY27", "filed")),
+    ({"timestamp": ""}, ("UNKNOWN", "unknown")),
+]:
+    check(f"row_quarter {row}", dashboard.row_quarter(row) == want, dashboard.row_quarter(row))
+
+for score, want in [("90.0", True), ("71.7", True), ("50.1", True), ("50.0", False), ("35", False), ("", False), ("x", False)]:
+    check(f"old 100-point scale: score {score!r} → {want}", dashboard.is_old_scale({"score": score}) == want)
+
+folder = tempfile.mkdtemp(prefix="pead_dash_")
+NEW_HEADER = pt.CSV_HEADER
+OLD_HEADER = pt.CSV_HEADER[:17]                       # the archive's layout: no quarter columns
+def csv_row(header, **kw):
+    base = {"timestamp": "", "company": "Co", "scrip": "1", "score": "", "revenue_cq": "", "pat_cq": "", "eps_cq": ""}
+    base.update(kw)
+    return [base.get(col, "") for col in header]
+with open(os.path.join(folder, dashboard.TOOL_FILE), "w", encoding="utf-8") as fh:
+    fh.write('SCORE_FROM_QUARTER = "Q2FY27"\n')
+with open(os.path.join(folder, dashboard.RESULTS_CSV), "w", newline="", encoding="utf-8") as fh:
+    w = csv.writer(fh)
+    w.writerow(NEW_HEADER)
+    w.writerow(csv_row(NEW_HEADER, timestamp="2026-10-20 11:02:13", company="Live Q2", score="41.0", revenue_cq="182.4", quarter="Q2FY27"))
+    w.writerow(csv_row(NEW_HEADER, timestamp="2026-10-20 12:00:00", company="Live empty", score="0.0", quarter="Q2FY27"))
+    w.writerow(csv_row(NEW_HEADER, timestamp="2026-10-20 15:20:31", company="Live unknown", score="40.0", pat_cq="9", quarter="UNKNOWN"))
+os.makedirs(os.path.join(folder, "archive", "q1fy27"))
+with open(os.path.join(folder, "archive", "q1fy27", dashboard.RESULTS_CSV), "w", newline="", encoding="utf-8") as fh:
+    w = csv.writer(fh)
+    w.writerow(OLD_HEADER)
+    w.writerow(csv_row(OLD_HEADER, timestamp="2026-05-27 23:50:45", company="GMR", score="90.0", revenue_cq="1580"))
+    w.writerow(csv_row(OLD_HEADER, timestamp="2026-05-28 18:28:07", company="Superior", score="85.0", revenue_cq="422"))
+    w.writerow(csv_row(OLD_HEADER, timestamp="2026-05-29 13:28:20", company="Sharda", score="45.0", revenue_cq="67.2"))
+    w.writerow(csv_row(OLD_HEADER, timestamp="2026-06-01 11:48:36", company="Photon", score="50.0", revenue_cq="143"))
+    w.writerow(csv_row(OLD_HEADER, timestamp="2026-07-20 23:24:50", company="California", score="40.0", revenue_cq="662"))
+    w.writerow(csv_row(OLD_HEADER, timestamp="2026-09-24 21:31:06", company="Purple", score="0.0", revenue_cq="119"))
+os.makedirs(os.path.join(folder, "archive", "extra"))
+with open(os.path.join(folder, "archive", "extra", dashboard.RESULTS_CSV), "w", newline="", encoding="utf-8") as fh:
+    w = csv.writer(fh)
+    w.writerow(NEW_HEADER)
+    w.writerow(csv_row(NEW_HEADER, timestamp="2026-09-30 10:00:00", company="Late filer", score="22", revenue_cq="80", period_end="2026-06-30"))
+with open(os.path.join(folder, "archive", "notes.txt"), "w") as fh:
+    fh.write("not a run folder")
+with mock.patch.object(dashboard, "BASE_DIR", folder):
+    payload = dashboard.build_payload()
+rows = payload["results"]
+by_company = {r["company"]: r for r in rows}
+check("archive rows merged with the live file, archives first",
+      [r["_source"] for r in rows] == ["archive/extra"] + ["archive/q1fy27"] * 4 + ["pead_results.csv"] * 3,
+      [r["_source"] for r in rows])
+check(">50 rows dropped from the results", "GMR" not in by_company and "Superior" not in by_company
+      and "Photon" in by_company, sorted(by_company))
+check("old-row quarters: filing-date mapping and period_end",
+      by_company["Sharda"]["_quarter"] == "Q4FY26" and by_company["Sharda"]["_quarter_from"] == "filed"
+      and by_company["California"]["_quarter"] == "Q1FY27" and by_company["Purple"]["_quarter"] == "Q1FY27"
+      and by_company["Late filer"]["_quarter"] == "Q1FY27" and by_company["Late filer"]["_quarter_from"] == "period_end")
+options = payload["quarters"]
+check("quarters newest first, the unknown group last",
+      [o["value"] for o in options] == ["Q2FY27", "Q1FY27", "Q4FY26", "UNKNOWN"], [o["value"] for o in options])
+check("quarter labels count scored results (empty extractions and >50 rows excluded)",
+      [o["label"] for o in options] == ["Q2 FY27 · Jul–Sep 2026 (1 result)", "Q1 FY27 · Apr–Jun 2026 (3 results)",
+                                        "Q4 FY26 · Jan–Mar 2026 (2 results)", "Quarter unknown (1 result)"], [o["label"] for o in options])
+check("old-scale rows counted per quarter",
+      {o["value"]: o["hidden_old_scale"] for o in options} == {"Q2FY27": 0, "Q1FY27": 0, "Q4FY26": 2, "UNKNOWN": 0})
+check("current quarter flagged", [o["value"] for o in options if o["current"]] == ["Q2FY27"])
+check("the current quarter is offered even with no rows",
+      [o["value"] for o in dashboard.group_quarters([], {}, "Q2FY27")] == ["Q2FY27"]
+      and dashboard.group_quarters([], {}, "Q2FY27")[0]["label"] == "Q2 FY27 · Jul–Sep 2026 (0 results)")
+
+# ─────────────────────────────────────────────────────────────
 section("dashboard log parser")
 
 def parse_log(text):

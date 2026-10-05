@@ -10,11 +10,12 @@ Put this file and dashboard.html in the same folder as pead_tool.py, then run:
 
 It only READS these files from this folder (it never writes anything):
     pead_results.csv        scored results
+    archive/*/pead_results.csv   results of earlier runs (for the quarter selector)
     seen.json               filings already handled
     processed_scrips.json   company-quarters already scored
     retry_counts.json       filings awaiting retry
     pead_tool.log           optional: scanner log (live status, timings, log tail)
-    pead_tool.py            only to read PEAD_THRESHOLD
+    pead_tool.py            only to read PEAD_THRESHOLD and SCORE_FROM_QUARTER
 
 No extra packages needed. Standard library only.
 The server listens on 127.0.0.1, so it is only reachable from this computer.
@@ -95,9 +96,9 @@ def read_current_quarter() -> str:
     return ""
 
 
-def read_results():
+def read_results(name: str = RESULTS_CSV):
     """Return (rows, error). Rows are dicts of raw strings keyed by CSV header."""
-    path = _p(RESULTS_CSV)
+    path = _p(name)
     if not os.path.exists(path):
         return [], None
     try:
@@ -111,7 +112,158 @@ def read_results():
                 })
         return rows, None
     except Exception as e:
-        return [], f"Could not read {RESULTS_CSV}: {e}"
+        return [], f"Could not read {name}: {e}"
+
+
+# ── Quarters ──────────────────────────────────────────────────
+#
+# The quarter selector covers pead_results.csv and every archived run
+# (archive/<name>/pead_results.csv). Each row's quarter is, in order:
+#   1. its quarter column (Q2FY27, or UNKNOWN when the PDF never said)
+#   2. else its period_end
+#   3. else its timestamp, mapped like pead_tool.reporting_quarter: results
+#      are filed in the three months after quarter end (filed Sep → Q1)
+# Indian FY quarters, as in pead_tool.py: Q1 = Apr–Jun, FY27 = Apr 2026 – Mar 2027.
+# Rows scoring above 50 come from the old 100-point scoring and are dropped,
+# counted per quarter so the page can say how many were hidden.
+
+ARCHIVE_DIR   = "archive"
+OLD_SCALE_MAX = 50
+QUARTER_RE    = re.compile(r"^Q([1-4])FY(\d{2})$")
+QUARTER_MONTHS = ["Apr–Jun", "Jul–Sep", "Oct–Dec", "Jan–Mar"]
+
+
+def quarter_label(d) -> str:
+    """Indian FY quarter containing a date, e.g. 30 Jun 2026 → Q1FY27."""
+    if d.month >= 4:
+        return f"Q{(d.month - 4) // 3 + 1}FY{(d.year + 1) % 100:02d}"
+    return f"Q4FY{d.year % 100:02d}"
+
+
+def reporting_quarter(filed_on) -> str:
+    """The quarter a result filed on this date reports (filed Sep 2026 → Q1FY27)."""
+    m, y = filed_on.month - 3, filed_on.year
+    if m < 1:
+        m, y = m + 12, y - 1
+    return quarter_label(datetime(y, m, 1).date())
+
+
+def quarter_index(q: str):
+    m = QUARTER_RE.match(q or "")
+    return int(m.group(2)) * 4 + int(m.group(1)) if m else None
+
+
+def quarter_name(q: str) -> str:
+    """"Q2FY27" → "Q2 FY27 · Jul–Sep 2026"; anything else → "Quarter unknown"."""
+    m = QUARTER_RE.match(q or "")
+    if not m:
+        return "Quarter unknown"
+    n, fy = int(m.group(1)), int(m.group(2))
+    year = 2000 + fy - (0 if n == 4 else 1)
+    return f"Q{n} FY{fy:02d} · {QUARTER_MONTHS[n - 1]} {year}"
+
+
+def _date(text):
+    try:
+        return datetime.strptime((text or "").strip()[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _num(text):
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def row_quarter(row: dict) -> tuple:
+    """(quarter, where it came from): "csv", "period_end", "filed" or "unknown"."""
+    q = (row.get("quarter") or "").strip().upper()
+    if q == "UNKNOWN" or QUARTER_RE.match(q):
+        return q, "csv"
+
+    period_end = _date(row.get("period_end"))
+    if period_end:
+        return quarter_label(period_end), "period_end"
+
+    filed = _date(row.get("timestamp"))
+    if filed:
+        return reporting_quarter(filed), "filed"
+
+    return "UNKNOWN", "unknown"
+
+
+def is_old_scale(row: dict) -> bool:
+    score = _num(row.get("score"))
+    return score is not None and score > OLD_SCALE_MAX
+
+
+def is_result(row: dict) -> bool:
+    """A scored row with figures (the dashboard hides empty extractions)."""
+    return _num(row.get("score")) is not None and any(
+        _num(row.get(k)) is not None for k in ("revenue_cq", "pat_cq", "eps_cq")
+    )
+
+
+def read_all_results():
+    """Rows from pead_results.csv and archive/*/pead_results.csv, each tagged
+    with _quarter, _quarter_from and _source, minus old-scale rows.
+
+    Returns (rows, {quarter: old-scale rows hidden}, error or None).
+    """
+    sources = [(RESULTS_CSV, RESULTS_CSV)]
+    archive = _p(ARCHIVE_DIR)
+    if os.path.isdir(archive):
+        for name in sorted(os.listdir(archive)):
+            rel = os.path.join(ARCHIVE_DIR, name, RESULTS_CSV)
+            if os.path.isfile(_p(rel)):
+                sources.append((rel, f"{ARCHIVE_DIR}/{name}"))
+
+    rows, hidden, errors = [], {}, []
+
+    # Archives first, so the live file's rows come last (newest at the end)
+    for rel, source in sources[1:] + sources[:1]:
+        found, error = read_results(rel)
+        if error:
+            errors.append(error)
+        for row in found:
+            quarter, origin = row_quarter(row)
+            if is_old_scale(row):
+                hidden[quarter] = hidden.get(quarter, 0) + 1
+                continue
+            row.update({"_quarter": quarter, "_quarter_from": origin, "_source": source})
+            rows.append(row)
+
+    return rows, hidden, " ".join(errors) or None
+
+
+def group_quarters(rows: list, hidden: dict, current: str) -> list:
+    """Quarter-selector options: newest first, the UNKNOWN group last, the
+    current quarter always present. count is the scored results the page
+    lists for the quarter; hidden_old_scale the >50 rows dropped from it."""
+    counts = {}
+    for row in rows:
+        counts.setdefault(row["_quarter"], 0)
+        if is_result(row):
+            counts[row["_quarter"]] += 1
+
+    keys = set(counts) | set(hidden) | ({current} if current else set())
+    known = sorted((q for q in keys if quarter_index(q) is not None), key=quarter_index, reverse=True)
+    ordered = known + (["UNKNOWN"] if "UNKNOWN" in keys else [])
+
+    options = []
+    for q in ordered:
+        n = counts.get(q, 0)
+        options.append({
+            "value": q,
+            "name": quarter_name(q),
+            "label": f"{quarter_name(q)} ({n} result{'' if n == 1 else 's'})",
+            "count": n,
+            "hidden_old_scale": hidden.get(q, 0),
+            "current": q == current,
+        })
+    return options
 
 
 # ── Log parsing ───────────────────────────────────────────────
@@ -227,7 +379,8 @@ def _count(obj) -> int:
 
 
 def build_payload():
-    rows, csv_error = read_results()
+    rows, hidden, csv_error = read_all_results()
+    current   = read_current_quarter()
     seen      = read_json(SEEN_FILE, [])
     processed = read_json(PROCESSED_FILE, [])
     retry     = read_json(RETRY_FILE, {})
@@ -235,7 +388,8 @@ def build_payload():
     return {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "threshold":    read_threshold(),
-        "current_quarter": read_current_quarter(),
+        "current_quarter": current,
+        "quarters":     group_quarters(rows, hidden, current),
         "results":      rows,
         "csv_error":    csv_error,
         "seen_count":   _count(seen),
