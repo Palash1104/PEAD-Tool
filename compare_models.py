@@ -19,7 +19,7 @@ import time
 
 import pead_tool as pt
 
-META_KEYS = ["basis", "unit", "period_end"]
+META_KEYS = ["basis", "unit", "period_end", "prev_period_end", "ly_period_end"]
 
 def fmt(value) -> str:
     if value is None:

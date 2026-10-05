@@ -98,15 +98,19 @@ Each poll, `main()` calls `run_cycle()` and then `wait_for_checks()` until the n
    - NSE `attchmntFile` is `-` when there is no attachment (treated as none). Some attachments are `.zip`.
 4. **Dedup**
    - The ISIN comes from the NSE filing itself, or from the scrip master for BSE (`lookup_isin`).
-   - The pre-check key is `{ISIN}_{quarter}`, with the quarter estimated from the filing date (`reporting_quarter`). While the ISIN is unknown the key is `{EXCHANGE}-{code}_{quarter}`.
+   - The pre-check key is `{ISIN}_{quarter}`, with the quarter estimated from the filing date (`reporting_quarter`). This cheap dedup skip is the only use of the filing-date estimate; it never decides a score. While the ISIN is unknown the key is `{EXCHANGE}-{code}_{quarter}`.
    - If the key is already in `processed_scrips`, the filing is marked seen and skipped.
-5. **`process_filing()`** = `obtain_financials()` + `score_filing()`. The first downloads (NSE via the session), extracts and checks `has_core_values` (current revenue **and** PAT); it touches no state, so the checker thread shares it. The second computes the real key, scores, writes the CSV and alerts, on the main thread only.
-   - The real quarter comes from the PDF's `period_end` via `filing_quarter`. It is only trusted if it falls 0–400 days before the filing date; otherwise the filing-date estimate is used.
-   - If the PDF's quarter is before `SCORE_FROM_QUARTER` ("Q2FY27"), `score_filing` logs "<quarter>: old quarter, ignored" and raises `SkipFiling(model_called=True)`. The filing is marked seen, and it isn't scored, alerted, added to processed or retried. This only applies when `period_end` gives the quarter; a filing-date estimate never triggers it.
+5. **`process_filing()`** = `obtain_financials()` + `score_filing()`. The first downloads (NSE via the session), extracts and validates; it touches no state, so the checker thread shares it. The second computes the real key, scores, writes the CSV and alerts, on the main thread only.
+   - `obtain_financials` validates in this order:
+     1. `has_core_values` (current revenue **and** PAT).
+     2. The quarter: `pdf_quarter` takes it from the PDF's `period_end`, trusted only if it falls 0–400 days before the filing date. There is **no filing-date fallback**: without a usable `period_end` it raises `QuarterUnknown` ("quarter unknown (no period_end)" / "(period_end … implausible …)").
+     3. The column dates: `column_dates_problem` checks that `prev_period_end` is 3 months and `ly_period_end` 12 months before `period_end`, by year and month. A mismatch or missing date raises `RetryFiling("column dates don't line up (…)")`. This catches half-year, nine-month or swapped columns.
+   - If the PDF's quarter is before `SCORE_FROM_QUARTER` ("Q2FY27"), `score_filing` logs "<quarter>: old quarter, ignored" and raises `SkipFiling(model_called=True)`. The filing is marked seen, and it isn't scored, alerted, added to processed or retried.
    - If that key is already processed, the filing is a duplicate: no score and no alert.
    - Otherwise it scores, writes the CSV and alerts, and returns the key. It returns None on failure.
 6. **Retry or skip**
-   - `obtain_financials` raises `RetryFiling(reason)` on a retryable failure: no attachment, download failed, model/extraction failed, or missing revenue or PAT. A crash is treated the same way. The filing is retried on later polls, up to `MAX_RETRIES` (3) extra attempts. The counts persist in `retry_counts.json`, so restarts don't reset them.
+   - `obtain_financials` raises `RetryFiling(reason)` on a retryable failure: no attachment, download failed, model/extraction failed, missing revenue or PAT, quarter unknown, or column dates that don't line up. A crash is treated the same way.
+   - `QuarterUnknown` is a `RetryFiling` that carries the extraction. Only when the last attempt also fails does `record_retry` score it and write **one** CSV row with quarter `UNKNOWN`, never alerted or added to processed. The line reads "… · gave up after 4 attempts · saved as quarter UNKNOWN (x/50, no alert)". A retry that recovers leaves only the real row. The filing is retried on later polls, up to `MAX_RETRIES` (3) extra attempts. The counts persist in `retry_counts.json`, so restarts don't reset them.
    - `SkipFiling` is raised when retrying can't help: "no results table found", or an attachment that isn't a PDF. The filing is then logged, marked seen and never retried, and the model is not called.
    - Success, a skip, or giving up calls `state.finish()`, which marks the filing seen and clears its retry count.
 
@@ -128,7 +132,7 @@ Each poll, `main()` calls `run_cycle()` and then `wait_for_checks()` until the n
 - `normalise_financials()` validates the reply:
   - Every `FIN_KEYS` entry becomes a 3-float list `[cq, pq, ly]`.
   - Amounts are converted to ₹ crore in code from `unit` (`UNIT_TO_CRORE`). EPS is never converted.
-  - It keeps `basis`, `unit` and `period_end` (ISO string or None). An unknown unit fails the extraction.
+  - It keeps `basis`, `unit` and the three column dates `period_end`, `prev_period_end` and `ly_period_end` (ISO strings or None). An unknown unit fails the extraction.
 
 ## PEAD score (max 50)
 
@@ -160,8 +164,17 @@ Growth is `_pct(curr, prev) = (curr - prev) / abs(prev) * 100`. `band_score` awa
 | `pead_tool.log` (+ `.1`–`.3`) | The console lines plus DEBUG detail, UTF-8, rotating at 5 MB with 3 backups. `setup_file_logging()` is attached only in the `__main__` block, so tests and `compare_models.py` don't write to it. Always lives next to `pead_tool.py`. | ignored |
 
 - **Scrip master**: built from BSE `ListofScripData` and NSE `EQUITY_L.csv` / `SME_EQUITY_L.csv`, refreshed daily. `updated` is only stamped when both downloads succeed, and failed downloads keep the cached mappings. NSE filings also teach symbol → ISIN (`learn_isin`).
-- **CSV columns**: timestamp, company, scrip (code or symbol), score, revenue/pat/ebitda for cq, pq and ly, eps_cq, eps_ly, exchange, filing_url (the result PDF's `attachment_url`).
-  - `initialize_csv()` appends any `CSV_ADDED_COLUMNS` an older file lacks: `exchange` (old rows marked BSE) and `filing_url` (blank for rows scored before 2026-09-26).
+- **CSV columns**: timestamp, company, scrip (code or symbol), score, revenue/pat/ebitda for cq, pq and ly, eps_cq, eps_ly, exchange, filing_url (the result PDF's `attachment_url`), period_end, quarter (e.g. `Q2FY27`, or `UNKNOWN`), basis, unit.
+  - `initialize_csv()` appends any `CSV_ADDED_COLUMNS` an older file lacks:
+    - `exchange`: old rows marked BSE
+    - `filing_url`: blank for rows scored before 2026-09-26
+    - `period_end`, `quarter`, `basis`, `unit`: blank for rows scored before 2026-10-05
+  - `save_result_csv(filing, score, fin, quarter)` writes them.
+- **Dashboard quarters**:
+  - `dashboard.py` sends `SCORE_FROM_QUARTER` as `current_quarter`.
+  - The results table has a Quarter column. The detail panel shows the quarter, the quarter-end date and the basis.
+  - Rows whose quarter isn't the current one (UNKNOWN, blank or another quarter) get an amber ⚠ pill and a left stripe.
+  - `alerted(r)` is score ≥ threshold and quarter not UNKNOWN. It drives "Alerts sent", "Alerts only", ▲, the badge and the skyline colours.
   - `dashboard.html` links the Exch. cell to `/filing?url=<filing_url>&exchange=&scrip=`, or straight to the company's exchange page (dotted underline) when `filing_url` is blank. It only accepts https links on bseindia.com / nseindia.com.
 - **`/filing` in dashboard.py**: BSE moves result PDFs from `AttachLive` to `AttachHis` after a few months. Checked 2026-09-26: May filings 404 on AttachLive and load from AttachHis, mid-August ones are in both, and today's are only on AttachLive.
   - `resolve_filing()` checks AttachLive, then AttachHis, by fetching the first 8 bytes and looking for `%PDF`. It redirects (302) to the first one that works, else to the company page.
@@ -171,7 +184,7 @@ Growth is `_pct(curr, prev) = (curr - prev) / abs(prev) * 100`. `band_score` awa
 ## Config (top of `pead_tool.py`)
 
 - `PEAD_THRESHOLD = 35`, `POLL_INTERVAL_SEC = 30`, `MAX_RETRIES = 3`, `BLOCKED_ALERT_SEC = 3600`
-- `SCORE_FROM_QUARTER = "Q2FY27"`: earlier quarters, by the PDF's period_end, are ignored. `test_pead.py` sets it to "Q1FY20" for its Q1FY27 fixtures, and the cutoff tests restore the real value.
+- `SCORE_FROM_QUARTER = "Q2FY27"`: earlier quarters, by the PDF's period_end, are ignored, and a result without a usable period_end is never scored. `test_pead.py` sets it to "Q1FY20" for its Q1FY27 fixtures, and the cutoff tests restore the real value.
 - `SMALL_BASE_PAT_CR = 1`, `SMALL_BASE_REV_CR = 10`
 - The Telegram emoji tiers are hardcoded separately in `send_telegram` (🚀 ≥40, ✅ ≥30).
 - Exchange constants sit in the EXCHANGES section, and extraction tuning sits next to `EXTRACTION_PROMPT`.

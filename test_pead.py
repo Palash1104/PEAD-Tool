@@ -6,6 +6,7 @@ Offline tests for pead_tool.py — no network, no real Telegram / AICredits.
 Network, the model and Telegram are mocked; state files go to a temp folder.
 The PDF tests use the real pdfplumber, Poppler and Tesseract (~30s of OCR).
 """
+import calendar
 import csv
 import io
 import json
@@ -91,9 +92,21 @@ class LogCapture(logging.Handler):
 
 ACCESS_DENIED = FakeResponse(403, text="<HTML><TITLE>Access Denied</TITLE>You don't have permission</HTML>")
 
+def month_end_before(iso, months):
+    """The month-end `months` before the month of an ISO date."""
+    d = date.fromisoformat(iso)
+    y, m = divmod(d.year * 12 + d.month - 1 - months, 12)
+    return date(y, m + 1, calendar.monthrange(y, m + 1)[1]).isoformat()
+
 def mk(**kw):
+    """A model reply, normalised. Given only period_end, the previous-quarter and
+    last-year column dates are filled in 3 and 12 months earlier, as a correct
+    extraction has them; tests of the column check pass their own."""
     d = {"unit": "crores"}
     d.update(kw)
+    if d.get("period_end") and "prev_period_end" not in d and "ly_period_end" not in d:
+        d["prev_period_end"] = month_end_before(d["period_end"], 3)
+        d["ly_period_end"] = month_end_before(d["period_end"], 12)
     return pt.normalise_financials(d)
 
 GOOD = dict(revenue_from_operations=[150, 120, 100], pat=[30, 20, 10], basic_eps=[3, 2, 1],
@@ -112,10 +125,32 @@ for d, q in [(date(2026, 9, 24), "Q1FY27"), (date(2026, 7, 1), "Q1FY27"), (date(
     check(f"reporting_quarter filed {d}", pt.reporting_quarter(d) == q, pt.reporting_quarter(d))
 
 filed = date(2026, 7, 20)
-check("filing_quarter uses period_end (late Q4 filer)", pt.filing_quarter({"period_end": "2026-03-31"}, filed) == "Q4FY26")
-check("filing_quarter falls back without period_end", pt.filing_quarter({"period_end": None}, filed) == "Q1FY27")
-check("filing_quarter ignores implausible period_end", pt.filing_quarter({"period_end": "2024-06-30"}, filed) == "Q1FY27")
-check("filing_quarter ignores future period_end", pt.filing_quarter({"period_end": "2026-09-30"}, filed) == "Q1FY27")
+check("pdf_quarter uses period_end (late Q4 filer)", pt.pdf_quarter({"period_end": "2026-03-31"}, filed) == "Q4FY26")
+check("no period_end → no quarter (no filing-date fallback)", pt.pdf_quarter({"period_end": None}, filed) is None)
+check("implausible period_end → no quarter", pt.pdf_quarter({"period_end": "2024-06-30"}, filed) is None)
+check("future period_end → no quarter", pt.pdf_quarter({"period_end": "2026-09-30"}, filed) is None)
+check("filing-date fallback is gone", not hasattr(pt, "filing_quarter"))
+check("quarter unknown reason: missing",
+      pt.quarter_unknown_reason({"period_end": None}, filed) == "quarter unknown (no period_end)")
+check("quarter unknown reason: implausible",
+      pt.quarter_unknown_reason({"period_end": "2024-06-30"}, filed)
+      == "quarter unknown (period_end 2024-06-30 implausible for a filing on 2026-07-20)")
+
+for cur, prev, ly, want in [
+    ("2026-09-30", "2026-06-30", "2025-09-30", None),                      # Q2FY27
+    ("2026-12-31", "2026-09-30", "2025-12-31", None),                      # Q3, previous in the same year
+    ("2027-03-31", "2026-12-31", "2026-03-31", None),                      # Q4, previous across the year end
+    ("2026-06-30", "2026-03-31", "2025-06-30", None),                      # Q1
+    ("2026-09-29", "2026-06-27", "2025-09-28", None),                      # day of month doesn't matter
+    ("2026-09-30", "2026-03-31", "2025-09-30", "previous column 2026-03-31 isn't 3 months before 2026-09-30"),
+    ("2026-09-30", "2025-09-30", "2026-06-30", "previous column 2025-09-30 isn't 3 months before 2026-09-30"),  # swapped
+    ("2026-09-30", "2026-06-30", "2024-09-30", "last-year column 2024-09-30 isn't 12 months before 2026-09-30"),
+    ("2026-09-30", "2026-09-30", "2025-09-30", "previous column 2026-09-30 isn't 3 months before 2026-09-30"),  # half-year YTD column
+    ("2026-09-30", None, "2025-09-30", "previous-quarter column date missing"),
+    ("2026-09-30", None, None, "previous-quarter and last-year column date missing"),
+]:
+    got = pt.column_dates_problem({"period_end": cur, "prev_period_end": prev, "ly_period_end": ly})
+    check(f"column dates {cur} / {prev} / {ly}", got == want, got)
 
 # ─────────────────────────────────────────────────────────────
 section("board meeting filter")
@@ -466,6 +501,7 @@ check("a results heading beats a cash-flow word in it",
 section("normalise_financials")
 
 raw = {"basis": "Consolidated", "unit": "Lakhs", "period_end": "30.06.2026",
+       "prev_period_end": "31-Mar-2026", "ly_period_end": "30/06/2025",
        "revenue_from_operations": [66258, "140,264", 15459],
        "pat": [41939, None, "abc"], "basic_eps": [0.68, 1.2, 0.03],
        "pbt": "oops", "ebitda": [1, 2], "finance_cost": [True, float("nan"), 3]}
@@ -479,6 +515,11 @@ check("bool/nan rejected", fin["finance_cost"] == [None, None, 0.03], fin["finan
 check("all keys present", all(len(fin[k]) == 3 for k in pt.FIN_KEYS))
 check("basis lowercased", fin["basis"] == "consolidated")
 check("period_end dd.mm.yyyy -> ISO", fin["period_end"] == "2026-06-30")
+check("previous and last-year column dates parsed",
+      fin["prev_period_end"] == "2026-03-31" and fin["ly_period_end"] == "2025-06-30", fin)
+check("missing column dates -> None", pt.normalise_financials({"unit": "crores"})["prev_period_end"] is None)
+check("prompt asks for all three column dates",
+      all(f'"{k}":"YYYY-MM-DD"' in pt.EXTRACTION_PROMPT for k in ("period_end", "prev_period_end", "ly_period_end")))
 for value, want in [("2026-06-30", "2026-06-30"), ("30-Jun-2026", "2026-06-30"), ("June 30, 2026", "2026-06-30"),
                     ("30/06/2026", "2026-06-30"), (None, None), ("", None), ("Q1 FY27", None), (20260630, None)]:
     check(f"parse_period_end {value!r}", pt.parse_period_end(value) == want, pt.parse_period_end(value))
@@ -549,28 +590,35 @@ with mock.patch.object(pt.requests, "post", side_effect=pt.requests.ConnectionEr
 # ─────────────────────────────────────────────────────────────
 section("CSV")
 
+NEW_COLUMNS = ["exchange", "filing_url", "period_end", "quarter", "basis", "unit"]
+check("CSV header ends with the added columns", pt.CSV_HEADER[-6:] == NEW_COLUMNS, pt.CSV_HEADER)
+
 d = fresh_state_dir()
 with open(pt.RESULTS_CSV, "w", newline="", encoding="utf-8") as fh:
     w = csv.writer(fh)
-    w.writerow(pt.CSV_HEADER[:-2])                         # pre-NSE file: no exchange, no filing_url
+    w.writerow(pt.CSV_HEADER[:15])                         # pre-NSE file: none of the added columns
     w.writerow(["2026-05-27 23:40:34", "Old Co", "540026", "0.0"] + [""] * 11)
 pt.initialize_csv()
-pt.save_result_csv(nse_filing, 40.0, mk(**GOOD))
+pt.save_result_csv(nse_filing, 40.0, mk(period_end="2026-09-30", basis="consolidated", **GOOD), "Q2FY27")
 rows = list(csv.reader(open(pt.RESULTS_CSV, encoding="utf-8")))
-check("pre-NSE CSV gains exchange + filing_url columns", rows[0][-2:] == ["exchange", "filing_url"] and rows[1][-2:] == ["BSE", ""], rows[1])
-check("new row records exchange and the filing link",
-      rows[2][-2:] == ["NSE", nse_filing["attachment_url"]] and len(rows[2]) == len(pt.CSV_HEADER), rows[2])
+check("pre-NSE CSV gains all six added columns",
+      rows[0][-6:] == NEW_COLUMNS and rows[1][-6:] == ["BSE", "", "", "", "", ""], rows[1])
+check("new row records exchange, filing link, period_end, quarter, basis, unit",
+      rows[2][-6:] == ["NSE", nse_filing["attachment_url"], "2026-09-30", "Q2FY27", "consolidated", "crores"]
+      and len(rows[2]) == len(pt.CSV_HEADER), rows[2])
 pt.initialize_csv()
 check("migration is idempotent", list(csv.reader(open(pt.RESULTS_CSV, encoding="utf-8")))[0] == pt.CSV_HEADER)
 
 d = fresh_state_dir()
 with open(pt.RESULTS_CSV, "w", newline="", encoding="utf-8") as fh:
     w = csv.writer(fh)
-    w.writerow(pt.CSV_HEADER[:-1])                         # file from before filing_url
-    w.writerow(["2026-09-24 21:31:06", "Purple Style Labs Limited", "PERNIASPOP", "0.0"] + [""] * 11 + ["NSE"])
+    w.writerow(pt.CSV_HEADER[:17])                         # the file as it was until 2026-10-05
+    w.writerow(["2026-09-24 21:31:06", "Purple Style Labs Limited", "PERNIASPOP", "0.0"] + [""] * 11
+               + ["NSE", "https://nsearchives.nseindia.com/corporate/x.pdf"])
 pt.initialize_csv()
 rows = list(csv.reader(open(pt.RESULTS_CSV, encoding="utf-8")))
-check("exchange column kept, only filing_url added", rows[0] == pt.CSV_HEADER and rows[1][-2:] == ["NSE", ""], rows)
+check("existing columns kept, only period_end/quarter/basis/unit added",
+      rows[0] == pt.CSV_HEADER and rows[1][-6:] == ["NSE", "https://nsearchives.nseindia.com/corporate/x.pdf", "", "", "", ""], rows)
 
 # ─────────────────────────────────────────────────────────────
 section("main loop")
@@ -818,12 +866,90 @@ try:
     check("OLD line with the model's timing on it",
           logs.has_line("OLD", "Co 801", "Q1FY27: old quarter, ignored (scoring from Q2FY27)")
           and logs.has_line("OLD", "OLDQ", "old quarter, ignored") and not logs.has("not calling the model"), logs.terminal())
+    retries = json.load(open(pt.RETRIES_FILE)) if os.path.exists(pt.RETRIES_FILE) else {}
     check("old-quarter filings marked seen, not scored, not processed, no retry",
           {old_q["id"], old_amb["id"]} <= seen and "801" not in csv_scrips and "OLDQ" not in csv_scrips
           and not any("801" in k or "INE802A01010" in k for k in processed)
-          and (not os.path.exists(pt.RETRIES_FILE) or json.load(open(pt.RETRIES_FILE)) == {}), (seen, processed, csv_scrips))
-    check("Q2FY27 result and one without period_end are scored and alerted",
-          alerts == ["BSE:Co 804", "BSE:Co 803"] and processed == {"BSE-803_Q2FY27", "BSE-804_Q1FY27"}, (alerts, processed))  # oldest first
+          and old_q["id"] not in retries and old_amb["id"] not in retries, (seen, processed, csv_scrips, retries))
+    check("only the Q2FY27 result is scored and alerted",
+          alerts == ["BSE:Co 803"] and processed == {"BSE-803_Q2FY27"} and csv_scrips == ["803"], (alerts, processed, csv_scrips))
+    check("no period_end: no alert, no row yet, RETRY 'quarter unknown'",
+          logs.has_line("RETRY", "Co 804", "quarter unknown (no period_end) · retry 1/3")
+          and retries.get(no_period["id"]) == 1 and no_period["id"] not in seen, logs.terminal())
+
+    # Every attempt without a period_end: one UNKNOWN row after the last, never an alert
+    fresh_state_dir()
+    unknown = pt.normalise_bse(bse_raw("u1", 821, "Result", "2026-10-20T10:00:00"))
+    extract, calls = counting_extract({unknown["attachment_url"]: mk(basis="standalone", **GOOD)})
+    alerts = run_main(2, bse=lambda k: [unknown], extract=extract)
+    rows_before = list(csv.DictReader(open(pt.RESULTS_CSV, encoding="utf-8")))
+    with LogCapture() as logs:
+        alerts += run_main(3, bse=lambda k: [unknown], extract=extract)          # restart: counts persist
+    rows = list(csv.DictReader(open(pt.RESULTS_CSV, encoding="utf-8")))
+    check("quarter unknown: no row while retries remain", rows_before == [], rows_before)
+    check("quarter unknown: 4 attempts, then one UNKNOWN row with the figures",
+          calls[unknown["attachment_url"]] == 4 and len(rows) == 1 and rows[0]["quarter"] == "UNKNOWN"
+          and rows[0]["period_end"] == "" and rows[0]["basis"] == "standalone" and rows[0]["unit"] == "crores"
+          and float(rows[0]["score"]) >= 35, (calls, rows))
+    check("quarter unknown: never alerted, not processed, marked seen",
+          alerts == [] and json.load(open(pt.PROCESSED_SCRIPS_FILE)) == []
+          and unknown["id"] in set(json.load(open(pt.SEEN_FILE))), alerts)
+    check("quarter unknown: give-up line says it was saved",
+          logs.has_line("RETRY", "Co 821", "quarter unknown (no period_end) · gave up after 4 attempts · saved as quarter UNKNOWN (", "/50, no alert)"),
+          logs.terminal())
+
+    # A retry that gets the period_end right leaves only the real row
+    fresh_state_dir()
+    recovers = pt.normalise_bse(bse_raw("u2", 822, "Result", "2026-10-20T10:00:00"))
+    replies = [mk(**GOOD), mk(period_end="2026-09-30", **GOOD)]
+    def flaky_extract(pdf, ambiguous=False, timings=None):
+        return replies.pop(0)
+    alerts = run_main(2, bse=lambda k: [recovers], extract=flaky_extract)
+    rows = list(csv.DictReader(open(pt.RESULTS_CSV, encoding="utf-8")))
+    check("unknown on the first try, Q2FY27 on the retry: one Q2FY27 row, one alert",
+          [(r["scrip"], r["quarter"], r["period_end"]) for r in rows] == [("822", "Q2FY27", "2026-09-30")]
+          and alerts == ["BSE:Co 822"], (rows, alerts))
+
+    # An implausible period_end is a quarter unknown too
+    fresh_state_dir()
+    stale = pt.normalise_bse(bse_raw("u3", 823, "Result", "2026-10-20T10:00:00"))
+    extract, calls = counting_extract({stale["attachment_url"]: mk(period_end="2024-09-30", **GOOD)})
+    with LogCapture() as logs:
+        alerts = run_main(1, bse=lambda k: [stale], extract=extract)
+    check("implausible period_end: RETRY 'quarter unknown', no alert",
+          logs.has_line("RETRY", "Co 823", "quarter unknown (period_end 2024-09-30 implausible for a filing on 2026-10-20) · retry 1/3")
+          and alerts == [], logs.terminal())
+
+    # Column dates that don't line up: retried, never scored, no row on giving up
+    fresh_state_dir()
+    shifted = pt.normalise_bse(bse_raw("c1", 831, "Result", "2026-10-20T10:00:00"))
+    missing = pt.normalise_bse(bse_raw("c2", 832, "Result", "2026-10-20T10:00:00"))
+    extract, calls = counting_extract({
+        shifted["attachment_url"]: mk(period_end="2026-09-30", prev_period_end="2026-03-31", ly_period_end="2025-09-30", **GOOD),
+        missing["attachment_url"]: mk(period_end="2026-09-30", prev_period_end="2026-06-30", ly_period_end=None, **GOOD),
+    })
+    with LogCapture() as logs:
+        alerts = run_main(4, bse=lambda k: [shifted, missing], extract=extract)
+    check("column mismatch: RETRY 'column dates don't line up'",
+          logs.has_line("RETRY", "Co 831",
+                        "column dates don't line up (previous column 2026-03-31 isn't 3 months before 2026-09-30) · retry 1/3"),
+          logs.terminal())
+    check("missing column date: RETRY 'column dates don't line up'",
+          logs.has_line("RETRY", "Co 832", "column dates don't line up (last-year column date missing) · retry 1/3"))
+    check("column mismatch: 4 attempts, given up, no row, no alert",
+          calls[shifted["attachment_url"]] == 4 and logs.has_line("RETRY", "Co 831", "gave up after 4 attempts")
+          and not logs.has_line("RETRY", "Co 831", "saved as quarter UNKNOWN")
+          and list(csv.DictReader(open(pt.RESULTS_CSV, encoding="utf-8"))) == [] and alerts == [], calls)
+
+    # The ambiguous-outcome checker path saves an UNKNOWN row the same way
+    fresh_state_dir()
+    vague = pt.normalise_nse(nse_raw("u9", "VAGUE", "INE829A01010", "20-Oct-2026 10:00:00", desc="Outcome of Board Meeting"))
+    extract, calls = counting_extract({vague["attachment_url"]: mk(**GOOD)})
+    alerts = run_main(4, nse=lambda c: [vague], extract=extract)
+    rows = list(csv.DictReader(open(pt.RESULTS_CSV, encoding="utf-8")))
+    check("checker path: quarter unknown retried, then one UNKNOWN row, no alert",
+          calls[vague["attachment_url"]] == 4 and [(r["scrip"], r["quarter"]) for r in rows] == [("VAGUE", "UNKNOWN")]
+          and alerts == [], (calls, rows))
 finally:
     pt.SCORE_FROM_QUARTER = "Q1FY20"
 
@@ -1080,6 +1206,19 @@ finally:
     server.server_close()
 
 # ─────────────────────────────────────────────────────────────
+section("dashboard current quarter")
+
+check("dashboard reads SCORE_FROM_QUARTER from pead_tool.py",
+      dashboard.read_current_quarter() == CONFIGURED_SCORE_FROM_QUARTER, dashboard.read_current_quarter())
+folder = tempfile.mkdtemp(prefix="pead_dash_")
+with open(os.path.join(folder, dashboard.TOOL_FILE), "w", encoding="utf-8") as fh:
+    fh.write('PEAD_THRESHOLD     = 35\nSCORE_FROM_QUARTER = "Q3FY27"\n')
+with mock.patch.object(dashboard, "BASE_DIR", folder):
+    check("…and sends it as current_quarter", dashboard.build_payload()["current_quarter"] == "Q3FY27")
+with mock.patch.object(dashboard, "BASE_DIR", tempfile.mkdtemp(prefix="pead_dash_")):
+    check("no pead_tool.py → empty current quarter", dashboard.read_current_quarter() == "")
+
+# ─────────────────────────────────────────────────────────────
 section("dashboard log parser")
 
 def parse_log(text):
@@ -1228,6 +1367,7 @@ def hybrid_pdf():
     return buf.getvalue()
 
 MODEL_JSON = ('Here you go:\n```json\n{"basis":"consolidated","unit":"lakhs","period_end":"2026-06-30",'
+              '"prev_period_end":"2026-03-31","ly_period_end":"2025-06-30",'
               '"revenue_from_operations":[66258,60000,50000],"pat":[7000,6000,4000],"basic_eps":[7.0,6.0,4.0]}\n```')
 
 class Msg:

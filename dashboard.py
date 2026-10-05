@@ -83,6 +83,18 @@ def read_threshold() -> float:
     return DEFAULT_THRESHOLD
 
 
+def read_current_quarter() -> str:
+    """SCORE_FROM_QUARTER from pead_tool.py: the quarter being scored now."""
+    try:
+        with open(_p(TOOL_FILE), "r", encoding="utf-8") as f:
+            m = re.search(r'^SCORE_FROM_QUARTER\s*=\s*"(Q[1-4]FY\d{2})"', f.read(), re.M)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return ""
+
+
 def read_results():
     """Return (rows, error). Rows are dicts of raw strings keyed by CSV header."""
     path = _p(RESULTS_CSV)
@@ -223,6 +235,7 @@ def build_payload():
     return {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "threshold":    read_threshold(),
+        "current_quarter": read_current_quarter(),
         "results":      rows,
         "csv_error":    csv_error,
         "seen_count":   _count(seen),

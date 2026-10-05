@@ -239,6 +239,13 @@ table.results tbody tr.sel { background: color-mix(in srgb, var(--accent) 12%, t
 /* Exch. text stays as it was, with an underline marking it as a link */
 .ex-link { color: inherit; text-decoration: underline; text-decoration-color: var(--text-muted); text-underline-offset: 3px; }
 .ex-link.fallback { text-decoration-style: dotted; }
+/* Quarter: rows that aren't the quarter being scored are marked */
+.qtag { display: inline-block; font-size: 12px; padding: 1px 7px; border-radius: 999px; border: 1px solid transparent; white-space: nowrap; }
+.qtag.off { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 55%, var(--border)); background: color-mix(in srgb, var(--warn) 12%, transparent); font-weight: 600; }
+table.results tr.off-q td:first-child { box-shadow: inset 3px 0 0 var(--warn); }
+.detail-quarter { font-size: 12px; color: var(--text-secondary); margin: -6px 0 10px; }
+.detail-quarter .qnote { color: var(--warn); margin-top: 4px; }
+.badge.off { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 55%, var(--border)); }
 .ex-link:hover { color: var(--accent); text-decoration-color: var(--accent); }
 .more { text-align: center; margin-top: 10px; }
 
@@ -358,6 +365,7 @@ table.results tbody tr.sel { background: color-mix(in srgb, var(--accent) 12%, t
       </div>
       <div class="detail-title" id="d-name">–</div>
       <div class="detail-meta" id="d-meta">–</div>
+      <div class="detail-quarter" id="d-quarter"></div>
       <div class="factors" id="d-factors"></div>
       <table class="fin" id="d-fin"></table>
       <div class="note" id="d-note"></div>
@@ -399,6 +407,7 @@ table.results tbody tr.sel { background: color-mix(in srgb, var(--accent) 12%, t
             <th data-k="ts">Time</th>
             <th data-k="company">Company</th>
             <th data-k="exchange">Exch.</th>
+            <th data-k="qsort">Quarter</th>
             <th data-k="score" class="num">Score</th>
             <th data-k="revYoy" class="num">Revenue YoY</th>
             <th data-k="patYoy" class="num">PAT YoY</th>
@@ -504,6 +513,39 @@ function filingLink(r) {
   return `/filing?url=${encodeURIComponent(r.filingUrl)}&exchange=${encodeURIComponent(r.exchange)}&scrip=${encodeURIComponent(r.scrip)}`;
 }
 
+// "Q2FY27" → sortable number; UNKNOWN or blank → null (sorts last)
+function quarterIndex(q) {
+  const m = /^Q([1-4])FY(\d{2})$/.exec(q || "");
+  return m ? Number(m[2]) * 4 + Number(m[1]) : null;
+}
+
+// Rows saved with quarter UNKNOWN were never alerted, whatever their score
+function alerted(r) {
+  return r.score >= S.threshold && r.quarter !== "UNKNOWN";
+}
+
+// Not the quarter pead_tool.py is scoring (SCORE_FROM_QUARTER)
+function offQuarter(r) {
+  return !!S.currentQuarter && r.quarter !== S.currentQuarter;
+}
+
+function quarterNote(r) {
+  if (r.quarter === "UNKNOWN") return "Quarter unknown: the PDF gave no usable quarter-end date, so this row was saved for reference and never alerted";
+  if (!r.quarter) return "Quarter not recorded (scored before quarters were saved)";
+  if (offQuarter(r)) return `Not the current quarter (${S.currentQuarter})`;
+  return "Current quarter";
+}
+
+function fmtPeriodEnd(iso) {
+  const d = iso ? new Date(iso + "T00:00:00") : null;
+  return d && !isNaN(d) ? d.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" }) : "";
+}
+
+function quarterTag(r) {
+  const label = r.quarter || "—";
+  return `<span class="qtag${offQuarter(r) ? " off" : ""}" title="${esc(quarterNote(r))}">${offQuarter(r) ? "⚠ " : ""}${esc(label)}</span>`;
+}
+
 function normalise(raw, i) {
   const g = (k) => raw[k] ?? raw[k.toUpperCase()] ?? null;
   const tsStr = g("timestamp") || "";
@@ -523,7 +565,12 @@ function normalise(raw, i) {
     ebCq: num(g("ebitda_cq")), ebPq: num(g("ebitda_pq")), ebLy: num(g("ebitda_ly")),
     epsCq: num(g("eps_cq")), epsLy: num(g("eps_ly")),
     filingUrl: safeFilingUrl(g("filing_url")),
+    quarter: (g("quarter") || "").trim().toUpperCase(),
+    periodEnd: (g("period_end") || "").trim(),
+    basis: (g("basis") || "").trim(),
+    unit: (g("unit") || "").trim(),
   };
+  r.qsort = quarterIndex(r.quarter);
   r.empty = r.revCq == null && r.patCq == null && r.epsCq == null;
   r.revYoy = pct(r.revCq, r.revLy);
   r.patYoy = pct(r.patCq, r.patLy);
@@ -591,7 +638,7 @@ function applyFilters() {
   const qq = q.trim().toLowerCase();
   S.filtered = S.rows.filter((r) => {
     if (r.score == null || r.empty) return false;
-    if (kind === "alerts" && r.score < S.threshold) return false;
+    if (kind === "alerts" && !alerted(r)) return false;
     if (ex !== "all" && r.exchange !== ex) return false;
     if (days && r.ts) {
       if (days === 1) {
@@ -607,7 +654,7 @@ function applyFilters() {
 /* ─────────────── KPIs ─────────────── */
 function renderKpis() {
   const d = S.data, list = S.filtered;
-  const alerts = list.filter((r) => r.score >= S.threshold).length;
+  const alerts = list.filter(alerted).length;
   $("k-scored").textContent = list.length.toLocaleString("en-IN");
   $("k-alerts").textContent = alerts.toLocaleString("en-IN");
   $("k-alerts-h").textContent = `score ≥ ${fmtScore(S.threshold)}` + (list.length ? ` · ${Math.round(alerts / list.length * 100)}% hit rate` : "");
@@ -675,18 +722,23 @@ function renderDetail() {
   if (!r) { r = latest(S.filtered); S.selectedId = r ? r.id : null; }
   if (!r) {
     $("d-score").textContent = "–"; $("d-name").textContent = "No result selected";
-    $("d-meta").textContent = ""; $("d-factors").innerHTML = ""; $("d-fin").innerHTML = "";
+    $("d-meta").textContent = ""; $("d-quarter").innerHTML = ""; $("d-factors").innerHTML = ""; $("d-fin").innerHTML = "";
     $("d-note").textContent = ""; $("d-badge").textContent = "–"; $("d-badge").className = "badge";
     Gauge.set(0, false);
     return;
   }
-  const hit = r.score >= S.threshold;
+  const hit = alerted(r);
   $("d-score").textContent = fmtScore(r.score);
-  $("d-badge").textContent = hit ? "▲ Alert sent" : "No alert";
-  $("d-badge").className = "badge" + (hit ? " alert" : "");
+  $("d-badge").textContent = hit ? "▲ Alert sent" : r.quarter === "UNKNOWN" ? "Quarter unknown · no alert" : "No alert";
+  $("d-badge").className = "badge" + (hit ? " alert" : r.quarter === "UNKNOWN" ? " off" : "");
   $("d-name").textContent = r.company;
   $("d-name").title = r.company;
   $("d-meta").innerHTML = `${esc(r.exchange)} · <a href="${esc(companyPage(r))}" target="_blank" rel="noopener" style="color:var(--accent)">${esc(r.scrip)}</a> · ${esc(r.tsStr)}`;
+  $("d-quarter").innerHTML = [
+    quarterTag(r),
+    r.periodEnd ? `quarter ended ${esc(fmtPeriodEnd(r.periodEnd) || r.periodEnd)}` : "no quarter-end date",
+    r.basis ? esc(r.basis) : "",
+  ].filter(Boolean).join(" · ") + (offQuarter(r) ? `<div class="qnote">${esc(quarterNote(r))}</div>` : "");
   Gauge.set(r.score, hit);
 
   const sc = scorecard(r);
@@ -712,6 +764,7 @@ function renderDetail() {
   let note = "Breakdown recomputed from the figures in pead_results.csv.";
   if (!sc.rejected && Math.abs(sc.total - r.score) > 0.6) note += ` It gives ${fmtScore(sc.total)}, not the logged ${fmtScore(r.score)}: this row was scored by an older scoring version.`;
   if (sc.turnaround) note += " Loss-to-profit turnaround: growth factors earn half points.";
+  if (r.quarter === "UNKNOWN") note += " The model never returned a usable quarter-end date for this filing, so its figures were saved after the last retry with quarter UNKNOWN and no alert was sent.";
   $("d-note").textContent = note;
 }
 
@@ -729,20 +782,22 @@ function renderTable() {
   const cls = (v) => v == null ? "" : v > 0 ? "up" : v < 0 ? "down" : "";
   const shown = list.slice(0, S.shown);
   $("tbl").querySelector("tbody").innerHTML = shown.map((r) => {
-    const hit = r.score >= S.threshold;
-    return `<tr data-id="${esc(r.id)}" class="${r.id === S.selectedId ? "sel" : ""}">
+    const hit = alerted(r);
+    const rowCls = [r.id === S.selectedId ? "sel" : "", offQuarter(r) ? "off-q" : ""].filter(Boolean).join(" ");
+    return `<tr data-id="${esc(r.id)}" class="${rowCls}">
       <td class="mono">${esc(r.tsStr.slice(5, 16))}</td>
       <td><span class="co" title="${esc(r.company)}">${esc(r.company)}</span></td>
       <td>${r.filingUrl
         ? `<a class="ex-link" href="${esc(filingLink(r))}" target="_blank" rel="noopener" title="Open the result filing on ${esc(r.exchange)}">${esc(r.exchange)}</a>`
         : `<a class="ex-link fallback" href="${esc(companyPage(r))}" target="_blank" rel="noopener" title="Filing link wasn't recorded for this row; opens the company's ${esc(r.exchange)} page">${esc(r.exchange)}</a>`}</td>
+      <td>${quarterTag(r)}</td>
       <td class="num"><span class="scorebar"><span>${hit ? "▲ " : ""}${fmtScore(r.score)}</span><span class="mini"><span class="${hit ? "hit" : ""}" style="width:${Math.min(100, r.score / MAX_SCORE * 100)}%"></span></span></span></td>
       <td class="num ${cls(r.revYoy)}">${fmtPct(r.revYoy)}</td>
       <td class="num ${cls(r.patYoy)}">${fmtPct(r.patYoy)}</td>
       <td class="num ${cls(r.epsYoy)}">${fmtPct(r.epsYoy)}</td>
       <td class="num">${fmtNum(r.rev)}</td>
     </tr>`;
-  }).join("") || `<tr><td colspan="8" style="text-align:center;color:var(--text-muted);padding:24px">No results match these filters.</td></tr>`;
+  }).join("") || `<tr><td colspan="9" style="text-align:center;color:var(--text-muted);padding:24px">No results match these filters.</td></tr>`;
   $("more-btn").style.display = list.length > S.shown ? "inline-block" : "none";
   $("more-btn").textContent = `Show more (${list.length - S.shown} hidden)`;
   document.querySelectorAll("#tbl th").forEach((th) => {
@@ -970,7 +1025,7 @@ const Skyline = (() => {
       // oldest at the back row, newest at the front
       const row = Math.floor(i / cols), col = i % cols;
       const h = towerHeight(r.score);
-      const hit = r.score >= threshold;
+      const hit = r.score >= threshold && r.quarter !== "UNKNOWN";
       const t = Math.max(0, Math.min(1, r.score / MAX_SCORE));
       const base = hit ? new THREE.Color(lerpColor(C.lo, C.hi, 0.35 + t * 0.65)) : C.below.clone();
       const mat = new THREE.MeshStandardMaterial({
@@ -1069,7 +1124,7 @@ const Skyline = (() => {
     return hit ? bars.find((b) => b.mesh === hit.object) : null;
   }
   function setHover(b) {
-    if (hovered && hovered !== b) hovered.mesh.material.emissive.copy(hovered.r.score >= S.threshold ? hovered.mesh.userData.base.clone().multiplyScalar(0.25) : new THREE.Color(0));
+    if (hovered && hovered !== b) hovered.mesh.material.emissive.copy(alerted(hovered.r) ? hovered.mesh.userData.base.clone().multiplyScalar(0.25) : new THREE.Color(0));
     hovered = b;
     if (b) b.mesh.material.emissive.copy(b.mesh.userData.base.clone().multiplyScalar(0.55));
     draw();
@@ -1091,7 +1146,7 @@ const Skyline = (() => {
     setHover(b);
     if (b) {
       const r = b.r;
-      showTip(e.clientX, e.clientY, `<div class="t1">${esc(r.company)}</div><div class="t2">Score ${fmtScore(r.score)} of 50${r.score >= S.threshold ? " · alerted" : ""}</div><div class="t2">${esc(r.exchange)} ${esc(r.scrip)} · ${esc(r.tsStr.slice(0, 16))}</div>`);
+      showTip(e.clientX, e.clientY, `<div class="t1">${esc(r.company)}</div><div class="t2">Score ${fmtScore(r.score)} of 50${alerted(r) ? " · alerted" : ""}</div><div class="t2">${esc(r.exchange)} ${esc(r.scrip)} · ${esc(r.quarter || "quarter not recorded")} · ${esc(r.tsStr.slice(0, 16))}</div>`);
       el.style.cursor = "pointer";
     } else { hideTip(); el.style.cursor = ""; }
   });
@@ -1270,10 +1325,11 @@ async function load() {
   else banner.classList.remove("show");
 
   S.data = d;
-  const resultsSig = d.results.length + "|" + (d.results.at(-1) ? JSON.stringify(d.results.at(-1)) : "") + "|" + d.threshold;
+  const resultsSig = d.results.length + "|" + (d.results.at(-1) ? JSON.stringify(d.results.at(-1)) : "") + "|" + d.threshold + "|" + d.current_quarter;
   const changed = resultsSig !== S.lastSig;
   S.lastSig = resultsSig;
   S.threshold = d.threshold;
+  S.currentQuarter = d.current_quarter || "";
 
   if (changed) {
     S.rows = d.results.map(normalise);

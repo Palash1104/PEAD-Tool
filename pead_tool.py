@@ -64,8 +64,10 @@ POLL_INTERVAL_SEC  = 30
 MAX_RETRIES        = 3      # extra attempts per failed filing, one per poll
 BLOCKED_ALERT_SEC  = 3600   # Telegram at most hourly about an exchange blocking us
 
-# Results whose PDF period_end falls in an earlier quarter are ignored:
-# logged as "old quarter, ignored", marked seen, never scored or alerted
+# Only results whose PDF says which quarter they are get scored. An earlier
+# quarter (by period_end) is logged "old quarter, ignored", marked seen, never
+# scored or alerted. No usable period_end, or column dates that don't line
+# up, count as a failed extraction and are retried.
 SCORE_FROM_QUARTER = "Q2FY27"
 
 # Growth factors are skipped when last year's base is this small (Rs. Cr)
@@ -206,12 +208,21 @@ CSV_HEADER = [
 
     "exchange",
     "filing_url",   # the result PDF on the exchange
+
+    "period_end",   # the current quarter column's date, from the PDF
+    "quarter",      # e.g. Q2FY27, or UNKNOWN when the PDF never said
+    "basis",        # consolidated / standalone
+    "unit",         # the table's unit before conversion to crores
 ]
 
 # Columns added after the CSV existed, with the value older rows get
 CSV_ADDED_COLUMNS = {
     "exchange": "BSE",      # every row before NSE support came from BSE
     "filing_url": "",       # not recorded before this column existed
+    "period_end": "",       # the four below weren't recorded before 2026-10-05
+    "quarter": "",
+    "basis": "",
+    "unit": "",
 }
 
 def initialize_csv():
@@ -250,7 +261,7 @@ def initialize_csv():
     except OSError as e:
         log.warning(f"Could not add new columns to {RESULTS_CSV}: {e}")
 
-def save_result_csv(filing, score, fin):
+def save_result_csv(filing, score, fin, quarter):
 
     def get3(key):
         v = fin.get(key) or []
@@ -282,6 +293,11 @@ def save_result_csv(filing, score, fin):
 
                 filing["exchange"],
                 filing["attachment_url"],
+
+                fin.get("period_end") or "",
+                quarter,
+                fin.get("basis") or "",
+                fin.get("unit") or "",
             ])
     except OSError as e:
         # e.g. CSV open in Excel — don't let logging block the alert
@@ -309,7 +325,17 @@ class SkipFiling(Exception):
         self.status = status
 
 class RetryFiling(Exception):
-    """A failure worth retrying on a later poll (download, model, missing values)."""
+    """A failure worth retrying on a later poll (download, model, missing values,
+    column dates that don't line up)."""
+
+class QuarterUnknown(RetryFiling):
+    """The PDF never said which quarter it is (no usable period_end). Retried like
+    any failed extraction; if the last attempt is no better, the figures are saved
+    with quarter UNKNOWN and never alerted. fin is the extraction."""
+
+    def __init__(self, reason: str, fin: dict):
+        super().__init__(reason)
+        self.fin = fin
 
 def is_blocked_response(r) -> bool:
     return r.status_code in (401, 403) or "access denied" in r.text[:2000].lower()
@@ -598,15 +624,17 @@ def quarter_label(period_end: date) -> str:
     return f"Q4FY{y % 100:02d}"
 
 def reporting_quarter(filed_on: date) -> str:
-    """Fallback when the PDF gives no period: results are filed within the
-    three months after quarter end, e.g. filed Sep 2026 → Q1FY27."""
+    """Estimate from the filing date (results are filed within three months of
+    quarter end, e.g. filed Sep 2026 → Q1FY27). Only the cheap dedup pre-check
+    in triage uses it; scoring never does."""
     m, y = filed_on.month - 3, filed_on.year
     if m < 1:
         m, y = m + 12, y - 1
     return quarter_label(date(y, m, 1))
 
 def pdf_quarter(fin: dict, filed_on: date) -> str | None:
-    """Quarter from the PDF's period_end, or None if missing or implausible."""
+    """Quarter from the PDF's period_end, or None if missing or implausible
+    (it must fall 0–400 days before the filing date)."""
     period_end = fin.get("period_end")
 
     if period_end:
@@ -615,13 +643,35 @@ def pdf_quarter(fin: dict, filed_on: date) -> str | None:
         if timedelta(0) <= filed_on - ended <= timedelta(days=400):
             return quarter_label(ended)
 
-        log.warning(f"period_end {period_end} implausible for a filing on {filed_on}, using filing date")
-
     return None
 
-def filing_quarter(fin: dict, filed_on: date) -> str:
-    """Quarter from the PDF's period_end, else from the filing date."""
-    return pdf_quarter(fin, filed_on) or reporting_quarter(filed_on)
+def quarter_unknown_reason(fin: dict, filed_on: date) -> str:
+    period_end = fin.get("period_end")
+    if not period_end:
+        return "quarter unknown (no period_end)"
+    return f"quarter unknown (period_end {period_end} implausible for a filing on {filed_on})"
+
+def column_dates_problem(fin: dict) -> str | None:
+    """Why the three quarterly columns aren't current / 3 months earlier / 12
+    months earlier, or None if they line up. Compares year and month only, so
+    30 vs 31 of the month doesn't matter. period_end must already be set."""
+    current, prev, ly = fin.get("period_end"), fin.get("prev_period_end"), fin.get("ly_period_end")
+
+    missing = [name for name, value in [("previous-quarter", prev), ("last-year", ly)] if not value]
+    if missing:
+        return f"{' and '.join(missing)} column date missing"
+
+    def months(iso: str) -> int:
+        d = date.fromisoformat(iso)
+        return d.year * 12 + d.month
+
+    if months(current) - months(prev) != 3:
+        return f"previous column {prev} isn't 3 months before {current}"
+
+    if months(current) - months(ly) != 12:
+        return f"last-year column {ly} isn't 12 months before {current}"
+
+    return None
 
 def quarter_index(label: str) -> int:
     """Sortable number for "Q2FY27"-style labels."""
@@ -777,13 +827,18 @@ Extract these values exactly as printed, in the table's own unit (do NOT convert
 Also report:
 - basis: which results you used, "consolidated" or "standalone"
 - unit: the unit the table states for amounts, one of "crores", "lakhs", "millions", "thousands", "rupees"
-- period_end: the "quarter ended" date of the current quarter column, as YYYY-MM-DD (null if not shown)
+- period_end: the "quarter ended" date of the current quarter column (Column 1), as YYYY-MM-DD
+- prev_period_end: the "quarter ended" date of the previous quarter column (Column 2), as YYYY-MM-DD
+- ly_period_end: the "quarter ended" date of the same quarter last year column (Column 3), as YYYY-MM-DD
+  (use null for any of these dates the table doesn't show)
 
 Return ONLY a JSON object, no explanation, no markdown:
 {
 "basis":"consolidated|standalone",
 "unit":"crores|lakhs|millions|thousands|rupees",
 "period_end":"YYYY-MM-DD",
+"prev_period_end":"YYYY-MM-DD",
+"ly_period_end":"YYYY-MM-DD",
 "revenue_from_operations":[cq,pq,ly],
 "total_income":[cq,pq,ly],
 "ebitda":[cq,pq,ly],
@@ -1079,6 +1134,8 @@ def normalise_financials(data) -> dict | None:
         "basis": str(data.get("basis") or "unknown").strip().lower(),
         "unit": unit,
         "period_end": parse_period_end(data.get("period_end")),
+        "prev_period_end": parse_period_end(data.get("prev_period_end")),
+        "ly_period_end": parse_period_end(data.get("ly_period_end")),
     }
 
     for key in FIN_KEYS:
@@ -1129,7 +1186,7 @@ def extract_from_text(text: str, model: str, timings: dict | None = None) -> dic
         if fin:
             log.debug(
                 f"basis: {fin['basis']}, unit: {fin['unit']}, "
-                f"period end: {fin['period_end']}"
+                f"column dates: {fin['period_end']} / {fin['prev_period_end']} / {fin['ly_period_end']}"
             )
 
         return fin
@@ -1667,7 +1724,8 @@ def obtain_financials(filing: dict, nse: NseClient, ambiguous: bool = False,
     """Download the PDF and extract validated financials.
 
     Touches no scanner state, so the checker thread can run it too. Raises
-    RetryFiling on a failure worth retrying, SkipFiling when retrying can't help.
+    RetryFiling on a failure worth retrying (QuarterUnknown when the PDF gives
+    no usable period_end), SkipFiling when retrying can't help.
     """
     timings = {} if timings is None else timings
 
@@ -1693,34 +1751,46 @@ def obtain_financials(filing: dict, nse: NseClient, ambiguous: bool = False,
     if not has_core_values(fin):
         raise RetryFiling("missing current-quarter revenue or PAT")
 
+    filed_on = (filing["exchange_dt"] or datetime.now()).date()
+
+    if not pdf_quarter(fin, filed_on):
+        raise QuarterUnknown(quarter_unknown_reason(fin, filed_on), fin)
+
+    problem = column_dates_problem(fin)
+    if problem:
+        raise RetryFiling(f"column dates don't line up ({problem})")
+
     return fin
 
 def score_filing(filing: dict, isin, fin: dict, processed: set, timings: dict) -> tuple:
     """Quarter key, duplicate check, score, CSV and alert.
 
     Returns (processed key, status word, line text); the key is returned too
-    when the PDF's period shows the quarter was already scored. Raises
-    SkipFiling for a quarter before SCORE_FROM_QUARTER.
+    when the PDF's period shows the quarter was already scored. The quarter
+    always comes from the PDF's period_end. Raises SkipFiling for a quarter
+    before SCORE_FROM_QUARTER.
     """
     exchange_dt = filing["exchange_dt"]
     filed_on = (exchange_dt or datetime.now()).date()
-    from_pdf = pdf_quarter(fin, filed_on)
+    quarter = pdf_quarter(fin, filed_on)
 
-    if from_pdf and quarter_index(from_pdf) < quarter_index(SCORE_FROM_QUARTER):
+    if not quarter:      # obtain_financials already checks; never fall back to the filing date
+        raise QuarterUnknown(quarter_unknown_reason(fin, filed_on), fin)
+
+    if quarter_index(quarter) < quarter_index(SCORE_FROM_QUARTER):
         raise SkipFiling(
-            f"{from_pdf}: old quarter, ignored (scoring from {SCORE_FROM_QUARTER})",
+            f"{quarter}: old quarter, ignored (scoring from {SCORE_FROM_QUARTER})",
             model_called=True,
             status="OLD",
         )
 
-    quarter = from_pdf or reporting_quarter(filed_on)
     key = processed_key(filing, isin, quarter)
 
     if key in processed:
         return key, "SKIP", with_timings(f"{key} already scored (quarter from PDF)", timings)
 
     score, bd = compute_pead_score(fin)
-    save_result_csv(filing, score, fin)
+    save_result_csv(filing, score, fin, quarter)
     summary = f"{score:4.1f}/50  {quarter}  {fin.get('basis', 'unknown')}"
 
     if score >= PEAD_THRESHOLD:
@@ -1793,7 +1863,7 @@ class AmbiguousChecker:
         except SkipFiling as e:
             result["skip"] = e
         except RetryFiling as e:
-            result["retry"] = str(e)
+            result["retry"] = e
         except Exception as e:
             result["error"] = e
 
@@ -1908,13 +1978,24 @@ def record_success(filing: dict, state: ScannerState, key: str):
     state.finish(filing["id"])
 
 def record_retry(filing: dict, state: ScannerState, reason: str, timings: dict,
-                 error: BaseException | None = None):
-    """A retryable failure: one RETRY (or ERROR) line, then retry later or give up."""
+                 error: BaseException | None = None, unknown_fin: dict | None = None):
+    """A retryable failure: one RETRY (or ERROR) line, then retry later or give up.
+
+    unknown_fin is the extraction from a QuarterUnknown failure: if this was
+    the last attempt, it is saved with quarter UNKNOWN (scored, never alerted),
+    so each filing leaves at most one row.
+    """
     fid = filing["id"]
     attempts = state.retries.get(fid, 0) + 1
 
     if attempts > MAX_RETRIES:
         outcome = f"gave up after {attempts} attempts"
+
+        if unknown_fin is not None:
+            score, _ = compute_pead_score(unknown_fin)
+            save_result_csv(filing, score, unknown_fin, "UNKNOWN")
+            outcome += f" · saved as quarter UNKNOWN ({score:.1f}/50, no alert)"
+
         state.finish(fid)
     else:
         outcome = f"retry {attempts}/{MAX_RETRIES}"
@@ -1954,7 +2035,7 @@ def handle_clear(filing: dict, state: ScannerState):
         record_skip(filing, state, e, timings)
         return
     except RetryFiling as e:
-        record_retry(filing, state, str(e), timings)
+        record_retry(filing, state, str(e), timings, unknown_fin=getattr(e, "fin", None))
         return
     except Exception as e:
         record_retry(filing, state, "", timings, error=e)
@@ -1991,7 +2072,8 @@ def apply_ambiguous_result(result: dict, state: ScannerState):
         return
 
     if result["retry"]:
-        record_retry(filing, state, result["retry"], timings)
+        retry = result["retry"]
+        record_retry(filing, state, str(retry), timings, unknown_fin=getattr(retry, "fin", None))
         return
 
     try:
@@ -2000,6 +2082,9 @@ def apply_ambiguous_result(result: dict, state: ScannerState):
         )
     except SkipFiling as e:
         record_skip(filing, state, e, timings)
+        return
+    except RetryFiling as e:
+        record_retry(filing, state, str(e), timings, unknown_fin=getattr(e, "fin", None))
         return
     except Exception as e:
         record_retry(filing, state, "", timings, error=e)
