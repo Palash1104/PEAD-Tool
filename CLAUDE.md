@@ -173,12 +173,17 @@ Growth is `_pct(curr, prev) = (curr - prev) / abs(prev) * 100`. `band_score` awa
 - **Dashboard quarter selector** (the grouping lives in `dashboard.py`, where `test_pead.py` covers it):
   - `read_all_results()` merges `archive/*/pead_results.csv` and `pead_results.csv` (archives first). Each row is tagged with `_quarter`, `_quarter_from` and `_source`.
   - `row_quarter()` takes the quarter column (incl. `UNKNOWN`), else `period_end`, else the timestamp via the filing-date mapping. `quarter_label` / `reporting_quarter` mirror `pead_tool.py`, and a test checks they match.
-  - The `archive/q1fy27` run is mostly Apr–Jun filings (Q4FY26: 165 scored results). Only a few rows are Q1FY27.
+  - `archive/pre-q2fy27` (renamed from `archive/q1fy27` on 2026-10-05; any folder name works) is mostly March-quarter results reported Apr–Jun: Q4FY26 has 165 scored results. Only a few rows are Q1FY27.
   - Rows scoring above 50 come from the old 100-point scale. They are dropped and counted per quarter (`hidden_old_scale`); the count line says "N rows from the old scoring scale hidden".
-  - `group_quarters()` builds the dropdown options: newest first, "Quarter unknown" last, and the current quarter (`SCORE_FROM_QUARTER`, sent as `current_quarter`) always present. Labels read "Q2 FY27 · Jul–Sep 2026 (12 results)", where the count is non-empty scored rows.
+  - `group_quarters()` builds the dropdown options: newest first, "Quarter unknown" last, and the current quarter (`SCORE_FROM_QUARTER`, sent as `current_quarter`) always present. Labels give the period covered and when it was reported (`reported_window`, the three months after quarter end), e.g. "Q4 FY26 · Jan–Mar 2026 quarter · reported Apr–Jun 2026 (165)". The count is non-empty scored rows.
   - The selected quarter filters the KPIs (results, alerts, average), skyline, detail panel, distribution and table.
-  - Unfiltered parts are marked `live`: status lights, Exchange → alert, Awaiting retry, Filings handled, the timing chart and the log.
-  - A past quarter shows a "Past quarter" tag, disables Today / 7 days / 30 days and resets the range to All.
+  - **Current-quarter view** (selection = `SCORE_FROM_QUARTER`): a green "Current quarter" tag, plus the live parts, each tagged `live`: Exchange → alert, Awaiting retry, Filings handled, the timing chart and the scanner log.
+  - **Past-quarter view** (`body.past-view`):
+    - An amber "Past quarter" tag (or "Quarter unknown" / "Later quarter").
+    - No `live` tags; the timing chart and log are hidden, and the distribution goes full width.
+    - The three live tiles are replaced by `.past-only` tiles: Highest score (with company), Turnarounds (prior-year PAT < 0, current > 0; names in the tooltip) and Reporting window (first to last result, by when the scanner logged it, since the CSV has no filing date).
+    - Today / 7 days / 30 days are disabled and the range resets to All.
+  - The Scanner/BSE/NSE pills show in every view. Switching back to the current quarter redraws the timing chart and log.
   - The choice is kept in the URL (`?quarter=Q1FY27`, removed for the current quarter); an unknown value falls back to the current quarter.
   - There is no Quarter column in the table. The detail panel shows the quarter, the quarter-end date (or "quarter from filing date") and the basis.
   - `alerted(r)` is score ≥ threshold and quarter not UNKNOWN. It drives "Alerts sent", "Alerts only", ▲, the badge and the skyline colours.
@@ -186,7 +191,7 @@ Growth is `_pct(curr, prev) = (curr - prev) / abs(prev) * 100`. `band_score` awa
 - **`/filing` in dashboard.py**: BSE moves result PDFs from `AttachLive` to `AttachHis` after a few months. Checked 2026-09-26: May filings 404 on AttachLive and load from AttachHis, mid-August ones are in both, and today's are only on AttachLive.
   - `resolve_filing()` checks AttachLive, then AttachHis, by fetching the first 8 bytes and looking for `%PDF`. It redirects (302) to the first one that works, else to the company page.
   - Results are cached for 6h. NSE archive links pass through unchecked. Any other URL is never fetched.
-- **Data reset 2026-09-26**: the Q1FY27 run (results CSV, seen, processed, log) was moved to `archive/q1fy27/`, which is gitignored. `pead_results.csv` restarted empty with the current header. `scrip_master.json` was kept.
+- **Data reset 2026-09-26**: the run before Q2FY27 (results CSV, seen, processed, log) was moved to `archive/q1fy27/`, renamed `archive/pre-q2fy27/` on 2026-10-05; `archive/` is gitignored. `pead_results.csv` restarted empty with the current header. `scrip_master.json` was kept.
 
 ## Config (top of `pead_tool.py`)
 

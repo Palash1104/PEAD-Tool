@@ -1225,6 +1225,9 @@ months = [date(y, m, d) for y in (2025, 2026, 2027) for m in range(1, 13) for d 
 check("dashboard quarter maths matches pead_tool for every month 2025–2027",
       all(dashboard.quarter_label(x) == pt.quarter_label(x) and dashboard.reporting_quarter(x) == pt.reporting_quarter(x)
           for x in months))
+for q, want in [("Q4FY26", "Apr–Jun 2026"), ("Q1FY27", "Jul–Sep 2026"), ("Q2FY27", "Oct–Dec 2026"),
+                ("Q3FY27", "Jan–Mar 2027"), ("Q4FY27", "Apr–Jun 2027"), ("UNKNOWN", "")]:
+    check(f"reported_window {q}", dashboard.reported_window(q) == want, dashboard.reported_window(q))
 for q, want in [("Q1FY27", "Q1 FY27 · Apr–Jun 2026"), ("Q2FY27", "Q2 FY27 · Jul–Sep 2026"),
                 ("Q3FY27", "Q3 FY27 · Oct–Dec 2026"), ("Q4FY26", "Q4 FY26 · Jan–Mar 2026"), ("UNKNOWN", "Quarter unknown")]:
     check(f"quarter_name {q}", dashboard.quarter_name(q) == want, dashboard.quarter_name(q))
@@ -1263,8 +1266,8 @@ with open(os.path.join(folder, dashboard.RESULTS_CSV), "w", newline="", encoding
     w.writerow(csv_row(NEW_HEADER, timestamp="2026-10-20 11:02:13", company="Live Q2", score="41.0", revenue_cq="182.4", quarter="Q2FY27"))
     w.writerow(csv_row(NEW_HEADER, timestamp="2026-10-20 12:00:00", company="Live empty", score="0.0", quarter="Q2FY27"))
     w.writerow(csv_row(NEW_HEADER, timestamp="2026-10-20 15:20:31", company="Live unknown", score="40.0", pat_cq="9", quarter="UNKNOWN"))
-os.makedirs(os.path.join(folder, "archive", "q1fy27"))
-with open(os.path.join(folder, "archive", "q1fy27", dashboard.RESULTS_CSV), "w", newline="", encoding="utf-8") as fh:
+os.makedirs(os.path.join(folder, "archive", "pre-q2fy27"))
+with open(os.path.join(folder, "archive", "pre-q2fy27", dashboard.RESULTS_CSV), "w", newline="", encoding="utf-8") as fh:
     w = csv.writer(fh)
     w.writerow(OLD_HEADER)
     w.writerow(csv_row(OLD_HEADER, timestamp="2026-05-27 23:50:45", company="GMR", score="90.0", revenue_cq="1580"))
@@ -1285,7 +1288,7 @@ with mock.patch.object(dashboard, "BASE_DIR", folder):
 rows = payload["results"]
 by_company = {r["company"]: r for r in rows}
 check("archive rows merged with the live file, archives first",
-      [r["_source"] for r in rows] == ["archive/extra"] + ["archive/q1fy27"] * 4 + ["pead_results.csv"] * 3,
+      [r["_source"] for r in rows] == ["archive/extra"] + ["archive/pre-q2fy27"] * 4 + ["pead_results.csv"] * 3,
       [r["_source"] for r in rows])
 check(">50 rows dropped from the results", "GMR" not in by_company and "Superior" not in by_company
       and "Photon" in by_company, sorted(by_company))
@@ -1296,15 +1299,17 @@ check("old-row quarters: filing-date mapping and period_end",
 options = payload["quarters"]
 check("quarters newest first, the unknown group last",
       [o["value"] for o in options] == ["Q2FY27", "Q1FY27", "Q4FY26", "UNKNOWN"], [o["value"] for o in options])
-check("quarter labels count scored results (empty extractions and >50 rows excluded)",
-      [o["label"] for o in options] == ["Q2 FY27 · Jul–Sep 2026 (1 result)", "Q1 FY27 · Apr–Jun 2026 (3 results)",
-                                        "Q4 FY26 · Jan–Mar 2026 (2 results)", "Quarter unknown (1 result)"], [o["label"] for o in options])
+check("labels: period covered, when reported, scored results (empty and >50 rows excluded)",
+      [o["label"] for o in options] == ["Q2 FY27 · Jul–Sep 2026 quarter · reported Oct–Dec 2026 (1)",
+                                        "Q1 FY27 · Apr–Jun 2026 quarter · reported Jul–Sep 2026 (3)",
+                                        "Q4 FY26 · Jan–Mar 2026 quarter · reported Apr–Jun 2026 (2)",
+                                        "Quarter unknown (1)"], [o["label"] for o in options])
 check("old-scale rows counted per quarter",
       {o["value"]: o["hidden_old_scale"] for o in options} == {"Q2FY27": 0, "Q1FY27": 0, "Q4FY26": 2, "UNKNOWN": 0})
 check("current quarter flagged", [o["value"] for o in options if o["current"]] == ["Q2FY27"])
 check("the current quarter is offered even with no rows",
       [o["value"] for o in dashboard.group_quarters([], {}, "Q2FY27")] == ["Q2FY27"]
-      and dashboard.group_quarters([], {}, "Q2FY27")[0]["label"] == "Q2 FY27 · Jul–Sep 2026 (0 results)")
+      and dashboard.group_quarters([], {}, "Q2FY27")[0]["label"] == "Q2 FY27 · Jul–Sep 2026 quarter · reported Oct–Dec 2026 (0)")
 
 # ─────────────────────────────────────────────────────────────
 section("dashboard log parser")

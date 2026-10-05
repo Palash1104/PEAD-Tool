@@ -163,6 +163,25 @@ def quarter_name(q: str) -> str:
     return f"Q{n} FY{fy:02d} · {QUARTER_MONTHS[n - 1]} {year}"
 
 
+def reported_window(q: str) -> str:
+    """When a quarter's results are filed: the three months after it ends,
+    e.g. Q4FY26 (Jan–Mar 2026) → "Apr–Jun 2026"."""
+    m = QUARTER_RE.match(q or "")
+    if not m:
+        return ""
+    n, fy = int(m.group(1)), int(m.group(2))
+    nxt, nfy = (1, fy + 1) if n == 4 else (n + 1, fy)
+    year = 2000 + nfy - (0 if nxt == 4 else 1)
+    return f"{QUARTER_MONTHS[nxt - 1]} {year}"
+
+
+def quarter_option_label(q: str, n: int) -> str:
+    """"Q4 FY26 · Jan–Mar 2026 quarter · reported Apr–Jun 2026 (165)"."""
+    if not QUARTER_RE.match(q or ""):
+        return f"Quarter unknown ({n})"
+    return f"{quarter_name(q)} quarter · reported {reported_window(q)} ({n})"
+
+
 def _date(text):
     try:
         return datetime.strptime((text or "").strip()[:10], "%Y-%m-%d").date()
@@ -258,7 +277,8 @@ def group_quarters(rows: list, hidden: dict, current: str) -> list:
         options.append({
             "value": q,
             "name": quarter_name(q),
-            "label": f"{quarter_name(q)} ({n} result{'' if n == 1 else 's'})",
+            "label": quarter_option_label(q, n),
+            "reported": reported_window(q),
             "count": n,
             "hidden_old_scale": hidden.get(q, 0),
             "current": q == current,

@@ -250,9 +250,15 @@ table.results tbody tr.sel { background: color-mix(in srgb, var(--accent) 12%, t
   border-radius: 9px; padding: 6px 10px; font: inherit; font-size: 13px; font-weight: 600;
 }
 .qtag { display: inline-block; font-size: 12px; padding: 1px 7px; border-radius: 999px; border: 1px solid transparent; white-space: nowrap; }
-.qtag.off, .past-tag { color: var(--warn); border: 1px solid color-mix(in srgb, var(--warn) 55%, var(--border)); background: color-mix(in srgb, var(--warn) 12%, transparent); font-weight: 600; }
-.past-tag { font-size: 12px; padding: 3px 9px; border-radius: 999px; white-space: nowrap; }
-.past-tag[hidden] { display: none; }
+.qtag.off, .qstate-tag.past { color: var(--warn); border: 1px solid color-mix(in srgb, var(--warn) 55%, var(--border)); background: color-mix(in srgb, var(--warn) 12%, transparent); font-weight: 600; }
+.qstate-tag.current { color: var(--good); border: 1px solid color-mix(in srgb, var(--good) 55%, var(--border)); background: color-mix(in srgb, var(--good) 12%, transparent); font-weight: 600; }
+.qstate-tag { font-size: 12px; padding: 3px 9px; border-radius: 999px; white-space: nowrap; }
+.qstate-tag[hidden] { display: none; }
+/* Past-quarter view: no live tags, timing chart or log; past tiles replace the live ones */
+body:not(.past-view) .past-only { display: none !important; }
+.past-view .live-only, .past-view .live { display: none !important; }
+.past-view .grid-two { grid-template-columns: minmax(0, 1fr); }
+.tile .hint.clip { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .seg button:disabled { opacity: .4; cursor: not-allowed; }
 /* "live": not filtered by the selected quarter */
 .live { display: inline-block; font-size: 10px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase;
@@ -313,7 +319,7 @@ table.results tbody tr.sel { background: color-mix(in srgb, var(--accent) 12%, t
     <div class="quarter-pick">
       <label for="f-quarter">Quarter</label>
       <select id="f-quarter" aria-label="Quarter"><option>Loading…</option></select>
-      <span class="past-tag" id="q-past" hidden>Past quarter</span>
+      <span class="qstate-tag" id="q-state" hidden></span>
     </div>
     <div class="status-row">
       <span class="live" title="Status lights are live, not filtered by quarter">live</span>
@@ -352,9 +358,12 @@ table.results tbody tr.sel { background: color-mix(in srgb, var(--accent) 12%, t
     <div class="tile"><div class="label">Results scored</div><div class="value" id="k-scored">–</div><div class="hint" id="k-scored-h">in current filter</div></div>
     <div class="tile"><div class="label">Alerts sent</div><div class="value" id="k-alerts">–</div><div class="hint" id="k-alerts-h">score ≥ threshold</div></div>
     <div class="tile"><div class="label">Average score</div><div class="value" id="k-avg">–</div><div class="hint">out of 50</div></div>
-    <div class="tile"><div class="label">Exchange → alert<span class="live" title="From the scanner log, not filtered by quarter">live</span></div><div class="value" id="k-delay">–</div><div class="hint" id="k-delay-h">median, from log</div></div>
-    <div class="tile"><div class="label">Awaiting retry<span class="live" title="Not filtered by quarter">live</span></div><div class="value" id="k-retry">–</div><div class="hint" id="k-retry-h">failed extractions</div></div>
-    <div class="tile"><div class="label">Filings handled<span class="live" title="Not filtered by quarter">live</span></div><div class="value" id="k-seen">–</div><div class="hint" id="k-seen-h">in seen.json</div></div>
+    <div class="tile live-only"><div class="label">Exchange → alert<span class="live" title="From the scanner log, not filtered by quarter">live</span></div><div class="value" id="k-delay">–</div><div class="hint" id="k-delay-h">median, from log</div></div>
+    <div class="tile past-only"><div class="label">Highest score</div><div class="value" id="k-top">–</div><div class="hint clip" id="k-top-h">–</div></div>
+    <div class="tile live-only"><div class="label">Awaiting retry<span class="live" title="Not filtered by quarter">live</span></div><div class="value" id="k-retry">–</div><div class="hint" id="k-retry-h">failed extractions</div></div>
+    <div class="tile past-only"><div class="label">Turnarounds</div><div class="value" id="k-turn">–</div><div class="hint clip" id="k-turn-h">prior-year PAT loss → profit</div></div>
+    <div class="tile live-only"><div class="label">Filings handled<span class="live" title="Not filtered by quarter">live</span></div><div class="value" id="k-seen">–</div><div class="hint" id="k-seen-h">in seen.json</div></div>
+    <div class="tile past-only"><div class="label">Reporting window</div><div class="value" id="k-window">–</div><div class="hint clip" id="k-window-h">first to last result</div></div>
   </section>
 
   <section class="grid-hero">
@@ -405,7 +414,7 @@ table.results tbody tr.sel { background: color-mix(in srgb, var(--accent) 12%, t
       </div>
       <div class="chart-box" id="hist"></div>
     </div>
-    <div class="card">
+    <div class="card live-only">
       <div class="card-head">
         <div>
           <h2>Where the time goes<span class="live" title="From the scanner log, not filtered by quarter">live</span></h2>
@@ -443,7 +452,7 @@ table.results tbody tr.sel { background: color-mix(in srgb, var(--accent) 12%, t
     <div class="more"><button class="icon" id="more-btn" style="display:none">Show more</button></div>
   </section>
 
-  <section class="card">
+  <section class="card live-only">
     <div class="card-head">
       <div>
         <h2>Scanner log<span class="live" title="Not filtered by quarter">live</span></h2>
@@ -685,6 +694,33 @@ function applyFilters() {
 }
 
 /* ─────────────── KPIs ─────────────── */
+// Shown instead of the live tiles when a past quarter is selected
+function renderPastTiles(list) {
+  const top = list.reduce((best, r) => (!best || r.score > best.score ? r : best), null);
+  $("k-top").textContent = top ? fmtScore(top.score) : "–";
+  $("k-top-h").textContent = top ? top.company : "no results";
+  $("k-top-h").title = top ? top.company : "";
+
+  const turns = list.filter((r) => r.patLy != null && r.patLy < 0 && r.patCq != null && r.patCq > 0)
+    .sort((a, b) => b.score - a.score);
+  $("k-turn").textContent = turns.length.toLocaleString("en-IN");
+  $("k-turn-h").textContent = "prior-year PAT loss → profit";
+  $("k-turn-h").title = turns.map((r) => `${r.company} (${fmtScore(r.score)})`).join("\n");
+
+  const times = list.map((r) => r.ts).filter(Boolean).sort((a, b) => a - b);
+  if (!times.length) {
+    $("k-window").textContent = "–";
+    $("k-window-h").textContent = "no results";
+    return;
+  }
+  const first = times[0], last = times[times.length - 1];
+  const sameYear = first.getFullYear() === last.getFullYear();
+  const fmt = (d, withYear) => d.toLocaleDateString("en-IN", withYear ? { day: "numeric", month: "short", year: "numeric" } : { day: "numeric", month: "short" });
+  const days = Math.round((new Date(last.toDateString()) - new Date(first.toDateString())) / 86400000) + 1;
+  $("k-window").textContent = first.toDateString() === last.toDateString() ? fmt(first, false) : `${fmt(first, !sameYear)} – ${fmt(last, !sameYear)}`;
+  $("k-window-h").textContent = `${sameYear ? first.getFullYear() + " · " : ""}${days} day${days === 1 ? "" : "s"} · by time scanned`;
+  $("k-window-h").title = "First to last result in this quarter, by when the scanner logged it";
+}
 function renderKpis() {
   const d = S.data, list = S.filtered;
   const alerts = list.filter(alerted).length;
@@ -695,6 +731,7 @@ function renderKpis() {
   $("k-avg").textContent = avg == null ? "–" : avg.toFixed(1);
 
   const failed = S.rows.filter((r) => r.empty && r.qkey === S.quarter).length;
+  renderPastTiles(list);
   $("k-scored-h").textContent = failed ? `${failed} empty extractions hidden` : "in current filter";
 
   $("k-retry").textContent = d.retry_pending ?? 0;
@@ -1299,7 +1336,7 @@ function renderQuarterSelect() {
     setQuarterInUrl();
   }
   const html = S.quarters.map((o) =>
-    `<option value="${esc(o.value)}">${esc(o.label)}${o.current ? " · current" : ""}</option>`
+    `<option value="${esc(o.value)}">${esc(o.label)}</option>`
   ).join("");
   if (html !== S.quarterHtml) {          // rebuild only on change, so an open dropdown isn't closed every 10s
     sel.innerHTML = html;
@@ -1316,13 +1353,19 @@ function setQuarterInUrl() {
   history.replaceState(null, "", u);
 }
 
-// A past quarter: tag it, and date ranges relative to today don't apply
+// Current quarter: green tag, live tiles, timing chart and log.
+// Any other quarter: amber tag, past-quarter tiles, no live parts, and date
+// ranges relative to today don't apply.
 function applyQuarterState() {
-  const past = !!S.quarter && S.quarter !== S.currentQuarter;
-  const tag = $("q-past");
-  tag.hidden = !past;
+  const past = !!S.quarter && !!S.currentQuarter && S.quarter !== S.currentQuarter;
+  document.body.classList.toggle("past-view", past);
+  const tag = $("q-state");
+  tag.hidden = !S.quarter || !S.currentQuarter;
   const qi = quarterIndex(S.quarter), ci = quarterIndex(S.currentQuarter);
-  tag.textContent = S.quarter === "UNKNOWN" ? "Quarter unknown" : (qi != null && ci != null && qi > ci ? "Later quarter" : "Past quarter");
+  tag.className = "qstate-tag " + (past ? "past" : "current");
+  tag.textContent = !past ? "Current quarter"
+    : S.quarter === "UNKNOWN" ? "Quarter unknown"
+    : (qi != null && ci != null && qi > ci ? "Later quarter" : "Past quarter");
   const range = $("f-range");
   range.querySelectorAll("button").forEach((b) => { b.disabled = past && b.dataset.v !== "0"; });
   if (past && S.f.days !== 0) {
@@ -1337,6 +1380,8 @@ $("f-quarter").addEventListener("change", (e) => {
   applyQuarterState();
   S.selectedId = null;
   refilter();
+  // Back in the current view: the timing chart and log were hidden, so redraw at full size
+  if (!document.body.classList.contains("past-view")) { renderTiming(); renderLog(); }
 });
 
 function refilter() {
