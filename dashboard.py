@@ -45,11 +45,13 @@ SEEN_FILE      = "seen.json"
 PROCESSED_FILE = "processed_scrips.json"
 RETRY_FILE     = "retry_counts.json"
 LOG_FILE       = "pead_tool.log"
+TERMINAL_LOG_FILE = "pead_terminal.log"    # copy of the scanner's terminal
 TOOL_FILE      = "pead_tool.py"
 HTML_FILE      = "dashboard.html"
 
 LOG_TAIL_BYTES    = 1_500_000   # only the end of a big log is read
-LOG_LINES_SHOWN   = 60
+LOG_LINES_SHOWN   = 100
+TERMINAL_TAIL_BYTES = 200_000   # plenty for LOG_LINES_SHOWN terminal lines
 DEFAULT_THRESHOLD = 35.0
 
 
@@ -311,28 +313,49 @@ def duration_to_seconds(text: str):
     return sum(int(v) * {"h": 3600, "m": 60, "s": 1}[u] for v, u in parts)
 
 
+def read_tail(path: str, tail_bytes: int) -> str:
+    """The last tail_bytes of a text log, starting at a whole line."""
+    size = os.path.getsize(path)
+    with open(path, "rb") as f:
+        head = f.read(2)
+        utf16 = head in (b"\xff\xfe", b"\xfe\xff")  # PowerShell Tee-Object writes UTF-16
+        start = max(0, size - tail_bytes)
+        if utf16:
+            start = max(2, start - (start % 2))
+        f.seek(start)
+        raw = f.read()
+    if utf16:
+        enc = "utf-16-le" if head == b"\xff\xfe" else "utf-16-be"
+        text = raw.decode(enc, errors="replace")
+    else:
+        text = raw.decode("utf-8", errors="replace")
+    if start > 0 and "\n" in text:
+        text = text.split("\n", 1)[1]  # drop the partial first line
+    return text
+
+
+def read_terminal_lines():
+    """The scanner's terminal as pead_tool.py mirrors it to pead_terminal.log,
+    or None if this scanner version doesn't write it yet."""
+    path = _p(TERMINAL_LOG_FILE)
+    if not os.path.exists(path):
+        return None
+    try:
+        text = read_tail(path, TERMINAL_TAIL_BYTES)
+    except Exception:
+        return None
+    return [ln.rstrip("\r") for ln in text.split("\n") if ln.strip()][-LOG_LINES_SHOWN:]
+
+
 def read_log():
+    """Live status, timings and exchange health from pead_tool.log; the
+    Scanner log panel's lines from the terminal copy when there is one."""
     path = _p(LOG_FILE)
     if not os.path.exists(path):
         return {"available": False}
     try:
-        size  = os.path.getsize(path)
         mtime = os.path.getmtime(path)
-        with open(path, "rb") as f:
-            head = f.read(2)
-            utf16 = head in (b"\xff\xfe", b"\xfe\xff")  # PowerShell Tee-Object writes UTF-16
-            start = max(0, size - LOG_TAIL_BYTES)
-            if utf16:
-                start = max(2, start - (start % 2))
-            f.seek(start)
-            raw = f.read()
-        if utf16:
-            enc = "utf-16-le" if head == b"\xff\xfe" else "utf-16-be"
-            text = raw.decode(enc, errors="replace")
-        else:
-            text = raw.decode("utf-8", errors="replace")
-        if start > 0 and "\n" in text:
-            text = text.split("\n", 1)[1]  # drop the partial first line
+        text  = read_tail(path, LOG_TAIL_BYTES)
     except Exception as e:
         return {"available": False, "error": str(e)}
 
@@ -347,7 +370,8 @@ def read_log():
         status = m.group(3) if m else status      # traceback lines follow their record
         msg    = m.group(4) if m else line
 
-        # pead_tool.log carries DEBUG detail; the panel shows what the terminal shows
+        # pead_tool.log carries DEBUG detail; without the terminal copy the
+        # panel falls back to these lines minus DEBUG
         if status == "DEBUG":
             continue
         shown.append(line)
@@ -366,6 +390,7 @@ def read_log():
             if d:
                 entry["kind"]  = d.group(1)
                 entry["delay"] = duration_to_seconds(d.group(2))
+                entry["catchup"] = "catch-up" in msg      # published before the scanner started
             timings.append(entry)
 
         for f in FETCH_RE.finditer(msg):
@@ -381,11 +406,14 @@ def read_log():
         if q:
             queue = int(q.group(1))
 
+    terminal = read_terminal_lines()
+
     return {
         "available": True,
         "mtime": mtime,
         "age_sec": max(0.0, time.time() - mtime),
-        "lines": shown[-LOG_LINES_SHOWN:],
+        "lines": terminal if terminal is not None else shown[-LOG_LINES_SHOWN:],
+        "lines_source": "terminal" if terminal is not None else "log",
         "timings": timings[-200:],
         "exchanges": exchanges,
         "checker_queue": queue,

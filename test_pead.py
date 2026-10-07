@@ -6,6 +6,7 @@ Offline tests for pead_tool.py — no network, no real Telegram / AICredits.
 Network, the model and Telegram are mocked; state files go to a temp folder.
 The PDF tests use the real pdfplumber, Poppler and Tesseract (~30s of OCR).
 """
+import base64
 import calendar
 import csv
 import io
@@ -50,6 +51,7 @@ def fresh_state_dir():
     pt.RESULTS_CSV = os.path.join(d, "results.csv")
     pt.RETRIES_FILE = os.path.join(d, "retries.json")
     pt.SCRIP_MASTER_FILE = os.path.join(d, "master.json")
+    pt.CHECKPOINT_FILE = os.path.join(d, "checkpoint.json")
     pt._last_blocked_alert.clear()
     return d
 
@@ -590,8 +592,8 @@ with mock.patch.object(pt.requests, "post", side_effect=pt.requests.ConnectionEr
 # ─────────────────────────────────────────────────────────────
 section("CSV")
 
-NEW_COLUMNS = ["exchange", "filing_url", "period_end", "quarter", "basis", "unit"]
-check("CSV header ends with the added columns", pt.CSV_HEADER[-6:] == NEW_COLUMNS, pt.CSV_HEADER)
+NEW_COLUMNS = ["exchange", "filing_url", "period_end", "quarter", "basis", "unit", "check"]
+check("CSV header ends with the added columns", pt.CSV_HEADER[-7:] == NEW_COLUMNS, pt.CSV_HEADER)
 
 d = fresh_state_dir()
 with open(pt.RESULTS_CSV, "w", newline="", encoding="utf-8") as fh:
@@ -601,10 +603,10 @@ with open(pt.RESULTS_CSV, "w", newline="", encoding="utf-8") as fh:
 pt.initialize_csv()
 pt.save_result_csv(nse_filing, 40.0, mk(period_end="2026-09-30", basis="consolidated", **GOOD), "Q2FY27")
 rows = list(csv.reader(open(pt.RESULTS_CSV, encoding="utf-8")))
-check("pre-NSE CSV gains all six added columns",
-      rows[0][-6:] == NEW_COLUMNS and rows[1][-6:] == ["BSE", "", "", "", "", ""], rows[1])
-check("new row records exchange, filing link, period_end, quarter, basis, unit",
-      rows[2][-6:] == ["NSE", nse_filing["attachment_url"], "2026-09-30", "Q2FY27", "consolidated", "crores"]
+check("pre-NSE CSV gains all seven added columns",
+      rows[0][-7:] == NEW_COLUMNS and rows[1][-7:] == ["BSE", "", "", "", "", "", ""], rows[1])
+check("new row records exchange, filing link, period_end, quarter, basis, unit, blank check",
+      rows[2][-7:] == ["NSE", nse_filing["attachment_url"], "2026-09-30", "Q2FY27", "consolidated", "crores", ""]
       and len(rows[2]) == len(pt.CSV_HEADER), rows[2])
 pt.initialize_csv()
 check("migration is idempotent", list(csv.reader(open(pt.RESULTS_CSV, encoding="utf-8")))[0] == pt.CSV_HEADER)
@@ -617,14 +619,26 @@ with open(pt.RESULTS_CSV, "w", newline="", encoding="utf-8") as fh:
                + ["NSE", "https://nsearchives.nseindia.com/corporate/x.pdf"])
 pt.initialize_csv()
 rows = list(csv.reader(open(pt.RESULTS_CSV, encoding="utf-8")))
-check("existing columns kept, only period_end/quarter/basis/unit added",
-      rows[0] == pt.CSV_HEADER and rows[1][-6:] == ["NSE", "https://nsearchives.nseindia.com/corporate/x.pdf", "", "", "", ""], rows)
+check("existing columns kept, only period_end/quarter/basis/unit/check added",
+      rows[0] == pt.CSV_HEADER and rows[1][-7:] == ["NSE", "https://nsearchives.nseindia.com/corporate/x.pdf", "", "", "", "", ""], rows)
+
+d = fresh_state_dir()
+with open(pt.RESULTS_CSV, "w", newline="", encoding="utf-8") as fh:
+    csv.writer(fh).writerow(pt.CSV_HEADER[:-1])            # the file as it was until 2026-10-07
+pt.initialize_csv()
+flagged = mk(period_end="2026-09-30", **GOOD)
+flagged["check"] = "this quarter: x"
+pt.save_result_csv(nse_filing, 12.0, flagged, "Q2FY27")
+rows = list(csv.reader(open(pt.RESULTS_CSV, encoding="utf-8")))
+check("check column added and written", rows[0] == pt.CSV_HEADER and rows[1][-1] == "this quarter: x", rows)
 
 # ─────────────────────────────────────────────────────────────
 section("main loop")
 
 class Stop(Exception):
     pass
+
+fetch_since = []      # (exchange, since) each run_main fetch was asked for
 
 def run_main(polls, bse=lambda known: [], nse=lambda client: [], extract=None, master=None,
              download=None, on_wait=None, argv=()):
@@ -644,8 +658,14 @@ def run_main(polls, bse=lambda known: [], nse=lambda client: [], extract=None, m
         if counter["n"] >= polls:
             raise Stop()
     alerts = []
-    with mock.patch.object(pt, "fetch_bse_filings", lambda known: (bse(known), 1)), \
-         mock.patch.object(pt, "fetch_nse_filings", nse), \
+    def fake_bse(known, since=None):
+        fetch_since.append(("BSE", since))
+        return bse(known), 1
+    def fake_nse(client, since=None):
+        fetch_since.append(("NSE", since))
+        return nse(client)
+    with mock.patch.object(pt, "fetch_bse_filings", fake_bse), \
+         mock.patch.object(pt, "fetch_nse_filings", fake_nse), \
          mock.patch.object(pt, "fetch_bse_master", lambda: dict((master or {}).get("bse", {}))), \
          mock.patch.object(pt, "fetch_nse_master", lambda client: dict((master or {}).get("nse", {}))), \
          mock.patch.object(pt, "download_pdf", download or (lambda filing, client: b"%PDF-" + filing["attachment_url"].encode())), \
@@ -663,7 +683,7 @@ ambiguous_calls = []
 
 def counting_extract(behaviour):
     calls = {}
-    def extract(pdf, ambiguous=False, timings=None):
+    def extract(pdf, ambiguous=False, timings=None, **kw):
         name = pdf.decode()[len("%PDF-"):]
         calls[name] = calls.get(name, 0) + 1
         if ambiguous:
@@ -788,7 +808,7 @@ check("intimation not printed, only counted",
 # Priority: clear results first (oldest first), ambiguous outcomes after, on the checker thread
 fresh_state_dir()
 order = []
-def ordered_extract(pdf, ambiguous=False, timings=None):
+def ordered_extract(pdf, ambiguous=False, timings=None, **kw):
     order.append((pdf.decode()[len("%PDF-"):].rsplit("/", 1)[-1], threading.current_thread().name))
     return good_fin
 amb_old = pt.normalise_bse(bse_raw("a1", 701, "Board Meeting", "2026-09-24T09:00:00", sub="Board Meeting Outcome for Meeting Held Today"))
@@ -808,7 +828,7 @@ started, release = threading.Event(), threading.Event()
 slow_amb = pt.normalise_nse(nse_raw("s50", "SLOW", "INE050A01010", "24-Sep-2026 09:00:00", desc="Outcome of Board Meeting"))
 next_clear = pt.normalise_bse(bse_raw("c50", 750, "Result", "2026-09-24T10:00:00"))
 amb_calls = []
-def slow_extract(pdf, ambiguous=False, timings=None):
+def slow_extract(pdf, ambiguous=False, timings=None, **kw):
     if ambiguous:
         amb_calls.append(1)
         started.set()
@@ -902,7 +922,7 @@ try:
     fresh_state_dir()
     recovers = pt.normalise_bse(bse_raw("u2", 822, "Result", "2026-10-20T10:00:00"))
     replies = [mk(**GOOD), mk(period_end="2026-09-30", **GOOD)]
-    def flaky_extract(pdf, ambiguous=False, timings=None):
+    def flaky_extract(pdf, ambiguous=False, timings=None, **kw):
         return replies.pop(0)
     alerts = run_main(2, bse=lambda k: [recovers], extract=flaky_extract)
     rows = list(csv.DictReader(open(pt.RESULTS_CSV, encoding="utf-8")))
@@ -910,15 +930,26 @@ try:
           [(r["scrip"], r["quarter"], r["period_end"]) for r in rows] == [("822", "Q2FY27", "2026-09-30")]
           and alerts == ["BSE:Co 822"], (rows, alerts))
 
-    # An implausible period_end is a quarter unknown too
+    # An implausibly old period_end whose column dates don't line up is a quarter unknown
     fresh_state_dir()
     stale = pt.normalise_bse(bse_raw("u3", 823, "Result", "2026-10-20T10:00:00"))
-    extract, calls = counting_extract({stale["attachment_url"]: mk(period_end="2024-09-30", **GOOD)})
+    extract, calls = counting_extract({stale["attachment_url"]: mk(period_end="2024-09-30", prev_period_end="2026-06-30",
+                                                                   ly_period_end="2025-09-30", **GOOD)})
     with LogCapture() as logs:
         alerts = run_main(1, bse=lambda k: [stale], extract=extract)
     check("implausible period_end: RETRY 'quarter unknown', no alert",
           logs.has_line("RETRY", "Co 823", "quarter unknown (period_end 2024-09-30 implausible for a filing on 2026-10-20) · retry 1/3")
           and alerts == [], logs.terminal())
+
+    # ...but with consistent column dates it's a very late filing of an old quarter: OLD, no retry
+    fresh_state_dir()
+    late = pt.normalise_bse(bse_raw("u4", 824, "Result", "2026-10-20T10:00:00"))
+    extract, calls = counting_extract({late["attachment_url"]: mk(period_end="2025-03-31", **GOOD)})
+    with LogCapture() as logs:
+        alerts = run_main(2, bse=lambda k: [late], extract=extract)
+    check("very late old result (columns line up): OLD once, not retried",
+          logs.has_line("OLD", "Co 824", "Q4FY25: old quarter, ignored") and calls == {late["attachment_url"]: 1}
+          and not logs.has_line("RETRY", "Co 824") and alerts == [] and "BSE:u4" in pt.load_seen(), logs.terminal())
 
     # Column dates that don't line up: retried, never scored, no row on giving up
     fresh_state_dir()
@@ -1025,7 +1056,7 @@ with LogCapture() as logs:
 check("failed BSE fetch logged as FAILED, not 0", logs.has("BSE: fetch FAILED (connection reset)")
       and not logs.has("BSE: 0 new"), logs.messages)
 with LogCapture() as logs:
-    run_main(2, nse=lambda c: [vague_nse], extract=lambda pdf, ambiguous=False, timings=None: None)
+    run_main(2, nse=lambda c: [vague_nse], extract=lambda pdf, ambiguous=False, timings=None, **kw: None)
 check("NSE counts only new filings on later polls",
       logs.has("NSE: 1 new announcements (fetch OK, 1 today)") and logs.has("NSE: 0 new announcements (fetch OK, 1 today)"))
 
@@ -1055,7 +1086,7 @@ def blocked(known):
 nse_ok = pt.normalise_nse(nse_raw("s9", "XYZ", "INE999A01019", "24-Sep-2026 11:00:00"))
 extract, calls = counting_extract({nse_ok["attachment_url"]: good_fin})
 warned = []
-with mock.patch.object(pt, "warn_blocked", lambda ex, detail: warned.append(ex)):
+with mock.patch.object(pt, "warn_blocked", lambda ex, detail, **kw: warned.append(ex)):
     alerts = run_main(2, bse=blocked, nse=lambda c: [nse_ok], extract=extract)
 check("blocked BSE warned each poll, NSE still processed", warned == ["BSE", "BSE"] and alerts == ["NSE:Co XYZ"], (warned, alerts))
 
@@ -1081,7 +1112,7 @@ check("checker queue logged once per poll, in the POLL summary",
       [m for m in logs.messages if "checker queue" in m])
 
 started, release = threading.Event(), threading.Event()
-def blocked_extract(pdf, ambiguous=False, timings=None):
+def blocked_extract(pdf, ambiguous=False, timings=None, **kw):
     started.set()
     release.wait(10)
     return None
@@ -1349,12 +1380,33 @@ t = parsed["timings"]
 check("three timing entries from filing lines", len(t) == 3, t)
 check("ALERT timing: stages, kind, delay, context",
       t[0] == {"time": "21:31:05", "context": "ALERT BSE ESDS Software Solution", "status": "ALERT",
-               "download": 0.5, "page_scan": 0.3, "model": 3.4, "kind": "alert", "delay": 133}, t[0])
+               "download": 0.5, "page_scan": 0.3, "model": 3.4, "kind": "alert", "delay": 133, "catchup": False}, t[0])
 check("SCORE timing with OCR and an hour-long delay",
       t[1]["ocr"] == 6.1 and t[1]["kind"] == "scored" and t[1]["delay"] == 3723 and t[1]["context"] == "SCORE NSE Purple Style Labs", t[1])
 check("NONE timing has stages but no delay", t[2]["download"] == 0.4 and "delay" not in t[2], t[2])
 check("log panel hides DEBUG lines and their tracebacks",
       not any("DEBUG" in l or "Traceback" in l or "x.py" in l for l in parsed["lines"]) and len(parsed["lines"]) == 11, parsed["lines"])
+
+check("without pead_terminal.log the panel shows the log file's lines", parsed["lines_source"] == "log")
+
+def parse_with_terminal(log_text, terminal_text):
+    folder = tempfile.mkdtemp(prefix="pead_dash_")
+    with open(os.path.join(folder, dashboard.LOG_FILE), "w", encoding="utf-8") as fh:
+        fh.write(log_text)
+    with open(os.path.join(folder, dashboard.TERMINAL_LOG_FILE), "w", encoding="utf-8") as fh:
+        fh.write(terminal_text)
+    with mock.patch.object(dashboard, "BASE_DIR", folder):
+        return dashboard.read_log()
+
+TERMINAL = "".join(f"21:{m:02d}:00  POLL   BSE 0 new  ·  NSE {m} new  ·  nothing relevant\n" for m in range(0, 59)) + \
+           "".join(f"22:{m:02d}:00  POLL   BSE 0 new  ·  NSE 0 new  ·  nothing relevant\n" for m in range(0, 59)) + \
+           "22:59:30  ALERT  BSE  ESDS Software Solution        41.0/50  Q2FY27  consolidated  Telegram sent  ·  58s after filing\n"
+parsed = parse_with_terminal(NEW_LOG, TERMINAL)
+check("with pead_terminal.log the panel shows the terminal's last lines",
+      parsed["lines_source"] == "terminal" and len(parsed["lines"]) == dashboard.LOG_LINES_SHOWN
+      and parsed["lines"][-1].startswith("22:59:30  ALERT  BSE  ESDS") and parsed["lines"][0].startswith("21:19:00  POLL"), parsed["lines"][:2])
+check("status, timings and queue still come from pead_tool.log",
+      parsed["exchanges"]["NSE"]["ok"] is False and len(parsed["timings"]) == 3 and parsed["checker_queue"] == 0)
 
 OLD_LOG = """21:30:55  ERROR  🚫 BSE BLOCKED (HTTP 403 on announcements page 1) — its announcements were NOT read this poll
 21:31:01  INFO  NSE: 919 announcements fetched
@@ -1435,10 +1487,12 @@ def text_pdf(pages):
     return out
 
 def scanned_pdf(pages):
-    try:
-        font = ImageFont.truetype("arial.ttf", 28)
-    except OSError:
-        font = ImageFont.load_default()
+    for name in ("arial.ttf", "DejaVuSans.ttf"):      # DejaVu on Linux test machines
+        try:
+            font = ImageFont.truetype(name, 28)
+            break
+        except OSError:
+            font = ImageFont.load_default()
     imgs = []
     for lines in pages:
         im = Image.new("RGB", (1654, 2339), "white")
@@ -1471,6 +1525,15 @@ class Resp:
     def __init__(self, content):
         self.choices = [type("Choice", (), {"message": Msg(content)})()]
 
+def IMG(n):
+    return f"--- PAGE {n} (scanned page image) ---"
+
+def sent_page_labels(content):
+    """Page labels in what was sent: text prompt lines, or text parts of an image message."""
+    if isinstance(content, str):
+        return [l for l in content.split("PDF TEXT:")[-1].splitlines() if l.startswith("--- PAGE")]
+    return [p["text"].splitlines()[0] for p in content if p["type"] == "text" and p["text"].startswith("--- PAGE")]
+
 sent_requests = []
 def fake_create(**kw):
     sent_requests.append(kw)
@@ -1479,28 +1542,96 @@ def fake_create(**kw):
 with mock.patch.object(pt.client.chat.completions, "create", fake_create):
     for label, pdf, expect_pages in [
         ("text PDF", text_pdf(PAGES), ["--- PAGE 4 ---", "--- PAGE 5 ---"]),
-        ("scanned PDF", scanned_pdf(PAGES), ["--- PAGE 4 ---", "--- PAGE 5 ---"]),
-        ("single-page scanned", scanned_pdf([table_lines("Standalone")]), ["--- PAGE 1 ---"]),
-        ("hybrid: text cover + scanned tables", hybrid_pdf(), ["--- PAGE 4 ---", "--- PAGE 5 ---"]),
+        ("scanned PDF → page images", scanned_pdf(PAGES), [IMG(4), IMG(5)]),
+        ("single-page scanned → page image", scanned_pdf([table_lines("Standalone")]), [IMG(1)]),
+        ("hybrid: text cover + scanned tables → page images", hybrid_pdf(), [IMG(4), IMG(5)]),
     ]:
         sent_requests.clear()
         started = time.time()
         fin = pt.extract_financials(pdf)
-        prompt = sent_requests[0]["messages"][0]["content"] if sent_requests else ""
-        pdf_text = prompt.split("PDF TEXT:")[-1]
-        sent_pages = [l for l in pdf_text.splitlines() if l.startswith("--- PAGE")]
+        content = sent_requests[0]["messages"][0]["content"] if sent_requests else ""
+        sent_pages = sent_page_labels(content)
         ok = (fin is not None and fin["revenue_from_operations"][0] == 662.58 and fin["period_end"] == "2026-06-30"
               and sent_requests[0]["max_tokens"] == 1500 and sent_requests[0]["model"] == pt.EXTRACTION_MODEL
               and sent_pages == expect_pages)
-        if len(expect_pages) == 2:
-            ok = ok and "consolidated" in pdf_text.split("--- PAGE 5")[0].lower()
+        if isinstance(content, str) and len(expect_pages) == 2:
+            ok = ok and "consolidated" in content.split("PDF TEXT:")[-1].split("--- PAGE 5")[0].lower()
+        if isinstance(content, list):      # scanned pages: real PNGs, within Claude's size limit
+            images = [p["image_url"]["url"] for p in content if p["type"] == "image_url"]
+            sizes = [Image.open(io.BytesIO(base64.b64decode(u.split(",", 1)[1]))).size for u in images]
+            ok = ok and len(images) == len(expect_pages) and all(u.startswith("data:image/png;base64,") for u in images) \
+                and all(max(sz) <= pt.IMAGE_MAX_EDGE for sz in sizes) and pt.find_result_pages(pdf)["basis"] in ("consolidated", "standalone")
         check(f"{label} ({time.time() - started:.0f}s)", ok, sent_pages)
 
     t_text, t_scan = {}, {}
     pt.extract_financials(text_pdf(PAGES), timings=t_text)
     check("timings: text PDF records page scan + model, no OCR", set(t_text) == {"scan", "model"}, t_text)
     pt.extract_financials(scanned_pdf(PAGES[:2]), timings=t_scan)
-    check("timings: scanned PDF records OCR separately", set(t_scan) == {"scan", "ocr", "model"} and t_scan["ocr"] > t_scan["scan"], t_scan)
+    check("timings: scanned PDF records OCR and image rendering separately",
+          set(t_scan) == {"scan", "ocr", "render", "model"} and t_scan["ocr"] > t_scan["scan"], t_scan)
+
+    # Locating OCR runs at the low resolution
+    dpis = []
+    real_ocr_page = pt.ocr_page
+    def spy_ocr(pdf_bytes, page_num, dpi=pt.LOCATE_OCR_DPI):
+        dpis.append(dpi)
+        return real_ocr_page(pdf_bytes, page_num, dpi)
+    with mock.patch.object(pt, "ocr_page", spy_ocr):
+        pt.extract_financials(scanned_pdf(PAGES[:2]))
+    check("locating OCR at LOCATE_OCR_DPI only", dpis and set(dpis) == {pt.LOCATE_OCR_DPI}, dpis)
+
+    # Provider refuses images → fall back to full-quality OCR text, and stop trying images
+    def refuse_images(**kw):
+        sent_requests.append(kw)
+        if isinstance(kw["messages"][0]["content"], list):
+            raise RuntimeError("Error code: 400 - messages.0.content.1.image.source.base64.media_type: image not supported")
+        return Resp(MODEL_JSON)
+    sent_requests.clear()
+    dpis.clear()
+    with mock.patch.object(pt.client.chat.completions, "create", refuse_images), \
+         mock.patch.object(pt, "ocr_page", spy_ocr), LogCapture() as logs:
+        fin = pt.extract_financials(scanned_pdf(PAGES[:2]))
+        rejected_after_first = pt._images_rejected
+        sent_requests_first = len(sent_requests)
+        sent_requests.clear()
+        pt.extract_financials(scanned_pdf(PAGES[:2]))
+    check("images refused: falls back to OCR text, figures still extracted",
+          fin is not None and fin["revenue_from_operations"][0] == 662.58 and sent_requests_first == 2
+          and pt.FALLBACK_OCR_DPI in dpis and logs.has_line("WARNING", "Provider rejected page images"), (sent_requests_first, dpis))
+    check("after a refusal, later scanned PDFs go straight to text", rejected_after_first and len(sent_requests) == 1
+          and isinstance(sent_requests[0]["messages"][0]["content"], str))
+    pt._images_rejected = False
+
+    # A transient error falls back for that filing only
+    def flaky_images(**kw):
+        sent_requests.append(kw)
+        if isinstance(kw["messages"][0]["content"], list):
+            raise RuntimeError("Request timed out")
+        return Resp(MODEL_JSON)
+    sent_requests.clear()
+    with mock.patch.object(pt.client.chat.completions, "create", flaky_images):
+        fin = pt.extract_financials(scanned_pdf(PAGES[:2]))
+    check("transient image-call error: text fallback, images stay on",
+          fin is not None and len(sent_requests) == 2 and not pt._images_rejected)
+
+    # Images can be switched off
+    sent_requests.clear()
+    with mock.patch.object(pt, "SEND_SCANS_AS_IMAGES", False):
+        fin = pt.extract_financials(scanned_pdf(PAGES[:2]))
+    check("SEND_SCANS_AS_IMAGES off: scanned pages sent as OCR text",
+          fin is not None and len(sent_requests) == 1 and isinstance(sent_requests[0]["messages"][0]["content"], str))
+
+    # raw_out carries the model's JSON even when it fails validation (no unit)
+    def no_unit(**kw):
+        return Resp('{"basis":"standalone","unit":null,"period_end":"2025-03-31","revenue_from_operations":[1,2,3]}')
+    raw = {}
+    with mock.patch.object(pt.client.chat.completions, "create", no_unit):
+        fin = pt.extract_financials(text_pdf(PAGES), raw_out=raw)
+    check("raw_out keeps period_end when the unit is missing", fin is None and raw["data"]["period_end"] == "2025-03-31")
+
+    sent_requests.clear()
+    pt.extract_financials(text_pdf(PAGES))
+    check("text PDF still sent as text, no images", isinstance(sent_requests[0]["messages"][0]["content"], str))
 
     sent_requests.clear()
     pt.extract_financials(text_pdf(PAGES), model="google/gemini-test")
@@ -1556,6 +1687,370 @@ with mock.patch.object(pt.client.chat.completions, "create", fake_create):
         check("scanned PDF with no table after OCR -> SkipFiling", False)
     except pt.SkipFiling:
         check("scanned PDF with no table after OCR -> SkipFiling", not sent_requests)
+
+# ─────────────────────────────────────────────────────────────
+section("old quarter from the headline (7 Oct 2026 live run)")
+
+SHIVOM = ("Shivom Investment & Consultancy Ltd - 539833 - Result For The Quarter & Financial Year Ended On 31.03.2025 "
+          "Financial Results of the Quarter & Financial Year ended on 31.03.2025 Financial Results")
+INDRAYANI = ("Indrayani Biotech Ltd - 526445 - Board Meeting Outcome for Board Meeting Outcome For Unaudited Standalone & "
+             "Consolidated Financial Results For The Quarter Ended 30Th June 2026 Along With Limited Review Report.")
+INDRAYANI_2 = "Results-Unaudited Standalone & Consolidated Financial Results For Quarter Ended June 30, 2026"
+TIAAN = ("Submission Of Un-Audited Financial Results Of (Tiaan Consumer Limited) For The Quarter And Half Year "
+         "Ended On September 30Th, 2026 And Along With Limited Review Report Thereon.")
+ALSTONE = "Board Meeting Outcome for Outcome Of Meeting Of Board Of Directors Held On Wednesday, 07Th October, 2026"
+
+check("dates: dd.mm.yyyy", pt.headline_period_ends(SHIVOM) == [date(2025, 3, 31)])
+check("dates: 30Th June 2026 / June 30, 2026",
+      pt.headline_period_ends(INDRAYANI) == [date(2026, 6, 30)] and pt.headline_period_ends(INDRAYANI_2) == [date(2026, 6, 30)])
+check("dates: September 30Th, 2026", pt.headline_period_ends(TIAAN) == [date(2026, 9, 30)])
+check("dates: meeting date isn't a quarter end", pt.headline_period_ends(ALSTONE) == [])
+check("dates: 30-Jun-2026, 31/12/25, 2026-09-30",
+      pt.headline_period_ends("results 30-Jun-2026") == [date(2026, 6, 30)]
+      and pt.headline_period_ends("q3 ended 31/12/25") == [date(2025, 12, 31)]
+      and pt.headline_period_ends("period 2026-09-30") == [date(2026, 9, 30)])
+check("dates: impossible dates ignored", pt.headline_period_ends("31.06.2026 and 30.02.2026") == [])
+
+with mock.patch.object(pt, "SCORE_FROM_QUARTER", "Q2FY27"):
+    check("old by headline: Shivom (FY25) and Indrayani (Q1FY27)",
+          pt.headline_old_quarter(SHIVOM) == "Q4FY25" and pt.headline_old_quarter(INDRAYANI) == "Q1FY27")
+    check("not old: Tiaan (Sep quarter), Alstone (no date)",
+          pt.headline_old_quarter(TIAAN) is None and pt.headline_old_quarter(ALSTONE) is None)
+    check("latest date wins: Q1 results approved at a 30 Sep meeting aren't skipped by headline",
+          pt.headline_old_quarter("Outcome of meeting held on 30.09.2026: results for quarter ended 30.06.2026") is None)
+
+    fresh_state_dir()
+    shivom = pt.normalise_bse(bse_raw("sh1", 539833, "Result", "2026-10-07T12:21:05", sub=SHIVOM))
+    indra = pt.normalise_bse(bse_raw("in1", 526445, "Board Meeting", "2026-10-07T17:58:18", sub=INDRAYANI))
+    fresh = pt.normalise_bse(bse_raw("ok1", 540108, "Result", "2026-10-07T19:25:17", sub=TIAAN))
+    extract, calls = counting_extract({fresh["attachment_url"]: mk(period_end="2026-09-30", **GOOD)})
+    downloads = []
+    with LogCapture() as logs:
+        run_main(1, bse=lambda k: [shivom, indra, fresh], extract=extract,
+                 download=lambda f, c: downloads.append(f["id"]) or b"%PDF-" + f["attachment_url"].encode())
+    seen = pt.load_seen()
+    check("old-by-headline filings: OLD line, not downloaded, marked seen",
+          logs.has_line("OLD", "Co 539833", "Q4FY25: old quarter per headline", "not downloaded")
+          and logs.has_line("OLD", "Co 526445", "Q1FY27: old quarter per headline")
+          and downloads == ["BSE:ok1"] and {"BSE:sh1", "BSE:in1"} <= seen, (downloads, logs.terminal()))
+    check("POLL summary counts them", logs.has_line("POLL", "2 old quarter by headline"))
+
+# ─────────────────────────────────────────────────────────────
+section("sanity check on extracted figures")
+
+def fin_with(**kw):
+    f = mk(period_end="2026-09-30", **kw)
+    return f
+
+# Tiaan Consumer and Golkonda Aluminium, 7 Oct 2026 (OCR misreads), in crores
+TIAAN_FIN = fin_with(revenue_from_operations=[88.0, 88.0522, 828.0316], total_income=[88.0, 88.0522, 828.0316],
+                     total_expenses=[828.0371, 0.9311, 828.1064], other_expenses=[828.0021, 0.9237, None],
+                     pbt=[-0.0371, -0.0377, -0.1017], pat=[-0.0371, -0.0377, -0.1017])
+GOLKONDA_FIN = fin_with(revenue_from_operations=[39.9017, None, None], total_expenses=[1399.0338, None, 0.1388],
+                        employee_expense=[0.0168, 0.0238, None], pat=[0.0288, 0.0471, -0.01848], basic_eps=[0.18, None, -0.06])
+ALSTONE_FIN = fin_with(revenue_from_operations=[784.8842, None, None], total_income=[785.0515, None, None],
+                       pbt=[-106.7225, None, None], pat=[-106.7225, None, None])
+INDRAYANI_FIN = fin_with(revenue_from_operations=[37.7055, 37.7642, 29.1037], total_income=[39.2965, 38.6481, 30.1599],
+                         total_expenses=[38.7076, 39.76, 29.9512], pbt=[0.5888, -1.1119, 0.2087], pat=[0.54, 0.976, 0.1565])
+
+check("Tiaan: income minus expenses nowhere near PBT", "this quarter" in (pt.numbers_problem(TIAAN_FIN) or ""), pt.numbers_problem(TIAAN_FIN))
+check("Golkonda: expenses 35x revenue with a profit", "PAT" in (pt.numbers_problem(GOLKONDA_FIN) or ""), pt.numbers_problem(GOLKONDA_FIN))
+check("Alstone: too few figures to judge → passes", pt.numbers_problem(ALSTONE_FIN) is None)
+check("real consistent result passes", pt.numbers_problem(INDRAYANI_FIN) is None, pt.numbers_problem(INDRAYANI_FIN))
+check("total income below revenue fails",
+      "below revenue" in (pt.numbers_problem(fin_with(revenue_from_operations=[100, 90, 80], total_income=[60, 91, 81])) or ""))
+check("expense line above total expenses fails",
+      "above total expenses" in (pt.numbers_problem(fin_with(revenue_from_operations=[100, 90, 80], total_income=[101, 91, 81],
+                                                            total_expenses=[90, 80, 70], other_expenses=[500, 1, 1], pbt=[11, 11, 11])) or ""))
+check("high-margin company with only PAT passes (tax gap allowed)",
+      pt.numbers_problem(fin_with(revenue_from_operations=[200, 150, 100], total_expenses=[100, 80, 50], pat=[70, 50, 35])) is None)
+check("exceptional item within 10% of income passes",
+      pt.numbers_problem(fin_with(revenue_from_operations=[1000, 900, 800], total_income=[1000, 900, 800],
+                                  total_expenses=[900, 820, 720], pbt=[80, 80, 80])) is None)
+
+# Flagged result: saved, never alerted, company-quarter left open for the other exchange's copy
+fresh_state_dir()
+GARBLED = dict(GOOD, total_income=[155, 125, 105], total_expenses=[500, 90, 85])
+garbled_bse = pt.normalise_bse(bse_raw("g1", 500777, "Result", "2026-10-07T10:00:00"))
+clean_nse = pt.normalise_nse(nse_raw("g2", "GARB", "INE777A01011", "07-Oct-2026 10:05:00"))
+extract, calls = counting_extract({garbled_bse["attachment_url"]: mk(period_end="2026-09-30", **GARBLED),
+                                   clean_nse["attachment_url"]: mk(period_end="2026-09-30", **GOOD)})
+with LogCapture() as logs:
+    alerts = run_main(1, bse=lambda k: [garbled_bse], nse=lambda c: [clean_nse], extract=extract,
+                      master={"bse": {"500777": "INE777A01011"}, "nse": {}})
+rows = list(csv.DictReader(open(pt.RESULTS_CSV, encoding="utf-8")))
+check("garbled copy: FLAG warning line, no alert", logs.has_line("FLAG", "Co 500777", "numbers don't add up", "no alert")
+      and any(lvl == logging.WARNING and st == "FLAG" for st, lvl, _ in logs.records), logs.terminal())
+check("garbled row saved with its check reason, clean copy alerted",
+      [(r["scrip"], bool(r["check"])) for r in rows] == [("500777", True), ("GARB", False)] and alerts == ["NSE:Co GARB"], (rows, alerts))
+check("only the clean copy closes the company-quarter",
+      set(json.load(open(pt.PROCESSED_SCRIPS_FILE))) == {"INE777A01011_Q2FY27"} and {"BSE:g1", "NSE:g2"} <= pt.load_seen())
+
+# ─────────────────────────────────────────────────────────────
+section("catch-up filings")
+
+pt.SCANNER_STARTED_AT = datetime(2026, 10, 7, 19, 51, 43)
+check("published before start → catch-up", pt.is_catch_up(datetime(2026, 10, 7, 14, 0)) and "(catch-up)" in pt.format_delay(datetime(2026, 10, 7, 14, 0)))
+check("published after start → not catch-up", not pt.is_catch_up(datetime(2026, 10, 7, 19, 52)) and not pt.is_catch_up(None))
+pt.SCANNER_STARTED_AT = None
+check("no start time (tests, compare_models) → never catch-up", not pt.is_catch_up(datetime(2020, 1, 1)))
+
+fresh_state_dir()
+old_filing = pt.normalise_bse(bse_raw("cu1", 500888, "Result", "2026-10-07T14:00:00"))
+extract, calls = counting_extract({old_filing["attachment_url"]: mk(period_end="2026-09-30", **GOOD)})
+with LogCapture() as logs:
+    run_main(1, bse=lambda k: [old_filing], extract=extract)
+check("scanner run tags a filing published before it started", logs.has_line("ALERT", "Co 500888", "(catch-up)"), logs.terminal())
+pt.SCANNER_STARTED_AT = None
+
+parsed = parse_log("""19:53:03  SCORE  BSE  Alstone Textiles (India)         0.0/50  Q2FY27  standalone  ⏱ download 1.0s · page scan 0.2s · OCR 8.9s · model 2.9s · exchange→scored 5h 53m 50s (catch-up)
+19:58:10  ALERT  NSE  Example Tech                    41.0/50  Q2FY27  consolidated  Telegram sent  ⏱ download 0.4s · page scan 0.2s · model 2.8s · exchange→alert 48s
+19:58:40  FLAG   BSE  Tiaan Consumer                   0.0/50  Q2FY27  standalone  numbers don't add up (x) · no alert  ⏱ download 1.0s · page scan 0.2s · OCR 1.2s · render 0.4s · model 3.0s · exchange→scored 31m 2s
+""")
+t = parsed["timings"]
+check("dashboard parses catch-up flag", [e.get("catchup") for e in t] == [True, False, False] and t[0]["delay"] == 5 * 3600 + 53 * 60 + 50, t)
+check("dashboard still reads stage timings around 'render'", t[2].get("ocr") == 1.2 and t[2].get("model") == 3.0, t[2])
+
+# ─────────────────────────────────────────────────────────────
+section("clean terminal view")
+
+ct = pt.console_text
+check("terminal: timing breakdown dropped",
+      ct("SCORE", "12.0/50  Q2FY27  standalone  ⏱ download 0.5s · page scan 0.3s · model 2.9s · exchange→scored 1m 4s")
+      == "12.0/50  Q2FY27  standalone")
+check("terminal: alert shows how long after the filing",
+      ct("ALERT", "41.0/50  Q2FY27  consolidated  Telegram sent  ⏱ download 0.4s · model 3.1s · exchange→alert 58s")
+      == "41.0/50  Q2FY27  consolidated  Telegram sent  ·  58s after filing")
+check("terminal: catch-up kept",
+      ct("SCORE", " 0.0/50  Q2FY27  standalone  ⏱ model 2.9s · exchange→scored 6h 46m 2s (catch-up)").endswith("(catch-up)"))
+check("terminal: old-by-title wording",
+      ct("OLD", "Q1FY27: old quarter per headline, ignored (scoring from Q2FY27) · not downloaded") == "Q1FY27 result, skipped by its title")
+check("terminal: duplicate wording", ct("SKIP", "INE0DRI01029_Q2FY27 already scored (quarter from PDF)") == "already scored this quarter")
+check("terminal: sanity-check reason left to the log file",
+      ct("FLAG", " 0.0/50  Q2FY27  standalone  numbers don't add up (this quarter: income 88.00 minus expenses 828.04 = -740.04, but PBT is -0.04) · no alert")
+      == " 0.0/50  Q2FY27  standalone  numbers don't add up · not alerted")
+
+rec = logging.LogRecord("pead_tool", logging.INFO, __file__, 1, "x", None, None)
+rec.status, rec.exchange, rec.company, rec.text = "ALERT", "NSE", "Kaveri Agro Foods Limited", "41.0/50  Q2FY27  consolidated  Telegram sent"
+plain = pt.ConsoleFormatter(False).format(rec)
+coloured = pt.ConsoleFormatter(True).format(rec)
+check("terminal line: status, exchange, short padded company", re.fullmatch(
+    r"\d\d:\d\d:\d\d  ALERT  NSE  Kaveri Agro Foods {11}  41\.0/50  Q2FY27  consolidated  Telegram sent", plain) is not None, plain)
+check("terminal colours only when enabled", "\033[" not in plain and "\033[1;32mALERT" in coloured)
+check("no colours when output is redirected", pt.console_colours_supported(io.StringIO()) is False)
+
+class TerminalCapture:
+    """What the clean terminal would print during a run (the real console handler's filter + formatter)."""
+    def __enter__(self):
+        self.buf = io.StringIO()
+        self.handler = logging.StreamHandler(self.buf)
+        self.handler.setLevel(logging.INFO)
+        self.handler.setFormatter(pt.ConsoleFormatter(False))
+        self.handler.addFilter(pt._console_visible)
+        logging.getLogger().addHandler(self.handler)
+        return self
+    def __exit__(self, *exc):
+        logging.getLogger().removeHandler(self.handler)
+    def lines(self):
+        return [l[10:] for l in self.buf.getvalue().splitlines()]      # drop "HH:MM:SS  "
+
+fresh_state_dir()
+intim = pt.normalise_bse(bse_raw("t1", 510001, "Board Meeting", "2026-10-07T10:00:00", sub="Board Meeting Intimation for results"))
+vague = pt.normalise_bse(bse_raw("t2", 510002, "Board Meeting", "2026-10-07T10:01:00", sub="Outcome of Board Meeting held today"))
+good = pt.normalise_bse(bse_raw("t3", 510003, "Result", "2026-10-07T10:02:00", sub="Unaudited Financial Results for quarter ended 30.09.2026"))
+extract, calls = counting_extract({vague["attachment_url"]: pt.SkipFiling("no results table found", status="NONE"),
+                                   good["attachment_url"]: mk(period_end="2026-09-30", **GOOD)})
+with TerminalCapture() as term:
+    run_main(2, bse=lambda k: [intim, vague, good], extract=extract)
+out = term.lines()
+check("terminal: 3-line banner, the alert, the catch-up summary, a rule, then a POLL line",
+      len(out) == 7 and out[0].startswith("PEAD scanner") and out[1].endswith("0 awaiting retry")
+      and out[2] == "Scanning from 00:00 today  ·  no earlier run to pick up from"
+      and out[3].startswith("ALERT  BSE  Co 510003")
+      and out[4].startswith("Caught up on today") and set(out[5].replace("  watching for new filings every 30s  ", "")) == {"─"}
+      and out[6].startswith("POLL "), out)
+check("banner carries the date (the terminal's times don't)", out[0].endswith(f"{datetime.now():%a %d %b %Y}"), out[0])
+check("catch-up summary counts what was skipped quietly",
+      "1 result filing" in out[4] and "1 intimation skipped" in out[4] and "1 board meeting outcome to check" in out[4], out[4])
+check("no CHECK, quiet NONE or DEBUG lines; POLL only as the short per-poll line",
+      not any(l.startswith(("CHECK", "NONE", "DEBUG")) for l in out)
+      and not any("announcements (fetch OK" in l or "checker queue" in l for l in out), out)
+
+fresh_state_dir()
+with TerminalCapture() as term:
+    run_main(4, bse=lambda k: [], extract=extract)
+polls = [l for l in term.lines() if l.startswith("POLL")]
+check("a POLL line after every poll once caught up (3 of 4 polls)", len(polls) == 3, term.lines())
+check("quiet POLL line: both exchanges and 'nothing relevant'",
+      polls and polls[-1] == "POLL   BSE 0 new  ·  NSE 0 new  ·  nothing relevant", polls)
+
+fresh_state_dir()
+fed = {"n": 0}
+def results_on_poll_2(known):
+    fed["n"] += 1
+    return [intim, good] if fed["n"] == 2 else []
+extract, calls = counting_extract({good["attachment_url"]: mk(period_end="2026-09-30", **GOOD)})
+with TerminalCapture() as term:
+    run_main(3, bse=results_on_poll_2, extract=extract)
+out = term.lines()
+poll_2 = [l for l in out if l.startswith("POLL")]
+check("POLL line counts that poll's announcements and what they were",
+      poll_2[0] == "POLL   BSE 2 new  ·  NSE 0 new  ·  1 result  ·  1 intimation skipped"
+      and poll_2[1] == "POLL   BSE 0 new  ·  NSE 0 new  ·  nothing relevant", poll_2)
+check("the alert comes before its poll's POLL line",
+      out.index(poll_2[0]) == next(i for i, l in enumerate(out) if l.startswith("ALERT")) + 1, out)
+
+line_rec = logging.LogRecord("pead_console", logging.INFO, __file__, 1, "BSE 0 new  ·  NSE 0 new  ·  nothing relevant", None, None)
+line_rec.word, line_rec.style = "POLL", "dim"
+check("POLL line coloured dim as a whole when enabled",
+      pt.ConsoleFormatter(True).format(line_rec).endswith("\033[2mPOLL \033[0m  \033[2mBSE 0 new  ·  NSE 0 new  ·  nothing relevant\033[0m"))
+check("--verbose skips the short POLL line (it shows the file's POLL lines)",
+      pt._not_poll_summary(line_rec) is False and pt._not_poll_summary(rec) is True)
+
+fresh_state_dir()
+pt.save_processed_scrips({"BSE-509084_Q4FY26"})
+with TerminalCapture() as term:
+    run_main(1)
+check("housekeeping lines (keys without ISIN) stay out of the terminal",
+      term.lines()[0].startswith("PEAD scanner") and not any("Processed keys" in l for l in term.lines()), term.lines())
+
+fresh_state_dir()
+state_calls = {"n": 0}
+def bse_down_then_up(known):
+    state_calls["n"] += 1
+    if state_calls["n"] <= 2:
+        raise RuntimeError("connection reset")
+    return []
+with TerminalCapture() as term:
+    run_main(3, bse=bse_down_then_up, extract=extract)
+down = [l for l in term.lines() if "BSE isn't answering" in l]
+check("exchange failure: said once, then once when it recovers",
+      len(down) == 1 and sum("BSE is answering again" in l for l in term.lines()) == 1
+      and not any("fetch FAILED" in l for l in term.lines()), term.lines())
+check("POLL line while an exchange is down says so",
+      "POLL   BSE not answering  ·  NSE 0 new  ·  nothing relevant" in term.lines(), term.lines())
+
+# pead_terminal.log: the same lines as the terminal, no colours
+mirror_path = os.path.join(tempfile.mkdtemp(prefix="pead_term_"), "pead_terminal.log")
+mirror = pt.setup_terminal_log(mirror_path)
+fresh_state_dir()
+try:
+    with TerminalCapture() as term:
+        run_main(2, bse=lambda k: [intim, vague, good], extract=counting_extract(
+            {vague["attachment_url"]: pt.SkipFiling("no results table found", status="NONE"),
+             good["attachment_url"]: mk(period_end="2026-09-30", **GOOD)})[0])
+        pt.log.debug("debug detail")
+        pt.log.warning("per-filing warning", extra=pt.QUIET)
+    mirror.flush()
+finally:
+    logging.getLogger().removeHandler(mirror)
+    mirror.close()
+mirrored = open(mirror_path, encoding="utf-8").read().splitlines()
+check("pead_terminal.log has exactly the terminal's lines",
+      [l[10:] for l in mirrored] == term.lines() and len(mirrored) == 7, (mirrored, term.lines()))
+check("pead_terminal.log: no colours, no DEBUG, no file-only lines",
+      not any("\033[" in l or "debug detail" in l or "per-filing warning" in l for l in mirrored))
+check("pead_terminal.log rotates at 1 MB with 2 backups, UTF-8, next to the script",
+      mirror.maxBytes == 1024 * 1024 and mirror.backupCount == 2 and mirror.encoding == "utf-8"
+      and pt.TERMINAL_LOG_FILE == os.path.join(os.path.dirname(os.path.abspath(pt.__file__)), "pead_terminal.log"))
+
+fresh_state_dir()
+with LogCapture() as logs:
+    run_main(1, bse=lambda k: [intim, vague, good], extract=extract)
+check("log file still gets POLL and CHECK lines (dashboard parses them)",
+      logs.has_line("POLL", "BSE: 3 new announcements") and logs.has_line("CHECK", "Co 510002"))
+
+# ─────────────────────────────────────────────────────────────
+section("resume from where the last run stopped")
+
+from datetime import timedelta
+today = date.today()
+yesterday = today - timedelta(days=1)
+
+def state_with(marks):
+    st = pt.ScannerState.__new__(pt.ScannerState)
+    st.checkpoint = marks
+    return st
+check("no checkpoint → today only", state_with({}).resume_from("BSE") is None)
+check("read earlier today → today only", state_with({"BSE": datetime.combine(today, datetime.min.time())}).resume_from("BSE") is None)
+night = datetime.combine(yesterday, datetime.min.time()).replace(hour=21)
+check("stopped at 9 pm yesterday → reads from yesterday", state_with({"BSE": night}).resume_from("BSE") == yesterday)
+check("stopped 20 days ago → reads the last 7 days only",
+      state_with({"NSE": night - timedelta(days=19)}).resume_from("NSE") == today - timedelta(days=pt.MAX_RESUME_DAYS))
+check("resume point shown in the terminal", state_with({"BSE": night, "NSE": night + timedelta(minutes=1)}).resumed_since() == night)
+noon = datetime.combine(today, datetime.min.time()).replace(hour=12, minute=5)
+check("same-day restart: scanning from the last scan, not midnight", state_with({"BSE": noon, "NSE": noon}).resumed_since() == noon)
+check("no checkpoint: no resume point", state_with({}).resumed_since() is None and state_with({}).last_stop() is None)
+check("stopped 20 days ago: scanning from 7 days back, last scan still known",
+      state_with({"BSE": night - timedelta(days=19)}).resumed_since()
+      == datetime.combine(today - timedelta(days=pt.MAX_RESUME_DAYS), datetime.min.time())
+      and state_with({"BSE": night - timedelta(days=19)}).last_stop() == night - timedelta(days=19))
+ref = datetime(2026, 10, 7, 16, 0)
+check("times in words",
+      pt.when_text(datetime(2026, 10, 7, 9, 5), ref) == "09:05 today"
+      and pt.when_text(datetime(2026, 10, 6, 21, 0), ref) == "21:00 yesterday"
+      and pt.when_text(datetime(2026, 10, 5, 21, 0), ref) == "21:00 on Mon 05 Oct")
+
+urls = []
+def record_bse(url, headers=None, timeout=None):
+    urls.append(url)
+    return FakeResponse(200, {"Table": []})
+with mock.patch.object(pt.requests, "get", record_bse):
+    pt.fetch_bse_filings(set(), since=yesterday)
+    pt.fetch_bse_filings(set())
+check("BSE asks for the date range",
+      f"strPrevDate={yesterday:%Y%m%d}" in urls[0] and f"strToDate={today:%Y%m%d}" in urls[0]
+      and f"strPrevDate={today:%Y%m%d}" in urls[1], urls)
+urls.clear()
+class RecordingNse:
+    def get(self, url, timeout=15):
+        urls.append(url)
+        return FakeResponse(200, [])
+pt.fetch_nse_filings(RecordingNse(), since=yesterday)
+check("NSE asks for the date range",
+      f"from_date={yesterday:%d-%m-%Y}" in urls[0] and f"to_date={today:%d-%m-%Y}" in urls[0], urls)
+
+fresh_state_dir()
+pt.save_checkpoint({"BSE": night, "NSE": night})
+fetch_since.clear()
+late = pt.normalise_bse(bse_raw("r1", 520001, "Result", (night + timedelta(minutes=30)).isoformat()))
+extract, calls = counting_extract({late["attachment_url"]: mk(period_end="2026-09-30", **GOOD)})
+with TerminalCapture() as term:
+    alerts = run_main(2, bse=lambda k: [late], extract=extract)
+marks = pt.load_checkpoint()
+check("restart reads both exchanges from where it stopped", fetch_since[:2] == [("BSE", yesterday), ("NSE", yesterday)], fetch_since)
+check("a filing from after last night's stop is processed", alerts == ["BSE:Co 520001"], alerts)
+check("checkpoint moves to this run, so the next poll is today only",
+      all(m.date() == today for m in marks.values()) and fetch_since[2:] == [("BSE", None), ("NSE", None)], (marks, fetch_since))
+check("header says where it's scanning from",
+      term.lines()[2] == "Scanning from 21:00 yesterday  ·  where the last scan stopped"
+      and any(l.startswith("Caught up since 21:00 yesterday  ·  1 BSE + 0 NSE announcements") for l in term.lines()), term.lines())
+
+fresh_state_dir()
+pt.save_checkpoint({"BSE": noon, "NSE": noon + timedelta(minutes=1)})
+with TerminalCapture() as term:
+    run_main(1, extract=extract)
+check("same-day restart: header shows the last scan's time",
+      term.lines()[2] == "Scanning from 12:05 today  ·  where the last scan stopped"
+      and term.lines()[3].startswith("Caught up since 12:05 today"), term.lines())
+
+fresh_state_dir()
+pt.save_checkpoint({"BSE": night - timedelta(days=19), "NSE": night - timedelta(days=19)})
+with TerminalCapture() as term:
+    run_main(1, extract=extract)
+capped = today - timedelta(days=pt.MAX_RESUME_DAYS)
+check("long gap: header says the catch-up is capped",
+      term.lines()[2] == f"Scanning from 00:00 on {capped:%a %d %b}  ·  last scan was 21:00 on "
+                         f"{yesterday - timedelta(days=19):%a %d %b}, catch-up goes back 7 days at most", term.lines())
+
+fresh_state_dir()
+pt.save_checkpoint({"BSE": night, "NSE": night})
+def bse_fails(known):
+    raise RuntimeError("down")
+run_main(1, bse=bse_fails, extract=extract)
+marks = pt.load_checkpoint()
+check("a failed exchange keeps its old checkpoint (read again next time)",
+      marks["BSE"] == night and marks["NSE"].date() == today, marks)
 
 # ─────────────────────────────────────────────────────────────
 section("compare_models.py")

@@ -276,6 +276,7 @@ body:not(.past-view) .past-only { display: none !important; }
   font-size: 11.5px; line-height: 1.55; color: var(--text-secondary); white-space: pre-wrap; word-break: break-word;
 }
 .log .w { color: var(--warn); } .log .e { color: var(--bad); } .log .a { color: var(--good); font-weight: 600; }
+.log .s { color: var(--accent); } .log .b { color: var(--text-primary); font-weight: 600; } .log .d { color: var(--text-muted); }
 
 /* Tooltip */
 .tip {
@@ -456,7 +457,7 @@ body:not(.past-view) .past-only { display: none !important; }
     <div class="card-head">
       <div>
         <h2>Scanner log<span class="live" title="Not filtered by quarter">live</span></h2>
-        <div class="desc" id="log-desc">Last lines of pead_tool.log</div>
+        <div class="desc" id="log-desc">What the scanner's terminal shows</div>
       </div>
     </div>
     <div class="log mono" id="log"></div>
@@ -553,9 +554,10 @@ function quarterIndex(q) {
   return m ? Number(m[2]) * 4 + Number(m[1]) : null;
 }
 
-// Rows saved with quarter UNKNOWN were never alerted, whatever their score
+// Rows saved with quarter UNKNOWN, or whose figures failed the sanity
+// check, were never alerted, whatever their score
 function alerted(r) {
-  return r.score >= S.threshold && r.quarter !== "UNKNOWN";
+  return r.score >= S.threshold && r.quarter !== "UNKNOWN" && !r.check;
 }
 
 function quarterOption(q) {
@@ -605,6 +607,7 @@ function normalise(raw, i) {
     periodEnd: (g("period_end") || "").trim(),
     basis: (g("basis") || "").trim(),
     unit: (g("unit") || "").trim(),
+    check: (g("check") || "").trim(),            // why the figures failed the sanity check, if they did
     qkey: raw._quarter || "UNKNOWN",             // the quarter dashboard.py assigned
     quarterFrom: raw._quarter_from || "",
     source: raw._source || "",
@@ -740,12 +743,17 @@ function renderKpis() {
   $("k-seen-h").textContent = `${(d.processed || []).length} company-quarters scored`;
 
   const log = d.log || {};
-  const delays = (log.timings || []).filter((t) => t.kind === "alert" && t.delay != null).map((t) => t.delay);
-  const all = (log.timings || []).filter((t) => t.delay != null).map((t) => t.delay);
+  // Catch-up filings (published before the scanner started) measure downtime, not speed
+  const timed = (log.timings || []).filter((t) => t.delay != null);
+  const live = timed.filter((t) => !t.catchup);
+  const caughtUp = timed.length - live.length;
+  const delays = live.filter((t) => t.kind === "alert").map((t) => t.delay);
+  const all = live.map((t) => t.delay);
   const use = delays.length ? delays : all;
   $("k-delay").textContent = use.length ? fmtDur(median(use)) : "–";
   $("k-delay-h").textContent = use.length
-    ? `median of ${use.length}${delays.length ? " alerts" : " filings"} · p90 ${fmtDur(quantile(use, 0.9))}`
+    ? `median of ${use.length}${delays.length ? " alerts" : " filings"} · p90 ${fmtDur(quantile(use, 0.9))}` + (caughtUp ? ` · ${caughtUp} catch-up excluded` : "")
+    : caughtUp ? `only catch-up filings so far (${caughtUp})`
     : (log.available ? "no timing lines yet" : "needs pead_tool.log");
 }
 
@@ -799,8 +807,10 @@ function renderDetail() {
   }
   const hit = alerted(r);
   $("d-score").textContent = fmtScore(r.score);
-  $("d-badge").textContent = hit ? "▲ Alert sent" : r.quarter === "UNKNOWN" ? "Quarter unknown · no alert" : "No alert";
-  $("d-badge").className = "badge" + (hit ? " alert" : r.quarter === "UNKNOWN" ? " off" : "");
+  $("d-badge").textContent = hit ? "▲ Alert sent"
+    : r.check ? "⚠ Numbers don't add up · no alert"
+    : r.quarter === "UNKNOWN" ? "Quarter unknown · no alert" : "No alert";
+  $("d-badge").className = "badge" + (hit ? " alert" : (r.check || r.quarter === "UNKNOWN") ? " off" : "");
   $("d-name").textContent = r.company;
   $("d-name").title = r.company;
   $("d-meta").innerHTML = `${esc(r.exchange)} · <a href="${esc(companyPage(r))}" target="_blank" rel="noopener" style="color:var(--accent)">${esc(r.scrip)}</a> · ${esc(r.tsStr)}`;
@@ -828,6 +838,7 @@ function renderDetail() {
     rowsF.map(([n, a, b, c]) => `<tr><td>${n}</td><td>${fmtNum(a)}</td><td>${fmtNum(b)}</td><td>${fmtNum(c)}</td></tr>`).join("") + "</tbody>";
 
   let note = "Breakdown recomputed from the figures in pead_results.csv.";
+  if (r.check) note = `Sanity check failed: ${r.check}. The figures are probably misread, so this row was saved for reference and never alerted. ` + note;
   if (!sc.rejected && Math.abs(sc.total - r.score) > 0.6) note += ` It gives ${fmtScore(sc.total)}, not the logged ${fmtScore(r.score)}: this row was scored by an older scoring version.`;
   if (sc.turnaround) note += " Loss-to-profit turnaround: growth factors earn half points.";
   if (r.source && r.source !== "pead_results.csv") note += ` From ${r.source}.`;
@@ -855,7 +866,7 @@ function renderTable() {
       <td>${r.filingUrl
         ? `<a class="ex-link" href="${esc(filingLink(r))}" target="_blank" rel="noopener" title="Open the result filing on ${esc(r.exchange)}">${esc(r.exchange)}</a>`
         : `<a class="ex-link fallback" href="${esc(companyPage(r))}" target="_blank" rel="noopener" title="Filing link wasn't recorded for this row; opens the company's ${esc(r.exchange)} page">${esc(r.exchange)}</a>`}</td>
-      <td class="num"><span class="scorebar"><span>${hit ? "▲ " : ""}${fmtScore(r.score)}</span><span class="mini"><span class="${hit ? "hit" : ""}" style="width:${Math.min(100, r.score / MAX_SCORE * 100)}%"></span></span></span></td>
+      <td class="num"><span class="scorebar"><span title="${esc(r.check ? "Numbers don't add up: " + r.check : "")}">${hit ? "▲ " : r.check ? "⚠ " : ""}${fmtScore(r.score)}</span><span class="mini"><span class="${hit ? "hit" : ""}" style="width:${Math.min(100, r.score / MAX_SCORE * 100)}%"></span></span></span></td>
       <td class="num ${cls(r.revYoy)}">${fmtPct(r.revYoy)}</td>
       <td class="num ${cls(r.patYoy)}">${fmtPct(r.patYoy)}</td>
       <td class="num ${cls(r.epsYoy)}">${fmtPct(r.epsYoy)}</td>
@@ -994,14 +1005,20 @@ function renderLog() {
   }
   const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 30;
   el.innerHTML = (log.lines || []).map((l) => {
-    // Colour by the status word after the time: ERROR/BLOCKED, WARN/RETRY, ALERT
-    const c = /^\S+\s+ERROR\b|FAILED|BLOCKED|Access Denied/.test(l) ? "e"
-      : /^\S+\s+(WARN|WARNING|RETRY)\b/.test(l) ? "w"
-      : /^\S+\s+ALERT\b|Above threshold|Telegram sent/.test(l) ? "a" : "";
+    // Same colours as the terminal, from the status word after the time
+    const c = /^\S+\s+ERROR\b|FAILED|BLOCKED|Access Denied|isn't answering|is blocking/.test(l) ? "e"
+      : /^\S+\s+(WARN|WARNING|RETRY|FLAG)\b|^\S+\s+POLL\b.*not answering/.test(l) ? "w"
+      : /^\S+\s+ALERT\b|Above threshold|Telegram sent|answering again/.test(l) ? "a"
+      : /^\S+\s+(SCORE\b|Scanning from)/.test(l) ? "s"
+      : /^\S+\s+PEAD scanner\b/.test(l) ? "b"
+      : /^\S+\s+(SKIP|OLD|NONE)\b|^\S+\s+POLL\b.*nothing relevant|^\S+\s+─|^\S+\s+[\d,]+ BSE \+ [\d,]+ NSE companies/.test(l) ? "d" : "";
     return c ? `<span class="${c}">${esc(l)}</span>` : esc(l);
   }).join("\n");
   if (atBottom) el.scrollTop = el.scrollHeight;
-  $("log-desc").textContent = `Last ${(log.lines || []).length} lines of pead_tool.log`;
+  const n = (log.lines || []).length;
+  $("log-desc").textContent = log.lines_source === "terminal"
+    ? `Last ${n} lines of the scanner's terminal`
+    : `Last ${n} lines of pead_tool.log · restart the scanner to show its terminal here`;
 }
 
 /* ═════════════════ 3D: shared ═════════════════ */
@@ -1089,7 +1106,7 @@ const Skyline = (() => {
       // oldest at the back row, newest at the front
       const row = Math.floor(i / cols), col = i % cols;
       const h = towerHeight(r.score);
-      const hit = r.score >= threshold && r.quarter !== "UNKNOWN";
+      const hit = alerted(r);
       const t = Math.max(0, Math.min(1, r.score / MAX_SCORE));
       const base = hit ? new THREE.Color(lerpColor(C.lo, C.hi, 0.35 + t * 0.65)) : C.below.clone();
       const mat = new THREE.MeshStandardMaterial({

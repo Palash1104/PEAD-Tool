@@ -18,6 +18,7 @@ RUN:
 import os
 from dotenv import load_dotenv
 import argparse
+import base64
 import json
 import re
 import html
@@ -32,6 +33,7 @@ import requests
 import pdfplumber
 import io
 import queue
+import sys
 import threading
 from datetime import datetime, date, timedelta
 from urllib.parse import quote
@@ -39,10 +41,11 @@ from openai import OpenAI
 
 load_dotenv()
 
-pytesseract.pytesseract.tesseract_cmd = (
-    r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-)
-POPPLER_PATH = r"C:\poppler\Library\bin"
+# Windows install locations; elsewhere (e.g. Linux test runs) use whatever is on PATH
+TESSERACT_EXE = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+if os.path.exists(TESSERACT_EXE):
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_EXE
+POPPLER_PATH = r"C:\poppler\Library\bin" if os.path.isdir(r"C:\poppler\Library\bin") else None
 
 # ─────────────────────────────────────────────────────────────
 # USER CONFIG
@@ -79,17 +82,24 @@ RESULTS_CSV = "pead_results.csv"
 PROCESSED_SCRIPS_FILE = "processed_scrips.json"   # "{ISIN}_{quarter}" keys
 RETRIES_FILE = "retry_counts.json"                # filing id → failed attempts
 SCRIP_MASTER_FILE = "scrip_master.json"           # BSE code / NSE symbol → ISIN
+CHECKPOINT_FILE = "scan_checkpoint.json"          # exchange → when its last completed poll started
+
+# After a restart the scanner reads from the day it last read each exchange
+# (stop at 9 pm, restart at 4 pm next day → yesterday's late filings are
+# read too), but never more than this many days back
+MAX_RESUME_DAYS = 7
 # ─────────────────────────────────────────────────────────────
 
 LOG_DATEFMT   = "%H:%M:%S"
 LOG_FILE      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pead_tool.log")
+TERMINAL_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pead_terminal.log")
 COMPANY_WIDTH = 30     # company column in filing lines
 
 class LineFormatter(logging.Formatter):
     """"HH:MM:SS  STATUS  message", one fixed-column line per record.
 
     Filing and poll lines pass a status word (POLL, SKIP, CHECK, NONE, SCORE,
-    ALERT, RETRY, OLD, ERROR) as extra={"status": ...}; other lines show their
+    ALERT, RETRY, OLD, FLAG, ERROR) as extra={"status": ...}; other lines show their
     level (INFO, WARN, ERROR, DEBUG). Non-filing lines from the checker thread
     are tagged [checker]. dashboard.py parses this layout.
     """
@@ -138,8 +148,167 @@ def setup_file_logging(path: str = LOG_FILE) -> logging.Handler:
     )
     handler.setLevel(logging.DEBUG)
     handler.setFormatter(LineFormatter())
+    handler.addFilter(lambda record: record.name != CONSOLE.name)   # summaries are terminal-only
     logging.getLogger().addHandler(handler)
     return handler
+
+# ── TERMINAL ──────────────────────────────────────────────────
+#
+# pead_tool.log keeps the full LineFormatter layout (dashboard.py parses it).
+# The terminal shows a cleaner view of the same records:
+#   - one short, colour-coded line per filing that matters, no timing detail
+#   - a "caught up" summary after the first poll, then one POLL line per poll
+#     (new announcements per exchange and what they were)
+#   - records logged with extra={"console": False} stay out of the terminal
+#     (queued checks, vague outcomes without results, per-filing warnings)
+# --verbose switches the terminal back to the full file layout, DEBUG included.
+# pead_terminal.log is a copy of the clean terminal (no colours), whatever
+# --verbose says; the dashboard's Scanner log panel shows it.
+
+CONSOLE = logging.getLogger("pead_console")   # terminal-only summary lines
+CONSOLE.setLevel(logging.INFO)
+QUIET = {"console": False}                    # extra= for file-only records
+CONSOLE_COMPANY_WIDTH = 28
+
+ANSI = {
+    "reset": "\033[0m", "dim": "\033[2m", "bold": "\033[1m",
+    "green": "\033[1;32m", "cyan": "\033[36m", "yellow": "\033[33m", "red": "\033[1;31m",
+}
+STATUS_COLOURS = {
+    "ALERT": "green", "SCORE": "cyan",
+    "FLAG": "yellow", "RETRY": "yellow", "WARN": "yellow",
+    "ERROR": "red",
+}
+DIM_STATUSES = {"SKIP", "OLD", "NONE"}         # handled, nothing to act on
+
+DELAY_IN_TIMINGS = re.compile(r"exchange→(alert|scored) ((?:\d+h )?(?:\d+m )?\d+s)( \(catch-up\))?")
+CONSOLE_REWRITES = [
+    (re.compile(r"^(Q[1-4]FY\d{2}): old quarter per headline, ignored.*$"), r"\1 result, skipped by its title"),
+    (re.compile(r"^(Q[1-4]FY\d{2}): old quarter, ignored.*$"), r"\1 result, ignored"),
+    (re.compile(r"^\S+_Q[1-4]FY\d{2} already scored.*$"), "already scored this quarter"),
+    (re.compile(r"numbers don't add up \(.*\) · no alert"), "numbers don't add up · not alerted"),
+    (re.compile(r"^no results table found · headline: .*$"), "no results table in the PDF"),
+    (re.compile(r"^attachment is not a PDF.*$"), "attachment isn't a PDF"),
+    (re.compile(r"\s{2,}"), "  "),
+]
+
+def console_text(status: str, text: str) -> str:
+    """The terminal's version of a filing line: no timing breakdown, shorter
+    wording, and for an alert how long after the filing it went out."""
+    main, _, timing = text.partition("  ⏱ ")
+    for pattern, repl in CONSOLE_REWRITES:
+        main = pattern.sub(repl, main)
+
+    delay = DELAY_IN_TIMINGS.search(timing)
+    if delay and status == "ALERT":
+        main += f"  ·  {delay.group(2)} after filing"
+    if delay and delay.group(3):
+        main += "  (catch-up)"
+
+    return main if len(main) <= 110 else main[:109] + "…"
+
+class ConsoleFormatter(logging.Formatter):
+    """HH:MM:SS  STATUS  EXCH  Company                       what happened"""
+
+    def __init__(self, colour: bool = False):
+        super().__init__()
+        self.colour = colour
+
+    def paint(self, text: str, *styles: str) -> str:
+        if not self.colour or not styles:
+            return text
+        return "".join(ANSI[s] for s in styles) + text + ANSI["reset"]
+
+    def format(self, record):
+        stamp = self.paint(self.formatTime(record, LOG_DATEFMT), "dim")
+
+        if record.name == CONSOLE.name:        # banner, summaries, POLL lines, rules
+            styles = [s for s in [getattr(record, "style", None)] if s]
+            word = getattr(record, "word", None)
+            head = self.paint(f"{word:<5}", *styles) + "  " if word else ""
+            return f"{stamp}  {head}" + self.paint(record.getMessage(), *styles)
+
+        status = getattr(record, "status", None) or LineFormatter.LEVELS.get(record.levelno, record.levelname)
+        colour = STATUS_COLOURS.get(status) or ("dim" if status in DIM_STATUSES else None)
+        word = self.paint(f"{status:<5}", colour) if colour else f"{status:<5}"
+
+        exchange = getattr(record, "exchange", None)
+        if exchange:
+            company = short_company(record.company, CONSOLE_COMPANY_WIDTH)
+            line = f"{exchange:<3}  {company}  {console_text(status, record.text)}"
+        else:
+            line = record.getMessage()
+
+        if status in DIM_STATUSES:
+            line = self.paint(line, "dim")
+        elif status == "ALERT":
+            line = self.paint(line, "bold")
+
+        return f"{stamp}  {word}  {line}"
+
+def console_colours_supported(stream) -> bool:
+    """ANSI colours if the terminal can show them (turns them on in Windows
+    consoles); off when NO_COLOR is set or output is redirected."""
+    if os.environ.get("NO_COLOR") or not getattr(stream, "isatty", lambda: False)():
+        return False
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-12 if stream is sys.stderr else -11)
+        mode = ctypes.c_uint32()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        return bool(kernel32.SetConsoleMode(handle, mode.value | 0x0004))   # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    except Exception:
+        return False
+
+def _console_visible(record) -> bool:
+    return getattr(record, "console", True)
+
+def _not_poll_summary(record) -> bool:
+    """--verbose already prints the file's two POLL lines; skip the short one."""
+    return not (record.name == CONSOLE.name and getattr(record, "word", None) == "POLL")
+
+def configure_console(verbose: bool):
+    """Clean terminal by default; --verbose shows the full log layout."""
+    console_handler.removeFilter(_console_visible)
+    console_handler.removeFilter(_not_poll_summary)
+    if verbose:
+        console_handler.setLevel(logging.DEBUG)
+        console_handler.setFormatter(LineFormatter())
+        console_handler.addFilter(_not_poll_summary)
+    else:
+        console_handler.setLevel(logging.INFO)
+        console_handler.setFormatter(ConsoleFormatter(console_colours_supported(console_handler.stream)))
+        console_handler.addFilter(_console_visible)
+
+def setup_terminal_log(path: str = TERMINAL_LOG_FILE) -> logging.Handler:
+    """Copy of the clean terminal, without colours, for the dashboard's
+    Scanner log panel: same lines, same layout. UTF-8, 1 MB with 2 backups.
+    Called only when run as a script, like setup_file_logging."""
+    handler = RotatingFileHandler(path, maxBytes=1024 * 1024, backupCount=2, encoding="utf-8")
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(ConsoleFormatter(False))
+    handler.addFilter(_console_visible)
+    logging.getLogger().addHandler(handler)
+    return handler
+
+def say(text: str, style: str | None = None, word: str | None = None):
+    """A terminal-only line (never written to pead_tool.log; pead_terminal.log
+    gets it). word fills the status column, e.g. "POLL"."""
+    extra = {k: v for k, v in (("style", style), ("word", word)) if v}
+    CONSOLE.info(text, extra=extra or None)
+
+def when_text(moment: datetime, now: datetime | None = None) -> str:
+    """"21:01 today", "21:01 yesterday", "21:01 on Mon 05 Oct"."""
+    day = (now or datetime.now()).date()
+    if moment.date() == day:
+        return f"{moment:%H:%M} today"
+    if moment.date() == day - timedelta(days=1):
+        return f"{moment:%H:%M} yesterday"
+    return f"{moment:%H:%M} on {moment:%a %d %b}"
 
 client = OpenAI(
     api_key=AICREDITS_API_KEY,
@@ -185,6 +354,19 @@ def load_retries() -> dict:
 def save_retries(retries: dict):
     save_json(RETRIES_FILE, retries)
 
+def load_checkpoint() -> dict:
+    """exchange → datetime its last completed poll started (bad entries dropped)."""
+    marks = {}
+    for exchange, value in (load_json(CHECKPOINT_FILE, {}) or {}).items():
+        try:
+            marks[exchange] = datetime.fromisoformat(value)
+        except (TypeError, ValueError):
+            continue
+    return marks
+
+def save_checkpoint(marks: dict):
+    save_json(CHECKPOINT_FILE, {ex: dt.isoformat(timespec="seconds") for ex, dt in marks.items()})
+
 CSV_HEADER = [
     "timestamp",
     "company",
@@ -213,6 +395,7 @@ CSV_HEADER = [
     "quarter",      # e.g. Q2FY27, or UNKNOWN when the PDF never said
     "basis",        # consolidated / standalone
     "unit",         # the table's unit before conversion to crores
+    "check",        # blank, or why the figures failed the sanity check (never alerted)
 ]
 
 # Columns added after the CSV existed, with the value older rows get
@@ -223,6 +406,7 @@ CSV_ADDED_COLUMNS = {
     "quarter": "",
     "basis": "",
     "unit": "",
+    "check": "",            # sanity check added 2026-10-07
 }
 
 def initialize_csv():
@@ -298,6 +482,7 @@ def save_result_csv(filing, score, fin, quarter):
                 quarter,
                 fin.get("basis") or "",
                 fin.get("unit") or "",
+                fin.get("check") or "",
             ])
     except OSError as e:
         # e.g. CSV open in Excel — don't let logging block the alert
@@ -355,8 +540,8 @@ HEADERS = {
 
 BSE_ANN_URL = (
     "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w"
-    "?pageno={page}&strCat=-1&strPrevDate={date}"
-    "&strScrip=&strSearch=P&strToDate={date}"
+    "?pageno={page}&strCat=-1&strPrevDate={from_date}"
+    "&strScrip=&strSearch=P&strToDate={to_date}"
     "&strType=C&subcategory=-1"
 )
 BSE_PDF_BASE = "https://www.bseindia.com/xml-data/corpfiling/AttachLive/"
@@ -371,7 +556,7 @@ BSE_TIME_FIELDS = ["EXCHANGE_RECEIVED_TIME", "NEWS_DT", "DT_TM", "DTTM"]
 NSE_HOME = "https://www.nseindia.com/"
 NSE_ANN_URL = (
     "https://www.nseindia.com/api/corporate-announcements"
-    "?index=equities&from_date={date}&to_date={date}"
+    "?index=equities&from_date={from_date}&to_date={to_date}"
 )
 NSE_MASTER_URLS = [
     "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv",
@@ -486,9 +671,10 @@ def normalise_nse(row: dict) -> dict:
         "exchange_dt": parse_exchange_time(row, NSE_TIME_FIELDS),
     }
 
-def fetch_bse_page(page: int, day: date) -> list:
+def fetch_bse_page(page: int, from_day: date, to_day: date | None = None) -> list:
+    to_day = to_day or from_day
     r = requests.get(
-        BSE_ANN_URL.format(page=page, date=day.strftime("%Y%m%d")),
+        BSE_ANN_URL.format(page=page, from_date=from_day.strftime("%Y%m%d"), to_date=to_day.strftime("%Y%m%d")),
         headers=HEADERS,
         timeout=15
     )
@@ -499,10 +685,10 @@ def fetch_bse_page(page: int, day: date) -> list:
     r.raise_for_status()
     return r.json().get("Table") or []
 
-def fetch_bse_filings(known_ids: set) -> tuple:
-    """Today's new BSE announcements, newest first, paging until a page has
-    no new rows or the last page (TotalPageCnt) is reached.
-    Returns (new filings, pages read).
+def fetch_bse_filings(known_ids: set, since: date | None = None) -> tuple:
+    """New BSE announcements from `since` (default today) to today, newest
+    first, paging until a page has no new rows or the last page
+    (TotalPageCnt) is reached. Returns (new filings, pages read).
 
     known_ids holds the NEWSIDs fetched on earlier polls and is updated in
     place, so a normal poll reads page 1 and one page of already-known rows.
@@ -510,6 +696,7 @@ def fetch_bse_filings(known_ids: set) -> tuple:
     what the earlier pages returned.
     """
     today = date.today()
+    first_day = min(since or today, today)
     filings = []
 
     for page in range(1, BSE_MAX_PAGES + 1):
@@ -517,7 +704,7 @@ def fetch_bse_filings(known_ids: set) -> tuple:
             time.sleep(0.5)   # only a startup backlog reads this deep; go gently
 
         try:
-            rows = fetch_bse_page(page, today)
+            rows = fetch_bse_page(page, first_day, today)
         except ExchangeBlocked:
             raise
         except Exception as e:
@@ -549,8 +736,11 @@ def fetch_bse_filings(known_ids: set) -> tuple:
 
     return filings, page
 
-def fetch_nse_filings(nse: NseClient) -> list:
-    r = nse.get(NSE_ANN_URL.format(date=date.today().strftime("%d-%m-%Y")))
+def fetch_nse_filings(nse: NseClient, since: date | None = None) -> list:
+    """NSE equity announcements from `since` (default today) to today."""
+    today = date.today()
+    first_day = min(since or today, today)
+    r = nse.get(NSE_ANN_URL.format(from_date=first_day.strftime("%d-%m-%Y"), to_date=today.strftime("%d-%m-%Y")))
 
     if is_blocked_response(r):
         raise ExchangeBlocked(f"HTTP {r.status_code} on announcements")
@@ -569,15 +759,16 @@ def download_pdf(filing: dict, nse: NseClient):
         r.raise_for_status()
         return r.content
     except Exception as e:
-        log.warning(f"PDF download failed: {e}")
+        log.warning(f"PDF download failed: {e}", extra=QUIET)
         return None
 
 _last_blocked_alert = {}   # exchange → time of last Telegram warning
 
-def warn_blocked(exchange: str, detail: str):
+def warn_blocked(exchange: str, detail: str, console: bool = True):
     log.error(
         f"🚫 {exchange} BLOCKED ({detail}) — its announcements were NOT read "
-        f"this poll; this is not 'zero announcements'"
+        f"this poll; this is not 'zero announcements'",
+        extra={"console": console},
     )
 
     now = time.time()
@@ -614,6 +805,60 @@ def board_meeting_kind(headline: str) -> str:
         return "ambiguous"
     return "other"
 
+# Quarter-end dates spelled out in a headline ("31.03.2025", "30th June 2026",
+# "September 30th, 2026", "30-Jun-2026"), so an old quarter can be skipped
+# before the PDF is downloaded or the model is called
+_MONTH = (r"(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?"
+          r"|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)")
+MONTH_NUMBERS = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
+HEADLINE_DATE_RES = [
+    ("dmy", re.compile(r"\b(\d{1,2})[./-](\d{1,2})[./-](\d{4}|\d{2})\b")),
+    ("ymd", re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")),
+    ("d-mon-y", re.compile(rf"\b(\d{{1,2}})\s*(?:st|nd|rd|th)?[\s.-]*(?:of\s+)?{_MONTH}\b[\s,.-]*(\d{{4}})\b")),
+    ("mon-d-y", re.compile(rf"\b{_MONTH}[\s.-]*(\d{{1,2}})\s*(?:st|nd|rd|th)?\b[\s,.-]*(\d{{4}})\b")),
+]
+QUARTER_ENDS = {(3, 31), (6, 30), (9, 30), (12, 31)}
+
+def headline_period_ends(headline: str) -> list:
+    """Every quarter-end date (31 Mar, 30 Jun, 30 Sep, 31 Dec) written in the headline."""
+    text = (headline or "").lower()
+    found = set()
+
+    for kind, pattern in HEADLINE_DATE_RES:
+        for groups in pattern.findall(text):
+            try:
+                if kind == "dmy":
+                    d, m, y = int(groups[0]), int(groups[1]), int(groups[2])
+                elif kind == "ymd":
+                    y, m, d = int(groups[0]), int(groups[1]), int(groups[2])
+                elif kind == "d-mon-y":
+                    d, m, y = int(groups[0]), MONTH_NUMBERS[groups[1][:3]], int(groups[2])
+                else:
+                    m, d, y = MONTH_NUMBERS[groups[0][:3]], int(groups[1]), int(groups[2])
+                if y < 100:
+                    y += 2000
+                if (m, d) in QUARTER_ENDS:
+                    found.add(date(y, m, d))
+            except (ValueError, KeyError):
+                continue
+
+    return sorted(found)
+
+def headline_old_quarter(headline: str) -> str | None:
+    """The quarter a headline names, if it is before SCORE_FROM_QUARTER.
+
+    Uses the latest quarter-end date in the headline, so one that also
+    mentions the current quarter (or a 30 Sep meeting date) is never skipped.
+    None when the headline names no quarter-end date or a current one.
+    """
+    ends = headline_period_ends(headline)
+    if not ends:
+        return None
+
+    quarter = quarter_label(ends[-1])
+    return quarter if quarter_index(quarter) < quarter_index(SCORE_FROM_QUARTER) else None
+
 # ── QUARTERS, SCRIP MASTER & DEDUP KEYS ──────────────────────
 
 def quarter_label(period_end: date) -> str:
@@ -644,6 +889,23 @@ def pdf_quarter(fin: dict, filed_on: date) -> str | None:
             return quarter_label(ended)
 
     return None
+
+def old_quarter(period_end: str | None, filed_on: date) -> str | None:
+    """The quarter of period_end if it is before SCORE_FROM_QUARTER, else None.
+
+    Unlike pdf_quarter there is no 400-day limit: a result for the year ended
+    31.03.2025 filed in Oct 2026 is old, not "quarter unknown". A date after
+    the filing date is implausible and never counts as old.
+    """
+    if not period_end:
+        return None
+
+    ended = date.fromisoformat(period_end)
+    if ended > filed_on:
+        return None
+
+    quarter = quarter_label(ended)
+    return quarter if quarter_index(quarter) < quarter_index(SCORE_FROM_QUARTER) else None
 
 def quarter_unknown_reason(fin: dict, filed_on: date) -> str:
     period_end = fin.get("period_end")
@@ -761,7 +1023,8 @@ def load_scrip_master(nse: NseClient) -> dict:
 
         log.info(
             f"Scrip master: {len(fresh)} {name.upper()} codes downloaded, "
-            f"{len(master[name])} known"
+            f"{len(master[name])} known",
+            extra=QUIET,
         )
 
     if complete:
@@ -802,7 +1065,7 @@ def migrate_processed_keys(processed: set, master: dict) -> set:
 
 # ── LLM PDF EXTRACTION ───────────────────────────────────────
 
-EXTRACTION_PROMPT = """This text comes from a quarterly financial result PDF filed by an Indian listed company on BSE/NSE.
+EXTRACTION_PROMPT = """These pages come from a quarterly financial result PDF filed by an Indian listed company on BSE/NSE. Each page is given either as extracted text or, for scanned pages, as an image; read the figures from whichever form you get.
 
 Use the CONSOLIDATED results if the text contains a consolidated results table; otherwise use the STANDALONE results.
 Use only the individual quarter columns (NOT year-to-date, half-year, nine-month or full year columns).
@@ -898,6 +1161,18 @@ MIN_TEXT_CHARS      = 500   # whole PDF below this → treat as scanned, OCR it 
 LOW_TEXT_PAGE_CHARS = 200   # no table in text layer → OCR pages below this
 HEADING_LINES       = 20    # a result table's title sits near the top of its page
 
+# Scanned pages. OCR only has to find which pages hold the results table
+# (keywords, not exact digits), so it runs at a low resolution. The selected
+# scanned pages then go to the model as images, which it reads far more
+# accurately than Tesseract's digits (7 Oct 2026: Tiaan Consumer and Golkonda
+# Aluminium came back with impossible figures from OCR text).
+LOCATE_OCR_DPI       = 150   # page finding only
+FALLBACK_OCR_DPI     = 250   # full-quality OCR text, used only when images can't be sent
+IMAGE_DPI            = 150   # scanned result pages rendered for the model
+IMAGE_MAX_EDGE       = 1568  # Claude scales larger images down to this anyway
+SEND_SCANS_AS_IMAGES = True  # False → send Tesseract text instead (the old behaviour)
+_images_rejected     = False # set if the provider refuses images; then text for the session
+
 # A page counts as a results table if it shows at least two of these kinds
 # of line item. Each kind accepts the wording different formats use:
 # companies ("Revenue from operations", "Profit before tax"), NBFCs ("Total
@@ -983,10 +1258,10 @@ def find_table_pages(page_texts: list) -> tuple:
 
     return [], None
 
-def ocr_page(pdf_bytes: bytes, page_num: int) -> str:
+def ocr_page(pdf_bytes: bytes, page_num: int, dpi: int = LOCATE_OCR_DPI) -> str:
     images = convert_from_bytes(
         pdf_bytes,
-        dpi=250,
+        dpi=dpi,
         first_page=page_num,
         last_page=page_num,
         poppler_path=POPPLER_PATH
@@ -994,11 +1269,11 @@ def ocr_page(pdf_bytes: bytes, page_num: int) -> str:
     return pytesseract.image_to_string(images[0]) if images else ""
 
 def ocr_pages(pdf_bytes: bytes, page_texts: list, indices: list,
-              timings: dict | None = None) -> list:
+              timings: dict | None = None, ocred: set | None = None) -> list:
     """OCR the given pages one at a time, replacing their text.
 
     Stops early once a consolidated table and its next page are both readable.
-    Adds the time spent to timings["ocr"].
+    Adds the time spent to timings["ocr"]; adds each OCR'd page index to ocred.
     """
     log.debug(f"running OCR on pages {[i + 1 for i in indices]}")
 
@@ -1010,38 +1285,42 @@ def ocr_pages(pdf_bytes: bytes, page_texts: list, indices: list,
         for idx in indices:
             page_texts[idx] = ocr_page(pdf_bytes, idx + 1)
             pending.discard(idx)
+            if ocred is not None:
+                ocred.add(idx)
 
             pages, basis = find_table_pages(page_texts)
             if basis == "consolidated" and not pending.intersection(pages):
                 break
 
     except Exception as e:
-        log.warning(f"OCR extraction failed: {e}")
+        log.warning(f"OCR extraction failed: {e}", extra=QUIET)
 
     if timings is not None:
         timings["ocr"] = timings.get("ocr", 0) + time.monotonic() - started
 
     return page_texts
 
-def get_result_text(pdf_bytes: bytes, ocr_page_limit: int = MAX_PDF_PAGES,
-                    timings: dict | None = None) -> tuple:
-    """Text of the result table pages to send to the model: (text, reason).
+def find_result_pages(pdf_bytes: bytes, ocr_page_limit: int = MAX_PDF_PAGES,
+                      timings: dict | None = None) -> dict:
+    """Locate the result table pages: {"pages", "basis", "reason", "texts", "ocr"}.
 
-    text is None when no page passes the results-table check, even after OCR.
-    Only the first ocr_page_limit pages are ever OCR'd. Records
-    timings["scan"] (text layer + table check) and timings["ocr"].
+    pages is [] when no page passes the results-table check, even after OCR.
+    texts holds every page's text (OCR text for scanned pages); ocr is the set
+    of page indices whose text came from OCR. Only the first ocr_page_limit
+    pages are ever OCR'd. Records timings["scan"] (text layer + table check)
+    and timings["ocr"].
     """
     started = time.monotonic()
     timings = {} if timings is None else timings
     ocr_before = timings.get("ocr", 0)
 
     try:
-        return _find_result_text(pdf_bytes, ocr_page_limit, timings)
+        return _find_result_pages(pdf_bytes, ocr_page_limit, timings)
     finally:
         ocr_spent = timings.get("ocr", 0) - ocr_before
         timings["scan"] = timings.get("scan", 0) + time.monotonic() - started - ocr_spent
 
-def _find_result_text(pdf_bytes: bytes, ocr_page_limit: int, timings: dict) -> tuple:
+def _find_result_pages(pdf_bytes: bytes, ocr_page_limit: int, timings: dict) -> dict:
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         page_count = min(len(pdf.pages), MAX_PDF_PAGES)
         page_texts = [
@@ -1050,10 +1329,11 @@ def _find_result_text(pdf_bytes: bytes, ocr_page_limit: int, timings: dict) -> t
         ]
 
     real_chars = sum(len(t.strip()) for t in page_texts)
+    ocred = set()
 
     if real_chars < MIN_TEXT_CHARS:
         log.debug(f"only {real_chars} chars of text layer, OCR-ing the whole PDF")
-        page_texts = ocr_pages(pdf_bytes, page_texts, list(range(min(page_count, ocr_page_limit))), timings)
+        page_texts = ocr_pages(pdf_bytes, page_texts, list(range(min(page_count, ocr_page_limit))), timings, ocred)
         selected, basis = find_table_pages(page_texts)
 
     else:
@@ -1067,25 +1347,66 @@ def _find_result_text(pdf_bytes: bytes, ocr_page_limit: int, timings: dict) -> t
 
         if not selected and low_text:
             log.debug("no result table in text layer, OCR-ing low-text pages")
-            page_texts = ocr_pages(pdf_bytes, page_texts, low_text, timings)
+            page_texts = ocr_pages(pdf_bytes, page_texts, low_text, timings, ocred)
             selected, basis = find_table_pages(page_texts)
 
-    if not selected:
-        return None, "no results table found"
+    found = {
+        "pages": selected,
+        "basis": basis,
+        "reason": f"{basis} table" if selected else "no results table found",
+        "texts": page_texts,
+        "ocr": ocred,
+    }
 
-    reason = f"{basis} table"
+    if selected:
+        scanned = [i + 1 for i in selected if i in ocred]
+        log.debug(
+            f"selected pages {[i + 1 for i in selected]} ({found['reason']}"
+            f"{f', scanned: {scanned}' if scanned else ''})"
+        )
 
-    text = "\n".join(
-        f"\n\n--- PAGE {i + 1} ---\n{page_texts[i]}"
-        for i in selected
+    return found
+
+def pages_as_text(found: dict) -> str:
+    return "\n".join(
+        f"\n\n--- PAGE {i + 1} ---\n{found['texts'][i]}"
+        for i in found["pages"]
     )
 
-    log.debug(
-        f"selected pages {[i + 1 for i in selected]} "
-        f"({reason}, {len(text)} chars)"
-    )
+def get_result_text(pdf_bytes: bytes, ocr_page_limit: int = MAX_PDF_PAGES,
+                    timings: dict | None = None) -> tuple:
+    """Text of the result table pages: (text, reason). text is None when no
+    page passes the results-table check, even after OCR. Scanned pages come
+    back as locating-quality OCR text (compare_models.py uses this)."""
+    found = find_result_pages(pdf_bytes, ocr_page_limit, timings)
 
-    return text, reason
+    if not found["pages"]:
+        return None, found["reason"]
+
+    return pages_as_text(found), found["reason"]
+
+def page_image_data_url(pdf_bytes: bytes, page_num: int) -> str:
+    """One PDF page as a grayscale PNG data URL, long edge at most IMAGE_MAX_EDGE."""
+    images = convert_from_bytes(
+        pdf_bytes,
+        dpi=IMAGE_DPI,
+        first_page=page_num,
+        last_page=page_num,
+        grayscale=True,
+        poppler_path=POPPLER_PATH,
+    )
+    if not images:
+        raise ValueError(f"could not render page {page_num}")
+
+    image = images[0]
+    longest = max(image.size)
+    if longest > IMAGE_MAX_EDGE:
+        scale = IMAGE_MAX_EDGE / longest
+        image = image.resize((round(image.width * scale), round(image.height * scale)))
+
+    buf = io.BytesIO()
+    image.save(buf, "PNG", optimize=True)
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
 def _to_number(value) -> float | None:
     if isinstance(value, bool):
@@ -1118,14 +1439,14 @@ def parse_period_end(value) -> str | None:
 def normalise_financials(data) -> dict | None:
     """Validate the model's JSON: numbers only, 3 values per metric, amounts in crores."""
     if not isinstance(data, dict):
-        log.warning("Model returned non-object JSON")
+        log.warning("Model returned non-object JSON", extra=QUIET)
         return None
 
     unit = str(data.get("unit") or "").strip().lower()
     unit = UNIT_ALIASES.get(unit, unit)
 
     if unit not in UNIT_TO_CRORE:
-        log.warning(f"Unrecognised unit from model: {data.get('unit')!r}")
+        log.warning(f"Unrecognised unit from model: {data.get('unit')!r}", extra=QUIET)
         return None
 
     factor = UNIT_TO_CRORE[unit]
@@ -1156,9 +1477,19 @@ def normalise_financials(data) -> dict | None:
 
     return fin
 
-def extract_from_text(text: str, model: str, timings: dict | None = None) -> dict | None:
-    """Send result-page text to the model via AICredits; validated financials or None.
-    Records timings["model"]."""
+class ModelCallFailed(Exception):
+    """The API call itself failed (not a bad answer). Only raised for image
+    calls, so extract_financials can fall back to OCR text."""
+
+def _call_model(content, model: str, timings: dict | None = None,
+                raw_out: dict | None = None, raise_api_errors: bool = False) -> dict | None:
+    """One extraction call via AICredits; validated financials or None.
+
+    content is the prompt string, or a list of text / image_url parts.
+    raw_out, if given, receives the model's parsed JSON as raw_out["data"],
+    even when it fails validation (obtain_financials reads period_end from it).
+    Adds the call time to timings["model"].
+    """
     started = time.monotonic()
 
     try:
@@ -1166,20 +1497,18 @@ def extract_from_text(text: str, model: str, timings: dict | None = None) -> dic
             response = client.chat.completions.create(
                 model=model,
                 max_tokens=1500,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": f"{EXTRACTION_PROMPT}\n\n---\nPDF TEXT:\n{text}"
-                    }
-                ],
+                messages=[{"role": "user", "content": content}],
             )
         finally:
             if timings is not None:
-                timings["model"] = time.monotonic() - started
+                timings["model"] = timings.get("model", 0) + time.monotonic() - started
 
         raw = response.choices[0].message.content or ""
         data = json.loads(raw[raw.find("{"):raw.rfind("}") + 1])
         log.debug(f"{model} extracted: {data}")
+
+        if raw_out is not None:
+            raw_out["data"] = data
 
         fin = normalise_financials(data)
 
@@ -1192,37 +1521,153 @@ def extract_from_text(text: str, model: str, timings: dict | None = None) -> dic
         return fin
 
     except json.JSONDecodeError as e:
-        log.warning(f"Model JSON parse error: {e}")
+        log.warning(f"Model JSON parse error: {e}", extra=QUIET)
         return None
     except Exception as e:
-        log.warning(f"Model extraction failed: {e}")
+        if raise_api_errors:
+            raise ModelCallFailed(str(e)) from e
+        log.warning(f"Model extraction failed: {e}", extra=QUIET)
         return None
 
+def extract_from_text(text: str, model: str, timings: dict | None = None,
+                      raw_out: dict | None = None) -> dict | None:
+    """Send result-page text to the model; validated financials or None."""
+    return _call_model(f"{EXTRACTION_PROMPT}\n\n---\nPDF TEXT:\n{text}", model, timings, raw_out)
+
+def extract_from_page_images(pdf_bytes: bytes, found: dict, model: str,
+                             timings: dict | None = None, raw_out: dict | None = None) -> dict | None:
+    """Send the selected pages to the model: scanned pages as PNG images, text
+    pages as text. Records timings["render"]. Raises ModelCallFailed if the API
+    call fails, so the caller can fall back to OCR text."""
+    started = time.monotonic()
+    parts = [{"type": "text", "text": EXTRACTION_PROMPT}]
+
+    for i in found["pages"]:
+        if i in found["ocr"]:
+            parts.append({"type": "text", "text": f"--- PAGE {i + 1} (scanned page image) ---"})
+            parts.append({"type": "image_url", "image_url": {"url": page_image_data_url(pdf_bytes, i + 1)}})
+        else:
+            parts.append({"type": "text", "text": f"--- PAGE {i + 1} ---\n{found['texts'][i]}"})
+
+    if timings is not None:
+        timings["render"] = timings.get("render", 0) + time.monotonic() - started
+
+    return _call_model(parts, model, timings, raw_out, raise_api_errors=True)
+
+def _note_image_failure(error: Exception):
+    """Stop sending images for the rest of the run if the provider refuses them."""
+    global _images_rejected
+    text = str(error).lower()
+    if "image" in text and any(w in text for w in ("media_type", "not supported", "unsupported", "invalid")):
+        _images_rejected = True
+        log.warning(f"Provider rejected page images ({error}); sending OCR text for scanned pages from now on")
+    else:
+        log.warning(f"Model call with page images failed ({error}); falling back to OCR text for this filing", extra=QUIET)
+
 def extract_financials(pdf_bytes: bytes, model: str | None = None,
-                       ambiguous: bool = False, timings: dict | None = None) -> dict | None:
+                       ambiguous: bool = False, timings: dict | None = None,
+                       raw_out: dict | None = None) -> dict | None:
     """Pick the result pages locally (OCR if needed), then have the model read them.
 
-    ambiguous: a board meeting outcome whose headline names no results — OCR
-    is capped at AMBIGUOUS_OCR_PAGES and the table check outcome is logged.
-    Raises SkipFiling when the PDF has no results table (the model isn't called).
+    Scanned result pages go to the model as images (SEND_SCANS_AS_IMAGES);
+    if that call fails, or images are off, they are re-OCR'd at
+    FALLBACK_OCR_DPI and sent as text. ambiguous: a board meeting outcome
+    whose headline names no results — OCR is capped at AMBIGUOUS_OCR_PAGES and
+    the table check outcome is logged. Raises SkipFiling when the PDF has no
+    results table (the model isn't called).
     """
     try:
-        text, reason = get_result_text(
+        found = find_result_pages(
             pdf_bytes,
             AMBIGUOUS_OCR_PAGES if ambiguous else MAX_PDF_PAGES,
             timings
         )
     except Exception as e:
-        log.warning(f"PDF text extraction failed: {e}")
+        log.warning(f"PDF text extraction failed: {e}", extra=QUIET)
         return None
 
     if ambiguous:
-        log.debug(f"ambiguous outcome → results table {'found' if text else 'not found'}")
+        log.debug(f"ambiguous outcome → results table {'found' if found['pages'] else 'not found'}")
 
-    if not text:
-        raise SkipFiling(reason, status="NONE")
+    if not found["pages"]:
+        raise SkipFiling(found["reason"], status="NONE")
 
-    return extract_from_text(text, model or EXTRACTION_MODEL, timings)
+    model = model or EXTRACTION_MODEL
+    scanned = [i for i in found["pages"] if i in found["ocr"]]
+
+    if scanned and SEND_SCANS_AS_IMAGES and not _images_rejected:
+        try:
+            return extract_from_page_images(pdf_bytes, found, model, timings, raw_out)
+        except ModelCallFailed as e:
+            _note_image_failure(e)
+        except Exception as e:      # rendering failed
+            log.warning(f"Could not render page images ({e}); falling back to OCR text", extra=QUIET)
+
+    if scanned:
+        # Locating OCR was low resolution; re-read the chosen pages properly
+        started = time.monotonic()
+        texts = list(found["texts"])
+        try:
+            for i in scanned:
+                texts[i] = ocr_page(pdf_bytes, i + 1, dpi=FALLBACK_OCR_DPI)
+        except Exception as e:
+            log.warning(f"Full-quality OCR failed ({e}); using the locating OCR text", extra=QUIET)
+        if timings is not None:
+            timings["ocr"] = timings.get("ocr", 0) + time.monotonic() - started
+        found = {**found, "texts": texts}
+
+    return extract_from_text(pages_as_text(found), model, timings, raw_out)
+
+# ── SANITY CHECK ──────────────────────────────────────────────
+#
+# Catches figures that can't all be true together — typically digits misread
+# from a scan. A failed check doesn't stop the row being saved, but it is
+# flagged and never alerted.
+
+CHECK_COLUMNS = [(0, "this quarter"), (2, "year-ago quarter")]
+
+def numbers_problem(fin: dict) -> str | None:
+    """Why the extracted figures don't add up, or None if they do (or there
+    aren't enough figures to tell). Amounts are in crores."""
+
+    def at(key, i):
+        values = fin.get(key) or []
+        return values[i] if i < len(values) else None
+
+    for i, label in CHECK_COLUMNS:
+        revenue, total_income = at("revenue_from_operations", i), at("total_income", i)
+        total_expenses, pbt, pat = at("total_expenses", i), at("pbt", i), at("pat", i)
+
+        if revenue is not None and total_income is not None and revenue > 0:
+            if total_income < revenue * 0.98 - 0.01:
+                return f"{label}: total income {total_income:,.2f} below revenue {revenue:,.2f}"
+
+        income = total_income if total_income is not None else revenue
+
+        if income is not None and total_expenses is not None:
+            for key in ("employee_expense", "other_expenses", "finance_cost", "depreciation"):
+                part = at(key, i)
+                if part is not None and total_expenses >= 0 and part > total_expenses * 1.02 + 0.05:
+                    return f"{label}: {key.replace('_', ' ')} {part:,.2f} above total expenses {total_expenses:,.2f}"
+
+            implied = income - total_expenses
+
+            if pbt is not None:
+                actual, name = pbt, "PBT"
+                tolerance = max(0.10 * abs(income), 0.25 * abs(pbt), 0.05)
+            elif pat is not None:
+                actual, name = pat, "PAT"
+                tolerance = max(0.10 * abs(income), 0.5 * abs(pat), 0.05)   # tax sits between them
+            else:
+                continue
+
+            if abs(implied - actual) > tolerance:
+                return (
+                    f"{label}: income {income:,.2f} minus expenses {total_expenses:,.2f} "
+                    f"= {implied:,.2f}, but {name} is {actual:,.2f}"
+                )
+
+    return None
 
 # ── PEAD SCORE ────────────────────────────────────────────────
 
@@ -1664,10 +2109,17 @@ def has_core_values(fin: dict) -> bool:
         fin["pat"][0] is not None
     )
 
+SCANNER_STARTED_AT: datetime | None = None   # set in main()
+
+def is_catch_up(exchange_dt) -> bool:
+    """Published before this run started: its delay measures downtime, not speed."""
+    return bool(exchange_dt and SCANNER_STARTED_AT and exchange_dt < SCANNER_STARTED_AT)
+
 def format_delay(since: datetime) -> str:
     hours, rest = divmod(int((datetime.now() - since).total_seconds()), 3600)
     mins, secs = divmod(rest, 60)
-    return f"{hours}h {mins}m {secs}s" if hours else f"{mins}m {secs}s"
+    text = f"{hours}h {mins}m {secs}s" if hours else f"{mins}m {secs}s"
+    return text + (" (catch-up)" if is_catch_up(since) else "")
 
 def short_company(name: str, width: int = COMPANY_WIDTH) -> str:
     """Company name without Ltd/Limited/-$, cut or padded to a fixed width."""
@@ -1675,12 +2127,15 @@ def short_company(name: str, width: int = COMPANY_WIDTH) -> str:
     name = re.sub(r"[\s,]*\b(?:Ltd|Limited)\.?$", "", name, flags=re.I).strip() or "Unknown"
     return name[:width - 1] + "…" if len(name) > width else name.ljust(width)
 
-def report(status: str, filing: dict, text: str, level: int = logging.INFO):
-    """The one terminal line for a filing: status, exchange, company, text."""
+def report(status: str, filing: dict, text: str, level: int = logging.INFO, console: bool = True):
+    """The one line for a filing: status, exchange, company, text. The log
+    file gets it whole; the terminal a shorter version (console_text), or
+    nothing when console=False."""
     log.log(
         level,
         f"{filing['exchange']:<3}  {short_company(filing['company'])}  {text}",
-        extra={"status": status},
+        extra={"status": status, "exchange": filing["exchange"], "company": filing["company"],
+               "text": text, "console": console},
     )
 
 def format_timings(timings: dict, exchange_dt=None, outcome: str | None = None) -> str:
@@ -1692,6 +2147,7 @@ def format_timings(timings: dict, exchange_dt=None, outcome: str | None = None) 
             ("download", "download"),
             ("scan", "page scan"),
             ("ocr", "OCR"),
+            ("render", "render"),
             ("model", "model"),
         ]
         if key in timings
@@ -1743,15 +2199,29 @@ def obtain_financials(filing: dict, nse: NseClient, ambiguous: bool = False,
         raise SkipFiling(f"attachment is not a PDF (starts {pdf[:8]!r})")
 
     log.debug(f"{filing['exchange']} {filing['company']}: PDF {len(pdf) / (1024 * 1024):.1f} MB")
-    fin = extract_financials(pdf, ambiguous=ambiguous, timings=timings)
+    raw_out = {}
+    fin = extract_financials(pdf, ambiguous=ambiguous, timings=timings, raw_out=raw_out)
+    filed_on = (filing["exchange_dt"] or datetime.now()).date()
+
+    # An old quarter is final, whatever else is wrong with the extraction:
+    # retrying a result we'd ignore anyway only burns model calls. A date
+    # more than 400 days old (e.g. a very late "year ended 31.03.2025") only
+    # counts if all three column dates line up, so a misread year is retried.
+    raw = raw_out.get("data") or {}
+    dates = fin or {k: parse_period_end(raw.get(k)) for k in ("period_end", "prev_period_end", "ly_period_end")}
+    old = old_quarter(dates.get("period_end"), filed_on)
+    if old and (pdf_quarter(dates, filed_on) or not column_dates_problem(dates)):
+        raise SkipFiling(
+            f"{old}: old quarter, ignored (scoring from {SCORE_FROM_QUARTER})",
+            model_called=True,
+            status="OLD",
+        )
 
     if not fin:
         raise RetryFiling("could not extract financials")
 
     if not has_core_values(fin):
         raise RetryFiling("missing current-quarter revenue or PAT")
-
-    filed_on = (filing["exchange_dt"] or datetime.now()).date()
 
     if not pdf_quarter(fin, filed_on):
         raise QuarterUnknown(quarter_unknown_reason(fin, filed_on), fin)
@@ -1760,6 +2230,7 @@ def obtain_financials(filing: dict, nse: NseClient, ambiguous: bool = False,
     if problem:
         raise RetryFiling(f"column dates don't line up ({problem})")
 
+    fin["check"] = numbers_problem(fin) or ""
     return fin
 
 def score_filing(filing: dict, isin, fin: dict, processed: set, timings: dict) -> tuple:
@@ -1792,6 +2263,15 @@ def score_filing(filing: dict, isin, fin: dict, processed: set, timings: dict) -
     score, bd = compute_pead_score(fin)
     save_result_csv(filing, score, fin, quarter)
     summary = f"{score:4.1f}/50  {quarter}  {fin.get('basis', 'unknown')}"
+    if "Rejected" in bd:
+        reason = bd["Rejected"][0]
+        summary += f"  rejected: {reason[:1].lower()}{reason[1:]}"
+
+    if fin.get("check"):
+        # Saved for reference, never alerted. The key isn't returned, so the
+        # other exchange's copy (or a corrected filing) can still be scored.
+        summary += f"  numbers don't add up ({fin['check']}) · no alert"
+        return None, "FLAG", with_timings(summary, timings, exchange_dt, "scored")
 
     if score >= PEAD_THRESHOLD:
         sent = send_telegram(
@@ -1885,6 +2365,13 @@ class ScannerState:
         self.bse_known_ids = set()             # BSE NEWSIDs fetched on earlier polls
         self.nse_known_ids = set()             # NSE filing ids fetched on earlier polls
         self.checker = AmbiguousChecker()
+        self.failing = {}                      # exchange → True while its fetch fails
+        self.fetched = {}                      # exchange → new announcements last poll (None = failed)
+        self.window = {}                       # counts since the last terminal line
+        self.caught_up = False                 # first poll's summary printed
+        self.first_since = None                # where this run picks up (None = start of today)
+        self.checkpoint = load_checkpoint()    # exchange → start of its last completed poll
+        self.poll_marks = {}                   # this cycle's successful fetches, saved when it ends
         self.refresh_master()
 
     def refresh_master(self):
@@ -1899,12 +2386,48 @@ class ScannerState:
         to_isin = [k for k in changed if not k.startswith(("BSE-", "NSE-"))]
         without_isin = sorted(k for k in self.processed if k.startswith(("BSE-", "NSE-")))
 
+        # Housekeeping detail: log file only, the terminal starts with the banner
         if to_isin:
-            log.info(f"Migrated {len(to_isin)} processed key{'' if len(to_isin) == 1 else 's'} to ISIN format")
+            log.info(f"Migrated {len(to_isin)} processed key{'' if len(to_isin) == 1 else 's'} to ISIN format", extra=QUIET)
         if len(changed) > len(to_isin):
-            log.info(f"Renamed {len(changed) - len(to_isin)} old-format keys to EXCHANGE-code format (ISIN unknown)")
+            log.info(f"Renamed {len(changed) - len(to_isin)} old-format keys to EXCHANGE-code format (ISIN unknown)", extra=QUIET)
         if without_isin:
-            log.info(f"Processed keys still without ISIN: {', '.join(without_isin)}")
+            log.info(f"Processed keys still without ISIN: {', '.join(without_isin)}", extra=QUIET)
+
+    def resume_from(self, exchange: str) -> date | None:
+        """First day to fetch for this exchange: the day it was last read, if
+        that's before today (at most MAX_RESUME_DAYS back). None = today only.
+        Also covers midnight: the first poll after it still reads yesterday."""
+        mark = self.checkpoint.get(exchange)
+        if not mark:
+            return None
+        today = date.today()
+        day = max(mark.date(), today - timedelta(days=MAX_RESUME_DAYS))
+        return day if day < today else None
+
+    def last_stop(self) -> datetime | None:
+        """When the previous run last read the exchanges (the earlier of the
+        two), or None if no run has finished a poll yet."""
+        return min(self.checkpoint.values()) if self.checkpoint else None
+
+    def resumed_since(self) -> datetime | None:
+        """Where this run picks up from: the previous run's last poll, at most
+        MAX_RESUME_DAYS back. A same-day restart re-reads today, but what came
+        before this time was already handled. None = no checkpoint (start of today)."""
+        stop = self.last_stop()
+        if not stop:
+            return None
+        floor = datetime.combine(date.today() - timedelta(days=MAX_RESUME_DAYS), datetime.min.time())
+        return max(stop, floor)
+
+    def save_poll_marks(self):
+        """End of a cycle: every exchange fetched successfully this cycle is
+        read up to when its poll started. Saved only once the cycle's clear
+        filings are handled, so a stop mid-cycle re-reads them next time."""
+        if self.poll_marks:
+            self.checkpoint.update(self.poll_marks)
+            self.poll_marks = {}
+            save_checkpoint(self.checkpoint)
 
     def finish(self, fid: str):
         """Done with a filing for good: success, skip, or retries exhausted."""
@@ -1934,6 +2457,7 @@ def triage(filing: dict, state: ScannerState) -> str:
       "results" / "ambiguous" — process it now
       "intimation", "not relevant" — skipped quietly (counted in the POLL summary)
       "duplicate" — company-quarter already scored (a SKIP line)
+      "old" — the headline names a quarter before SCORE_FROM_QUARTER (an OLD line)
       "seen" — already handled on an earlier poll
     """
     fid = filing["id"]
@@ -1957,6 +2481,13 @@ def triage(filing: dict, state: ScannerState) -> str:
         state.finish(fid)
         return "intimation" if kind == "intimation" else "not relevant"
 
+    old = headline_old_quarter(filing["headline"])
+    if old:
+        log.debug(f"old quarter per headline: {filing['headline']!r}")
+        report("OLD", filing, f"{old}: old quarter per headline, ignored (scoring from {SCORE_FROM_QUARTER}) · not downloaded")
+        state.finish(fid)
+        return "old"
+
     state.learn_isin(filing)
     isin = lookup_isin(filing, state.master)
 
@@ -1972,10 +2503,15 @@ def triage(filing: dict, state: ScannerState) -> str:
 
     return kind
 
-def record_success(filing: dict, state: ScannerState, key: str):
-    state.processed.add(key)
-    save_processed_scrips(state.processed)
+def record_success(filing: dict, state: ScannerState, key: str | None):
+    if key:      # None for a flagged result: saved, but the company-quarter stays open
+        state.processed.add(key)
+        save_processed_scrips(state.processed)
     state.finish(filing["id"])
+
+def report_result(status: str, filing: dict, text: str):
+    """SCORE / ALERT / SKIP line; a FLAG (failed sanity check) is a warning."""
+    report(status, filing, text, level=logging.WARNING if status == "FLAG" else logging.INFO)
 
 def record_retry(filing: dict, state: ScannerState, reason: str, timings: dict,
                  error: BaseException | None = None, unknown_fin: dict | None = None):
@@ -2021,7 +2557,12 @@ def record_skip(filing: dict, state: ScannerState, skip: "SkipFiling", timings: 
             # A "Result" filing without a table is worth a look at what it was
             text += f" · headline: {shorten(filing['headline'], 160)!r}"
 
-    report(skip.status, filing, with_timings(text, timings))
+    # A vague board meeting outcome with no results is the expected case:
+    # counted in the terminal's summaries, not listed
+    quiet = ambiguous and skip.status == "NONE"
+    if quiet:
+        state.window["outcomes without results"] = state.window.get("outcomes without results", 0) + 1
+    report(skip.status, filing, with_timings(text, timings), console=not quiet)
     state.finish(filing["id"])
 
 def handle_clear(filing: dict, state: ScannerState):
@@ -2041,7 +2582,7 @@ def handle_clear(filing: dict, state: ScannerState):
         record_retry(filing, state, "", timings, error=e)
         return
 
-    report(status, filing, text)
+    report_result(status, filing, text)
     record_success(filing, state, key)
 
 def handle_ambiguous(filing: dict, state: ScannerState) -> bool:
@@ -2050,7 +2591,7 @@ def handle_ambiguous(filing: dict, state: ScannerState) -> bool:
         return False
 
     log_filing_details(filing, lookup_isin(filing, state.master))
-    report("CHECK", filing, "ambiguous outcome → queued for a results-table check")
+    report("CHECK", filing, "ambiguous outcome → queued for a results-table check", console=False)
     return True
 
 def apply_ambiguous_result(result: dict, state: ScannerState):
@@ -2090,7 +2631,7 @@ def apply_ambiguous_result(result: dict, state: ScannerState):
         record_retry(filing, state, "", timings, error=e)
         return
 
-    report(status, filing, text)
+    report_result(status, filing, text)
     record_success(filing, state, key)
 
 def drain_checks(state: ScannerState):
@@ -2146,54 +2687,145 @@ def run_cycle(state: ScannerState):
 
     drain_checks(state)
     queued = sum(handle_ambiguous(filing, state) for filing in ambiguous)
+    state.save_poll_marks()
 
     log.info(
         " · ".join([
             "done",
             plural(counts.get("results", 0), "result filing"),
             plural(counts.get("intimation", 0), "intimation") + " skipped",
+            *([f"{counts['old']} old quarter by headline"] if counts.get("old") else []),
             f"{queued} ambiguous queued",
             f"{counts.get('not relevant', 0)} not relevant",
             f"checker queue: {len(state.checker.in_flight)} pending",
         ]),
-        extra={"status": "POLL"},
+        extra={"status": "POLL", "console": False},
     )
+
+    for key, n in [("results", counts.get("results", 0)), ("intimations", counts.get("intimation", 0)),
+                   ("old by title", counts.get("old", 0)), ("outcomes to check", queued)]:
+        state.window[key] = state.window.get(key, 0) + n
+
+    terminal_summary(state)
+
+SUMMARY_WORDS = [   # window key, singular, plural — the "Caught up" line
+    ("results", "result filing", "result filings"),
+    ("outcomes to check", "board meeting outcome to check", "board meeting outcomes to check"),
+    ("outcomes without results", "outcome without results", "outcomes without results"),
+    ("intimations", "intimation skipped", "intimations skipped"),
+    ("old by title", "old result skipped by title", "old results skipped by title"),
+]
+POLL_WORDS = [      # shorter, for the per-poll line
+    ("results", "result", "results"),
+    ("outcomes to check", "outcome to check", "outcomes to check"),
+    ("outcomes without results", "outcome without results", "outcomes without results"),
+    ("intimations", "intimation skipped", "intimations skipped"),
+    ("old by title", "old result skipped", "old results skipped"),
+]
+
+def summary_parts(window: dict, words: list = SUMMARY_WORDS) -> list:
+    return [
+        f"{window[key]:,} {one if window[key] == 1 else many}"
+        for key, one, many in words
+        if window.get(key)
+    ]
+
+def poll_line(state) -> tuple:
+    """The terminal's line for one poll: (text, style).
+    "BSE 3 new  ·  NSE 0 new  ·  1 result  ·  2 intimations skipped" """
+    feeds = [
+        f"{ex} not answering" if state.fetched.get(ex) is None else f"{ex} {state.fetched[ex]:,} new"
+        for ex in ("BSE", "NSE")
+    ]
+    found = summary_parts(state.window, POLL_WORDS)
+    if any(state.fetched.get(ex) is None for ex in ("BSE", "NSE")):
+        style = "yellow"
+    else:
+        style = None if found else "dim"
+    return "  ·  ".join(feeds + (found or ["nothing relevant"])), style
+
+def terminal_summary(state):
+    """After the first poll: what the catch-up found, then a rule. After every
+    later poll: one POLL line, so the terminal shows each poll as it happens."""
+    if not state.caught_up:
+        state.caught_up = True
+        found = summary_parts(state.window) or ["nothing relevant"]
+        since = state.first_since
+        span = f"since {when_text(since)}" if since else "on today"
+        say(f"Caught up {span}  ·  {state.window.get('BSE', 0):,} BSE + {state.window.get('NSE', 0):,} NSE "
+            f"announcements  ·  " + "  ·  ".join(found))
+        say("─" * 24 + f"  watching for new filings every {POLL_INTERVAL_SEC}s  " + "─" * 24, "dim")
+    else:
+        text, style = poll_line(state)
+        say(text, style, word="POLL")
+
+    state.window = {}
 
 def poll_exchanges(state: ScannerState) -> list:
     """New filings from both exchanges plus pending retries, oldest first,
     so whichever exchange published a result first is the one processed.
-    Logs the POLL line with both fetch results."""
+    Logs the POLL line with both fetch results (file only; the terminal gets
+    a failure once, and a line when the exchange recovers)."""
     fresh, parts = [], []
+    poll_started = datetime.now()
+
+    def failed(exchange: str, detail: str, blocked: bool):
+        first = not state.failing.get(exchange)
+        state.failing[exchange] = True
+        state.fetched[exchange] = None
+        if blocked:
+            warn_blocked(exchange, detail, console=False)
+        else:
+            log.warning(f"{exchange}: fetch FAILED ({detail}) — announcements not read this poll", extra=QUIET)
+        if first:      # the terminal says it once, and again when it recovers
+            what = "is blocking the scanner (Access Denied) — Telegram warning sent" if blocked else \
+                   f"isn't answering ({shorten(detail, 60)})"
+            say(f"{exchange} {what}; retrying every poll, you'll see a line when it's back", "red")
+
+    def succeeded(exchange: str, new: list):
+        if state.failing.pop(exchange, None):
+            say(f"{exchange} is answering again", "green")
+        state.poll_marks[exchange] = poll_started
+        # First poll: count for the terminal only what's newer than the last
+        # run's read; a resumed range also returns the earlier part of that
+        # day, already handled. Later polls only return new rows: count them all.
+        mark = None if state.caught_up else state.checkpoint.get(exchange)
+        cutoff = mark - timedelta(minutes=2) if mark else None
+        count = sum(1 for f in new if not cutoff or not f["exchange_dt"] or f["exchange_dt"] >= cutoff)
+        state.fetched[exchange] = count
+        state.window[exchange] = state.window.get(exchange, 0) + count
 
     try:
-        filings, pages = fetch_bse_filings(state.bse_known_ids)
+        filings, pages = fetch_bse_filings(state.bse_known_ids, since=state.resume_from("BSE"))
         parts.append(
             f"BSE: {len(filings)} new announcements "
             f"(fetch OK, {pages} page{'' if pages == 1 else 's'} read)"
         )
         fresh += filings
+        succeeded("BSE", filings)
     except ExchangeBlocked as e:
-        warn_blocked("BSE", str(e))
+        failed("BSE", str(e), blocked=True)
         parts.append(f"BSE: fetch FAILED (blocked: {e})")
     except Exception as e:
-        log.warning(f"BSE: fetch FAILED ({e}) — announcements not read this poll")
+        failed("BSE", str(e), blocked=False)
         parts.append(f"BSE: fetch FAILED ({e})")
 
     try:
-        filings = fetch_nse_filings(state.nse)
+        filings = fetch_nse_filings(state.nse, since=state.resume_from("NSE"))
         # NSE returns the whole day every poll; only unseen ones go on
         new = [f for f in filings if f["id"] not in state.nse_known_ids]
         state.nse_known_ids.update(f["id"] for f in filings)
         parts.append(f"NSE: {len(new)} new announcements (fetch OK, {len(filings)} today)")
         fresh += new
+        succeeded("NSE", new)
     except ExchangeBlocked as e:
-        warn_blocked("NSE", str(e))
+        failed("NSE", str(e), blocked=True)
         parts.append(f"NSE: fetch FAILED (blocked: {e})")
     except Exception as e:
-        log.warning(f"NSE: fetch FAILED ({e}) — announcements not read this poll")
+        failed("NSE", str(e), blocked=False)
         parts.append(f"NSE: fetch FAILED ({e})")
 
-    log.info(" · ".join(parts), extra={"status": "POLL"})
+    log.info(" · ".join(parts), extra={"status": "POLL", "console": False})
 
     by_id = {f["id"]: f for f in state.pending.values()}
     by_id.update({f["id"]: f for f in fresh})
@@ -2209,14 +2841,14 @@ def dump_samples():
         (
             "BSE", "raw_bse_sample.json", BSE_HEADLINE_FIELDS,
             lambda: requests.get(
-                BSE_ANN_URL.format(page=1, date=today.strftime("%Y%m%d")),
+                BSE_ANN_URL.format(page=1, from_date=today.strftime("%Y%m%d"), to_date=today.strftime("%Y%m%d")),
                 headers=HEADERS,
                 timeout=15
             ),
         ),
         (
             "NSE", "raw_nse_sample.json", NSE_HEADLINE_FIELDS,
-            lambda: nse.get(NSE_ANN_URL.format(date=today.strftime("%d-%m-%Y"))),
+            lambda: nse.get(NSE_ANN_URL.format(from_date=today.strftime("%d-%m-%Y"), to_date=today.strftime("%d-%m-%Y"))),
         ),
     ]
 
@@ -2274,17 +2906,22 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
 
-    if args.verbose:
-        console_handler.setLevel(logging.DEBUG)
+    configure_console(args.verbose)
 
     if args.dump:
         dump_samples()
         return
 
+    global SCANNER_STARTED_AT
+    SCANNER_STARTED_AT = datetime.now()
+
     log.info(
         f"PEAD scanner · BSE + NSE · model {EXTRACTION_MODEL} · "
-        f"alert at score ≥ {PEAD_THRESHOLD} · scoring from {SCORE_FROM_QUARTER}"
+        f"alert at score ≥ {PEAD_THRESHOLD} · scoring from {SCORE_FROM_QUARTER}",
+        extra=QUIET,
     )
+    say(f"PEAD scanner  ·  {EXTRACTION_MODEL.split('/')[-1]}  ·  alerts at {PEAD_THRESHOLD}+  ·  "
+        f"scoring {SCORE_FROM_QUARTER} results  ·  {SCANNER_STARTED_AT:%a %d %b %Y}", "bold")
 
     initialize_csv()
 
@@ -2292,8 +2929,23 @@ def main(argv=None):
 
     log.info(
         f"Loaded {len(state.seen)} seen filings · {len(state.processed)} scored company-quarters · "
-        f"{len(state.retries)} awaiting retry"
+        f"{len(state.retries)} awaiting retry",
+        extra=QUIET,
     )
+    say(f"{len(state.master['bse']):,} BSE + {len(state.master['nse']):,} NSE companies  ·  "
+        f"{len(state.processed)} scored this quarter  ·  {len(state.retries)} awaiting retry", "dim")
+
+    state.first_since = state.resumed_since()
+    stop = state.last_stop()
+    if not state.first_since:
+        say("Scanning from 00:00 today  ·  no earlier run to pick up from", "cyan")
+    elif state.first_since > stop:
+        say(f"Scanning from {when_text(state.first_since)}  ·  last scan was {when_text(stop)}, "
+            f"catch-up goes back {MAX_RESUME_DAYS} days at most", "cyan")
+    else:
+        say(f"Scanning from {when_text(state.first_since)}  ·  where the last scan stopped", "cyan")
+    if stop:
+        log.info(f"Last scan {stop:%d %b %Y %H:%M:%S} · scanning from {state.first_since:%d %b %Y %H:%M:%S}", extra=QUIET)
 
     try:
         while True:
@@ -2307,4 +2959,5 @@ def main(argv=None):
 
 if __name__ == "__main__":
     setup_file_logging()
+    setup_terminal_log()
     main()

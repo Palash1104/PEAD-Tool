@@ -8,7 +8,7 @@ Post-Earnings Announcement Drift scanner for Indian stocks. It polls BSE and NSE
 |---|---|
 | [pead_tool.py](pead_tool.py) | The scanner. It is one procedural module with no package structure. |
 | [compare_models.py](compare_models.py) | Runs a folder of saved PDFs through two models and prints the extracted values side by side. |
-| [dashboard.py](dashboard.py) + [dashboard.html](dashboard.html) | Local read-only dashboard (`py dashboard.py`, http://127.0.0.1:8050). Standard library only. Reads the state files, `archive/*/pead_results.csv` and `pead_tool.log`. Its one outbound request is `/filing` (below). |
+| [dashboard.py](dashboard.py) + [dashboard.html](dashboard.html) | Local read-only dashboard (`py dashboard.py`, http://127.0.0.1:8050). Standard library only. Reads the state files, `archive/*/pead_results.csv`, `pead_tool.log` (live status, timings, exchange health) and `pead_terminal.log` (the Scanner log panel; falls back to `pead_tool.log` without DEBUG if it's missing). Its one outbound request is `/filing` (below). |
 | [test_pead.py](test_pead.py) | Offline tests. Run `python test_pead.py` and expect `FAILURES: 0`. Network, model and Telegram are mocked, and state files go to a temp dir. The PDF section uses the real pdfplumber, Poppler and Tesseract (about 15s of OCR). Keep it passing and extend it with any change. |
 
 ## Running
@@ -114,12 +114,12 @@ Each poll, `main()` calls `run_cycle()` and then `wait_for_checks()` until the n
    - `SkipFiling` is raised when retrying can't help: "no results table found", or an attachment that isn't a PDF. The filing is then logged, marked seen and never retried, and the model is not called.
    - Success, a skip, or giving up calls `state.finish()`, which marks the filing seen and clears its retry count.
 
-## Extraction (`extract_financials` = `get_result_text` + `extract_from_text`)
+## Extraction (`extract_financials` = `find_result_pages` + model call)
 
 - pdfplumber reads pages 1–`MAX_PDF_PAGES` (25).
 - If the whole PDF has under `MIN_TEXT_CHARS` (500) of text, it is OCR'd.
 - Otherwise, if no result table is found in the text layer, the pages under `LOW_TEXT_PAGE_CHARS` (200) are OCR'd. That handles a text cover letter with scanned result pages.
-- `ocr_pages()` works one page at a time (Poppler at 250 dpi, then Tesseract) and stops once a consolidated table and its next page are readable. OCR takes about 2s per page.
+- `ocr_pages()` works one page at a time (Poppler at `LOCATE_OCR_DPI` = 150, then Tesseract) and stops once a consolidated table and its next page are readable. This OCR only *locates* the table (keywords), so low resolution is fine; it records which pages were OCR'd.
 - `find_table_pages()`:
   - A page is a results table if it shows at least 2 of the 5 `TABLE_MARKERS` kinds: income, expenses, profit before tax, net profit and EPS.
     - Each kind is a regex covering company, NBFC, broker and bank wording, e.g. "Total Revenue", "Profit/(Loss) before Tax", "Earning per equity share", "Interest earned/expended", "Operating profit before provisions".
@@ -129,10 +129,44 @@ Each poll, `main()` calls `run_cycle()` and then `wait_for_checks()` until the n
   - The first page in `TABLE_PREFERENCE` order (consolidated, standalone, generic, untitled) is sent, together with the next page.
   - There is **no keyword fallback**. If no page is a results table, even after OCR, `get_result_text` returns `(None, "no results table found")` and `extract_financials` raises `SkipFiling`.
 - `extract_from_text(text, model)` sends `EXTRACTION_PROMPT` plus the page text with `max_tokens=1500` and no truncation. The JSON is sliced from the first `{` to the last `}`.
+- **Scanned result pages go to the model as images** (since 2026-10-07; Tiaan Consumer and Golkonda Aluminium came back with impossible figures from Tesseract digits). `extract_from_page_images()` sends the selected scanned pages as grayscale PNGs at `IMAGE_DPI` (150), long edge capped at `IMAGE_MAX_EDGE` (1568, Claude's limit), and text-layer pages as text. Rendering time is `timings["render"]`.
+  - If the image call fails, the selected scanned pages are re-OCR'd at `FALLBACK_OCR_DPI` (250) and sent as text. A provider error that rejects images sets `_images_rejected` and text is used for the rest of the run; other errors fall back for that filing only. `SEND_SCANS_AS_IMAGES = False` restores the old text-only behaviour.
+  - Not yet verified live: whether AICredits passes `image_url` PNG parts through to Haiku. The fallback covers a refusal; watch for a "Provider rejected page images" warning.
+- `get_result_text()` still returns `(text, reason)` for `compare_models.py`; scanned pages there are locating-quality OCR text.
+- `_call_model(..., raw_out=)` puts the model's raw JSON in `raw_out["data"]` even when validation fails, so `obtain_financials` can still see `period_end`.
 - `normalise_financials()` validates the reply:
   - Every `FIN_KEYS` entry becomes a 3-float list `[cq, pq, ly]`.
   - Amounts are converted to ₹ crore in code from `unit` (`UNIT_TO_CRORE`). EPS is never converted.
   - It keeps `basis`, `unit` and the three column dates `period_end`, `prev_period_end` and `ly_period_end` (ISO strings or None). An unknown unit fails the extraction.
+
+### After extraction (`obtain_financials`), in this order
+1. **Old quarter first**: if `period_end` (from the validated result, or the raw JSON when validation failed, e.g. no unit) is before `SCORE_FROM_QUARTER`, the filing is `OLD` and never retried. A date over 400 days old only counts if all three column dates line up, so a misread year is retried instead.
+2. Missing extraction / revenue / PAT → retry. 3. Quarter unknown → retry. 4. Column dates don't line up → retry.
+5. **Sanity check** `numbers_problem()` on the current and year-ago columns: total income must not be below revenue, no expense line above total expenses, and income − total expenses must be near PBT (within max(10% of income, 25% of PBT)) or PAT (within max(10% of income, 50% of PAT)). A failure sets `fin["check"]`: the row is saved with that reason in the `check` CSV column, logged as a `FLAG` warning, **never alerted**, and the company-quarter is **not** marked processed, so the other exchange's copy or a corrected filing can still score. The dashboard treats flagged rows as not alerted.
+
+### Before download
+- `triage()` reads quarter-end dates written in the headline (`headline_period_ends`: 31.03.2025, 30th June 2026, September 30th, 2026, 30-Jun-2026, …). If the latest one is before `SCORE_FROM_QUARTER`, the filing is logged `OLD … per headline · not downloaded` and marked seen; counted as "N old quarter by headline" in the POLL summary. Using the latest date means a headline that also names a 30 Sep meeting is never skipped.
+
+### Catch-up
+- `SCANNER_STARTED_AT` is set in `main()`. Filings published before it get "(catch-up)" after their exchange→alert/scored delay (and in Telegram's Delay). `dashboard.py` sets `catchup` on those timing entries and the dashboard's delay median excludes them.
+
+## Resuming after a stop
+- `scan_checkpoint.json` holds, per exchange, when its last completed poll started. It is saved at the end of each cycle (after the cycle's clear filings are handled), and only for exchanges whose fetch succeeded.
+- `ScannerState.resume_from(exchange)` returns the first day to fetch: the checkpoint's day if it's before today, at most `MAX_RESUME_DAYS` (7) back, else None (today only). `fetch_bse_filings(known, since=)` and `fetch_nse_filings(nse, since=)` request that date range (BSE `strPrevDate`/`strToDate`, NSE `from_date`/`to_date`).
+- So a stop at 9 pm and a restart at 4 pm next day reads from 9 pm yesterday, and the first poll after midnight also re-reads yesterday (closes the midnight gap). `seen.json` stops anything already handled from being processed twice. On the first poll the terminal's counts only include announcements newer than the checkpoint (minus 2 min); later polls count every new row.
+- `ScannerState.last_stop()` is the earlier of the two checkpoints; `resumed_since()` is that, floored at `MAX_RESUME_DAYS` back, also for a same-day restart (today is re-read, but what came before that time was already handled). None when there is no checkpoint. The banner's third line says it: "Scanning from 21:01 yesterday · where the last scan stopped", "Scanning from 00:00 today · no earlier run to pick up from", or the capped variant. `when_text()` gives "HH:MM today / yesterday / on Mon 05 Oct".
+
+## Terminal vs log file
+- `pead_tool.log` keeps the full `LineFormatter` layout with every POLL, CHECK and DEBUG line; `dashboard.py` parses it, so keep its phrases stable.
+- The terminal (`configure_console`, `ConsoleFormatter`) shows a clean view of the same records:
+  - a 3-line banner (model, threshold, quarter and the date; companies, scored, awaiting retry; "Scanning from …")
+  - one colour-coded line per filing that matters (`console_text()` drops the ⏱ breakdown, shortens wording, adds "Ns after filing" to alerts)
+  - after the first poll a "Caught up since … / on today" summary and a rule
+  - after every later poll one line from `poll_line()`: "POLL   BSE 3 new  ·  NSE 0 new  ·  1 result  ·  2 intimations skipped" (`POLL_WORDS`); dim when nothing relevant, yellow and "BSE not answering" while an exchange fails
+  - exchange failures also get their own line once, and again on recovery.
+- Records logged with `extra={"console": False}` (`QUIET`) are file-only: queued CHECKs, vague outcomes without results, per-filing warnings, fetch details, scrip master and processed-key housekeeping. `say(text, style, word)` writes terminal-only lines via the `pead_console` logger, which the `pead_tool.log` handler drops; `word` fills the status column (the POLL line).
+- `pead_terminal.log` (`setup_terminal_log()`, attached in `__main__` only) is a colourless copy of exactly what the clean terminal prints, whatever `--verbose` says. The dashboard's Scanner log panel shows its last 100 lines and colours them by the same status words.
+- Colours use ANSI (turned on in Windows consoles via `SetConsoleMode`); off when `NO_COLOR` is set or output is redirected. `--verbose` restores the full file layout in the terminal, DEBUG included.
 
 ## PEAD score (max 50)
 
@@ -162,6 +196,7 @@ Growth is `_pct(curr, prev) = (curr - prev) / abs(prev) * 100`. `band_score` awa
 | `pead_results.csv` | One row per scored filing | ignored |
 | `raw_bse_sample.json`, `raw_nse_sample.json` | `--dump` output | ignored |
 | `pead_tool.log` (+ `.1`–`.3`) | The console lines plus DEBUG detail, UTF-8, rotating at 5 MB with 3 backups. `setup_file_logging()` is attached only in the `__main__` block, so tests and `compare_models.py` don't write to it. Always lives next to `pead_tool.py`. | ignored |
+| `pead_terminal.log` (+ `.1`–`.2`) | Copy of the clean terminal, UTF-8, rotating at 1 MB with 2 backups. Read by the dashboard's Scanner log panel. | ignored |
 
 - **Scrip master**: built from BSE `ListofScripData` and NSE `EQUITY_L.csv` / `SME_EQUITY_L.csv`, refreshed daily. `updated` is only stamped when both downloads succeed, and failed downloads keep the cached mappings. NSE filings also teach symbol → ISIN (`learn_isin`).
 - **CSV columns**: timestamp, company, scrip (code or symbol), score, revenue/pat/ebitda for cq, pq and ly, eps_cq, eps_ly, exchange, filing_url (the result PDF's `attachment_url`), period_end, quarter (e.g. `Q2FY27`, or `UNKNOWN`), basis, unit.
