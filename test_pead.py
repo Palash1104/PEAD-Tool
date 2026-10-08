@@ -642,11 +642,12 @@ class Stop(Exception):
 fetch_since = []      # (exchange, since) each run_main fetch was asked for
 
 def run_main(polls, bse=lambda known: [], nse=lambda client: [], extract=None, master=None,
-             download=None, on_wait=None, argv=()):
+             download=None, on_wait=None, argv=(), events=None):
     """Run pt.main() for a number of polls with everything external mocked.
 
     Between polls the default waits for queued ambiguous checks to finish and
     applies them, so runs are deterministic; on_wait(state, poll) replaces that.
+    `events`, when given, gets "alert" each time an alert is sent, in order.
     """
     counter = {"n": 0}
     def fake_wait(state, seconds):
@@ -659,6 +660,11 @@ def run_main(polls, bse=lambda known: [], nse=lambda client: [], extract=None, m
         if counter["n"] >= polls:
             raise Stop()
     alerts = []
+    def fake_send(filing, *a):
+        alerts.append(filing["exchange"] + ":" + filing["company"])
+        if events is not None:
+            events.append("alert")
+        return True
     def fake_bse(known, since=None):
         fetch_since.append(("BSE", since))
         return bse(known), 1
@@ -671,7 +677,7 @@ def run_main(polls, bse=lambda known: [], nse=lambda client: [], extract=None, m
          mock.patch.object(pt, "fetch_nse_master", lambda client: dict((master or {}).get("nse", {}))), \
          mock.patch.object(pt, "download_pdf", download or (lambda filing, client: b"%PDF-" + filing["attachment_url"].encode())), \
          mock.patch.object(pt, "extract_financials", extract), \
-         mock.patch.object(pt, "send_telegram", lambda filing, *a: alerts.append(filing["exchange"] + ":" + filing["company"]) or True), \
+         mock.patch.object(pt, "send_telegram", fake_send), \
          mock.patch.object(pt, "send_telegram_text", lambda text: True), \
          mock.patch.object(pt, "wait_for_checks", fake_wait):
         try:
@@ -2151,6 +2157,17 @@ with mock.patch.object(pt, "publish_announcements", lambda filings, master: None
     without = run_main(1, bse=lambda k: [bse_r], nse=lambda c: [nse_r], extract=extract,
                        master={"bse": {"500001": "INE000A01011"}, "nse": {}})
 check("alerts are the same with and without sharing", alerts == without and alerts, (alerts, without))
+
+# The write comes after the poll's alerts, so a slow one can never delay an alert.
+fresh_state_dir()
+events = []
+extract, calls = counting_extract({bse_r["attachment_url"]: good_fin, nse_r["attachment_url"]: good_fin})
+with mock.patch.object(pt, "publish_announcements",
+                       lambda filings, master: events.append(("publish", [f["id"] for f in filings]))):
+    run_main(1, bse=lambda k: [bse_r], nse=lambda c: [nse_r], extract=extract,
+             master={"bse": {"500001": "INE000A01011"}, "nse": {}}, events=events)
+check("announcements are shared only after the poll's alerts are sent",
+      events == ["alert", "alert", ("publish", ["BSE:r1", "NSE:r2"])], events)
 
 print(f"\nFAILURES: {fails}")
 sys.exit(1 if fails else 0)

@@ -2373,6 +2373,7 @@ class ScannerState:
         self.first_since = None                # where this run picks up (None = start of today)
         self.checkpoint = load_checkpoint()    # exchange → start of its last completed poll
         self.poll_marks = {}                   # this cycle's successful fetches, saved when it ends
+        self.unpublished = []                  # this poll's new announcements, for BASIS after the alerts
         self.refresh_master()
 
     def refresh_master(self):
@@ -2688,6 +2689,10 @@ def run_cycle(state: ScannerState):
 
     drain_checks(state)
     queued = sum(handle_ambiguous(filing, state) for filing in ambiguous)
+    # Shared with BASIS only now, once this poll's alerts are sent, so a slow write can
+    # never delay one. Before the poll marks are saved: a crash first re-reads them.
+    publish_announcements(state.unpublished, state.master)
+    state.unpublished = []
     state.save_poll_marks()
 
     log.info(
@@ -2763,8 +2768,9 @@ def terminal_summary(state):
     state.window = {}
 
 # ── SHARED ANNOUNCEMENTS (read by BASIS) ─────────────────────
-# Every announcement a poll reads is also appended to this SQLite file, which BASIS
-# (Downloads/news_scanner) opens read-only to follow BSE filings for its stock watchlist.
+# Every announcement a poll reads is also appended to this SQLite file, once that poll's
+# alerts are sent (run_cycle), which BASIS (Downloads/news_scanner) opens read-only to
+# follow BSE filings for its stock watchlist.
 # Additive only: nothing here changes what is polled, scored or alerted, and a failure to
 # write is logged to the file log and ignored. exchange_time is the exchange's own clock
 # (IST), as the scanner parses it; fetched_at carries its UTC offset.
@@ -2891,7 +2897,7 @@ def poll_exchanges(state: ScannerState) -> list:
         parts.append(f"NSE: fetch FAILED ({e})")
 
     log.info(" · ".join(parts), extra={"status": "POLL", "console": False})
-    publish_announcements(fresh, state.master)
+    state.unpublished = list(fresh)    # shared with BASIS by run_cycle, after the alerts
 
     by_id = {f["id"]: f for f in state.pending.values()}
     by_id.update({f["id"]: f for f in fresh})
