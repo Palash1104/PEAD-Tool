@@ -52,6 +52,7 @@ def fresh_state_dir():
     pt.RETRIES_FILE = os.path.join(d, "retries.json")
     pt.SCRIP_MASTER_FILE = os.path.join(d, "master.json")
     pt.CHECKPOINT_FILE = os.path.join(d, "checkpoint.json")
+    pt.ANNOUNCEMENTS_DB = os.path.join(d, "announcements.db")
     pt._last_blocked_alert.clear()
     return d
 
@@ -2079,6 +2080,54 @@ out = io.StringIO()
 with mock.patch.object(pt.client.chat.completions, "create", side_effect=AssertionError("model called")), mock.patch("sys.stdout", out):
     result = compare_models.compare_pdf(cover_path, "model-a", "model-b")
 check("compare skips PDFs without a results table", result["mismatches"] is None and "no results table found" in out.getvalue())
+
+section("announcements shared with BASIS (additive)")
+import sqlite3
+
+def shared_rows():
+    if not os.path.exists(pt.ANNOUNCEMENTS_DB):
+        return []
+    conn = sqlite3.connect(pt.ANNOUNCEMENTS_DB)
+    try:
+        return conn.execute(
+            "SELECT id, exchange, company, code, isin, category, exchange_time FROM announcements ORDER BY id"
+        ).fetchall()
+    finally:
+        conn.close()
+
+fresh_state_dir()
+bse_a = pt.normalise_bse(bse_raw("a1", 541154, "Company Update", "2026-10-07T11:02:00", sub="Clarification"))
+nse_a = pt.normalise_nse(nse_raw("n1", "PFOCUS", "INE367G01020", "07-Oct-2026 11:05:31", desc="News Verification"))
+master = {"bse": {"541154": "INE066F01012"}, "nse": {}}
+pt.publish_announcements([bse_a, nse_a], master)
+pt.publish_announcements([bse_a], master)          # read again on a later poll
+rows = shared_rows()
+check("every announcement read is stored once", [r[0] for r in rows] == ["BSE:a1", "NSE:n1"], rows)
+check("BSE rows get their ISIN from the scrip master", rows[0][4] == "INE066F01012", rows)
+check("NSE rows keep the ISIN NSE sends", rows[1][4] == "INE367G01020", rows)
+check("the exchange's time is kept", rows[0][6] == "2026-10-07T11:02:00", rows)
+
+pt.ANNOUNCEMENTS_DB = os.path.join(tempfile.mkdtemp(prefix="pead_ann_"), "no", "such", "dir", "a.db")
+try:
+    pt.publish_announcements([bse_a], master)
+    check("an unwritable file never stops a poll", True)
+except Exception as e:
+    check("an unwritable file never stops a poll", False, e)
+
+# A whole run: the poll stores what it read, and alerts are exactly what they were.
+fresh_state_dir()
+bse_r = pt.normalise_bse(bse_raw("r1", 500001, "Result", "2026-09-24T10:02:00"))
+nse_r = pt.normalise_nse(nse_raw("r2", "XYZ", "INE000B01011", "24-Sep-2026 10:05:00"))
+extract, calls = counting_extract({bse_r["attachment_url"]: good_fin, nse_r["attachment_url"]: good_fin})
+alerts = run_main(1, bse=lambda k: [bse_r], nse=lambda c: [nse_r], extract=extract,
+                  master={"bse": {"500001": "INE000A01011"}, "nse": {}})
+check("a poll shares both exchanges' announcements", [r[0] for r in shared_rows()] == ["BSE:r1", "NSE:r2"], shared_rows())
+fresh_state_dir()
+extract, calls = counting_extract({bse_r["attachment_url"]: good_fin, nse_r["attachment_url"]: good_fin})
+with mock.patch.object(pt, "publish_announcements", lambda filings, master: None):
+    without = run_main(1, bse=lambda k: [bse_r], nse=lambda c: [nse_r], extract=extract,
+                       master={"bse": {"500001": "INE000A01011"}, "nse": {}})
+check("alerts are the same with and without sharing", alerts == without and alerts, (alerts, without))
 
 print(f"\nFAILURES: {fails}")
 sys.exit(1 if fails else 0)

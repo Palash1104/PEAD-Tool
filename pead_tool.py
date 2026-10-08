@@ -33,6 +33,7 @@ import requests
 import pdfplumber
 import io
 import queue
+import sqlite3
 import sys
 import threading
 from datetime import datetime, date, timedelta
@@ -2761,6 +2762,58 @@ def terminal_summary(state):
 
     state.window = {}
 
+# ── SHARED ANNOUNCEMENTS (read by BASIS) ─────────────────────
+# Every announcement a poll reads is also appended to this SQLite file, which BASIS
+# (Downloads/news_scanner) opens read-only to follow BSE filings for its stock watchlist.
+# Additive only: nothing here changes what is polled, scored or alerted, and a failure to
+# write is logged to the file log and ignored. exchange_time is the exchange's own clock
+# (IST), as the scanner parses it.
+ANNOUNCEMENTS_DB = os.getenv("PEAD_ANNOUNCEMENTS_DB") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "announcements.db"
+)
+
+def publish_announcements(filings: list, master: dict):
+    """Append `filings` to ANNOUNCEMENTS_DB, one row each, keyed by the scanner's own id, so
+    a filing read twice is stored once. The ISIN comes from the scrip master, as for
+    scoring. Never raises."""
+    fetched_at = datetime.now().isoformat(timespec="seconds")
+    rows = []
+    for f in filings:
+        if not f.get("id"):
+            continue
+        try:
+            isin = lookup_isin(f, master)
+        except (KeyError, AttributeError, TypeError):
+            isin = f.get("isin")
+        when = f.get("exchange_dt")
+        rows.append((
+            f["id"], f.get("exchange"), f.get("company"), f.get("code"), isin, f.get("category"),
+            f.get("headline"), f.get("attachment_url"), when.isoformat() if when else None,
+            fetched_at,
+        ))
+    if not rows:
+        return
+    try:
+        conn = sqlite3.connect(ANNOUNCEMENTS_DB, timeout=2)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")   # BASIS reads while this writes
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS announcements (id TEXT PRIMARY KEY, exchange TEXT, "
+                "company TEXT, code TEXT, isin TEXT, category TEXT, headline TEXT, "
+                "attachment_url TEXT, exchange_time TEXT, fetched_at TEXT)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_announcements_time ON announcements (exchange_time)"
+            )
+            conn.executemany(
+                "INSERT OR IGNORE INTO announcements VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        log.warning(f"announcements for BASIS not written ({e})", extra=QUIET)
+
 def poll_exchanges(state: ScannerState) -> list:
     """New filings from both exchanges plus pending retries, oldest first,
     so whichever exchange published a result first is the one processed.
@@ -2826,6 +2879,7 @@ def poll_exchanges(state: ScannerState) -> list:
         parts.append(f"NSE: fetch FAILED ({e})")
 
     log.info(" · ".join(parts), extra={"status": "POLL", "console": False})
+    publish_announcements(fresh, state.master)
 
     by_id = {f["id"]: f for f in state.pending.values()}
     by_id.update({f["id"]: f for f in fresh})

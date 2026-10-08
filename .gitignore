@@ -11,3 +11,4 @@ processed_scrips.json
 archive/
 scan_checkpoint.json
 pead_terminal.log*
+announcements.db*
