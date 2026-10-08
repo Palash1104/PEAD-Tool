@@ -2767,7 +2767,10 @@ def terminal_summary(state):
 # (Downloads/news_scanner) opens read-only to follow BSE filings for its stock watchlist.
 # Additive only: nothing here changes what is polled, scored or alerted, and a failure to
 # write is logged to the file log and ignored. exchange_time is the exchange's own clock
-# (IST), as the scanner parses it.
+# (IST), as the scanner parses it; fetched_at carries its UTC offset.
+# BASIS reads by seq, the order rows were written in, never by exchange_time: a filing this
+# tool backfills after a restart is written late but is still read. AUTOINCREMENT keeps seq
+# from ever being reused or renumbered.
 ANNOUNCEMENTS_DB = os.getenv("PEAD_ANNOUNCEMENTS_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "announcements.db"
 )
@@ -2775,38 +2778,47 @@ ANNOUNCEMENTS_DB = os.getenv("PEAD_ANNOUNCEMENTS_DB") or os.path.join(
 def publish_announcements(filings: list, master: dict):
     """Append `filings` to ANNOUNCEMENTS_DB, one row each, keyed by the scanner's own id, so
     a filing read twice is stored once. The ISIN comes from the scrip master, as for
-    scoring. Never raises."""
-    fetched_at = datetime.now().isoformat(timespec="seconds")
-    rows = []
-    for f in filings:
-        if not f.get("id"):
-            continue
-        try:
-            isin = lookup_isin(f, master)
-        except (KeyError, AttributeError, TypeError):
-            isin = f.get("isin")
-        when = f.get("exchange_dt")
-        rows.append((
-            f["id"], f.get("exchange"), f.get("company"), f.get("code"), isin, f.get("category"),
-            f.get("headline"), f.get("attachment_url"), when.isoformat() if when else None,
-            fetched_at,
-        ))
-    if not rows:
-        return
+    scoring. Never raises: building the rows is inside the guard too, and a filing that
+    can't be turned into a row is skipped on its own, so it costs neither the poll nor the
+    other rows."""
     try:
+        fetched_at = datetime.now().astimezone().isoformat(timespec="seconds")
+        rows = []
+        for f in filings:
+            try:
+                if not f.get("id"):
+                    continue
+                try:
+                    isin = lookup_isin(f, master)
+                except (KeyError, AttributeError, TypeError):
+                    isin = f.get("isin")
+                when = f.get("exchange_dt")
+                rows.append((
+                    f["id"], f.get("exchange"), f.get("company"), f.get("code"), isin,
+                    f.get("category"), f.get("headline"), f.get("attachment_url"),
+                    when.isoformat() if when else None, fetched_at,
+                ))
+            except Exception as e:
+                log.warning(f"announcement for BASIS skipped ({e})", extra=QUIET)
+        if not rows:
+            return
         conn = sqlite3.connect(ANNOUNCEMENTS_DB, timeout=2)
         try:
             conn.execute("PRAGMA journal_mode=WAL")   # BASIS reads while this writes
             conn.execute(
-                "CREATE TABLE IF NOT EXISTS announcements (id TEXT PRIMARY KEY, exchange TEXT, "
-                "company TEXT, code TEXT, isin TEXT, category TEXT, headline TEXT, "
-                "attachment_url TEXT, exchange_time TEXT, fetched_at TEXT)"
+                "CREATE TABLE IF NOT EXISTS announcements (seq INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "id TEXT NOT NULL UNIQUE, exchange TEXT, company TEXT, code TEXT, isin TEXT, "
+                "category TEXT, headline TEXT, attachment_url TEXT, exchange_time TEXT, "
+                "fetched_at TEXT)"
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS ix_announcements_time ON announcements (exchange_time)"
             )
             conn.executemany(
-                "INSERT OR IGNORE INTO announcements VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows
+                "INSERT OR IGNORE INTO announcements (id, exchange, company, code, isin, category, "
+                "headline, attachment_url, exchange_time, fetched_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                rows,
             )
             conn.commit()
         finally:

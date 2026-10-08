@@ -2107,6 +2107,29 @@ check("BSE rows get their ISIN from the scrip master", rows[0][4] == "INE066F010
 check("NSE rows keep the ISIN NSE sends", rows[1][4] == "INE367G01020", rows)
 check("the exchange's time is kept", rows[0][6] == "2026-10-07T11:02:00", rows)
 
+# A filing backfilled after a restart is written later but filed earlier: BASIS reads by
+# seq (write order), so it must come after everything already written.
+bse_late = pt.normalise_bse(bse_raw("a0", 541154, "Company Update", "2026-10-07T02:00:00"))
+pt.publish_announcements([bse_late], master)
+conn = sqlite3.connect(pt.ANNOUNCEMENTS_DB)
+seqs = dict(conn.execute("SELECT id, seq FROM announcements").fetchall())
+stamps = [r[0] for r in conn.execute("SELECT fetched_at FROM announcements").fetchall()]
+conn.close()
+check("rows are numbered in the order they were written, not filed",
+      seqs["BSE:a0"] > seqs["NSE:n1"] > seqs["BSE:a1"], seqs)
+check("fetched_at carries its UTC offset",
+      all(datetime.fromisoformat(s).utcoffset() is not None for s in stamps), stamps)
+
+odd = dict(bse_a, id="BSE:odd", exchange_dt="07-Oct-2026 11:02")   # not a datetime
+good = pt.normalise_bse(bse_raw("a2", 541154, "Company Update", "2026-10-07T12:00:00"))
+try:
+    pt.publish_announcements([odd, good], master)
+    check("an odd filing never stops a poll", True)
+except Exception as e:
+    check("an odd filing never stops a poll", False, e)
+ids = [r[0] for r in shared_rows()]
+check("an odd filing is skipped on its own", "BSE:a2" in ids and "BSE:odd" not in ids, ids)
+
 pt.ANNOUNCEMENTS_DB = os.path.join(tempfile.mkdtemp(prefix="pead_ann_"), "no", "such", "dir", "a.db")
 try:
     pt.publish_announcements([bse_a], master)
