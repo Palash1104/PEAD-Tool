@@ -46,14 +46,15 @@ Each poll, `main()` calls `run_cycle()` and then `wait_for_checks()` until the n
 
 **Terminal log (LineFormatter).** Every line is `HH:MM:SS  STATUS  message`.
 - Filing lines come from `report(status, filing, text)`: exchange, `short_company()` (Ltd/Limited/-$ stripped, padded to `COMPANY_WIDTH` 30), then the text. Each is built whole in one call, so threads can't interleave it. Every filing handled gets exactly one line:
-  - `SKIP`: already scored, or not a PDF
+  - `SKIP`: already scored, already flagged (a second failing copy saves no row), a byte-identical copy of a PDF already handled this run ("same PDF as the BSE 09 Oct 16:35 filing (MISS)"), or not a PDF
+  - `MISS`: the model answered but without current-quarter revenue or PAT (insurers, banks, shell companies, wrong pages); never retried
   - `CHECK`: ambiguous outcome queued
   - `NONE`: no results table; for a "Result" filing the line includes its headline (160 chars)
   - `SCORE` / `ALERT`: `score/50  quarter  basis`, plus "Telegram sent/FAILED" on alerts
   - `OLD`: before `SCORE_FROM_QUARTER`
   - `RETRY`: reason · "retry n/3" or "gave up after n attempts"
   - `ERROR`: unexpected exception, logged at ERROR level; the traceback goes to DEBUG
-- Each cycle has one `POLL` line with both fetch results ("BSE: N new announcements (fetch OK, P pages read) · NSE: …") and one `POLL` summary: "done · N result filings · N intimations skipped · N ambiguous queued · N not relevant · checker queue: N pending". There is no "Sleeping" line.
+- Each cycle has one `POLL` line with both fetch results ("BSE: N new announcements (fetch OK, P pages read) · NSE: …") and one `POLL` summary: "done · N result filings · N intimations skipped · N ambiguous queued · [N of them retries ·] N not relevant · checker queue: N pending". Retried filings are counted apart in the terminal ("3 retries"). There is no "Sleeping" line.
 - Intimations and not-relevant filings are only counted. `triage()` returns a verdict (results / ambiguous / intimation / not relevant / duplicate / seen), and `run_cycle` counts it.
 - Other lines use their level word: `INFO` (startup, migrations), `WARN`, `ERROR`, `DEBUG`. Warnings and errors (fetch failures, blocks, model/OCR/Telegram problems) always get their own line.
 - ISIN, headline source and full headline, exchange time, PDF size, OCR/page-selection notes and the model's raw JSON are DEBUG.
@@ -72,11 +73,12 @@ Each poll, `main()` calls `run_cycle()` and then `wait_for_checks()` until the n
 - `format_timings` appends them to the filing's line, e.g. `⏱ download 1.2s · page scan 0.3s · OCR 6.1s · model 3.4s · exchange→alert 2m 13s` ("exchange→scored" when there is no alert).
 
 1. **Fetch** (`poll_exchanges`)
-   - **BSE**: `fetch_bse_filings(known_ids)` reads `AnnSubCategoryGetData` pages. It stops when a page has no NEWSIDs unseen on earlier polls, or at the row's `TotalPageCnt`, capped at `BSE_MAX_PAGES` (100). It returns only new rows, so `state.pending` re-queues filings awaiting retry.
+   - **BSE**: `fetch_bse_filings(known_ids, since)` reads `AnnSubCategoryGetData` **one day at a time** (`fetch_bse_day`, `strPrevDate` = `strToDate`), oldest day first, so a long catch-up never hits the page cap. Each day stops when a page has no NEWSIDs unseen on earlier polls, or at the row's `TotalPageCnt`, capped at `BSE_MAX_PAGES` (100). It returns only new rows, so `state.pending` re-queues filings awaiting retry. `known_ids` is only updated once every page was read.
      - Verified 2026-09-24: 50 rows per page, newest first, and an out-of-range page returns an empty `Table`. A busy day runs 30+ pages.
      - BSE returns **403 unless `HEADERS` includes `Origin` and `Accept`**. User-Agent and Referer alone stopped working, for both the API and the scrip master. PDF downloads work either way.
    - **NSE**: `fetch_nse_filings(NseClient)` calls `/api/corporate-announcements` for today. `NseClient` primes cookies from the NSE homepage and re-primes once on 401/403.
-   - `fetch_bse_filings` returns `(new filings, pages read)`. A page-1 failure raises; a later page failing keeps the earlier pages.
+   - `fetch_bse_filings` returns `(new filings, pages read)`. **Any page failing raises** (nothing half-read: keeping earlier pages would let the checkpoint move past the rest).
+   - **An empty answer can be a failure.** BSE's API sometimes returns an empty list (7 Oct 2026 21:12; 9 Oct 2026 20:27, which moved the checkpoint past all of 8 Oct, never read). `empty_day_is_wrong(day)`: an empty first page for any past weekday, or today on a weekday from 10 am, raises "empty answer for 08 Oct, not believable", so the poll counts as failed and is read again next poll. Weekends may be empty. NSE gets the same check on its whole range. After `EMPTY_ANSWERS_BELIEVED` (10) empty answers in a row for the same day (~5 min) it is taken as genuinely quiet (a holiday), with a warning, so it can't stall the catch-up for good.
    - Poll logs read "BSE: N new announcements (fetch OK, P pages read)" and "NSE: N new announcements (fetch OK, M today)". A failure logs "BSE/NSE: fetch FAILED (…)", so a quiet poll and a failed one look different.
    - An Access Denied, 401 or 403 response raises `ExchangeBlocked`. `warn_blocked()` then logs an error every poll and sends Telegram at most every `BLOCKED_ALERT_SEC` per exchange. A block is never treated as zero announcements.
    - Filings from both exchanges plus pending ones are sorted oldest first, so whichever exchange published first is processed.
@@ -109,9 +111,12 @@ Each poll, `main()` calls `run_cycle()` and then `wait_for_checks()` until the n
    - If that key is already processed, the filing is a duplicate: no score and no alert.
    - Otherwise it scores, writes the CSV and alerts, and returns the key. It returns None on failure.
 6. **Retry or skip**
-   - `obtain_financials` raises `RetryFiling(reason)` on a retryable failure: no attachment, download failed, model/extraction failed, missing revenue or PAT, quarter unknown, or column dates that don't line up. A crash is treated the same way.
+   - `obtain_financials` raises `RetryFiling(reason)` on a retryable failure: no attachment, download failed, the model call failed or its reply wasn't JSON, quarter unknown, or column dates that don't line up. A crash is treated the same way.
+   - **No retry when the model answered** but gave no usable figures or no revenue/PAT: that's `SkipFiling(status="MISS")`. The same PDF reads the same; on 9 Oct 2026, 52 of 59 model calls were such retries (insurers, HFCs, shell companies, each filed 2–4 times).
+   - **Out of credits** (`CreditsExhausted`, not a `RetryFiling`): `_call_model` recognises an AICredits refusal for lack of credits (`is_credit_error`: HTTP 402, or 400/401/403/429 whose message mentions credits, balance, quota, billing…). The terminal says so once in red (and `ERROR` in the log). Filings that need the model are held in `pending` (`state.held`, a `WAIT` line in the log file only), without using a retry or being marked seen; while waiting nothing is downloaded or sent to the model, except one model call every `CREDITS_RECHECK_SEC` (300) to check. When a call succeeds the terminal says the credits are back (green) and the held filings are read on the next polls. The POLL line shows "N waiting for credits" (yellow).
+   - **Same PDF, read once**: `obtain_financials` hashes each PDF (sha256). A byte-identical copy of one already handled this run (`_pdf_memory`, in memory, last `PDF_MEMORY_SIZE`) is skipped with "same PDF as the … filing (STATUS)". Remembered on success and on `SkipFiling`, not on `RetryFiling`.
    - `QuarterUnknown` is a `RetryFiling` that carries the extraction. Only when the last attempt also fails does `record_retry` score it and write **one** CSV row with quarter `UNKNOWN`, never alerted or added to processed. The line reads "… · gave up after 4 attempts · saved as quarter UNKNOWN (x/50, no alert)". A retry that recovers leaves only the real row. The filing is retried on later polls, up to `MAX_RETRIES` (3) extra attempts. The counts persist in `retry_counts.json`, so restarts don't reset them.
-   - `SkipFiling` is raised when retrying can't help: "no results table found", or an attachment that isn't a PDF. The filing is then logged, marked seen and never retried, and the model is not called.
+   - `SkipFiling` is raised when retrying can't help: "no results table found", an attachment that isn't a PDF, a MISS or a same-PDF copy. The filing is then logged, marked seen and never retried.
    - Success, a skip, or giving up calls `state.finish()`, which marks the filing seen and clears its retry count.
 
 ## Extraction (`extract_financials` = `find_result_pages` + model call)
@@ -119,7 +124,9 @@ Each poll, `main()` calls `run_cycle()` and then `wait_for_checks()` until the n
 - pdfplumber reads pages 1–`MAX_PDF_PAGES` (25).
 - If the whole PDF has under `MIN_TEXT_CHARS` (500) of text, it is OCR'd.
 - Otherwise, if no result table is found in the text layer, the pages under `LOW_TEXT_PAGE_CHARS` (200) are OCR'd. That handles a text cover letter with scanned result pages.
-- `ocr_pages()` works one page at a time (Poppler at `LOCATE_OCR_DPI` = 150, then Tesseract) and stops once a consolidated table and its next page are readable. This OCR only *locates* the table (keywords), so low resolution is fine; it records which pages were OCR'd.
+- **Scans with the scanner's own text layer**: `is_scanned_page()` — one image covering ≥ `SCAN_IMAGE_COVER` (85%) of the page. That layer can be too garbled to show the table (GM Breweries, 8 Oct 2026: row names, no figures, "lncome"). If still no table, those pages are OCR'd too, most table-like first (`table_hints`: line-item kinds, +3 for a consolidated title, +2 for another results title), within the same OCR page limit. `find_result_pages` returns them as `found["scans"]`.
+- `TABLE_MARKERS` income also accepts the OCR misreads "lncome" / "1ncome".
+- `ocr_pages()` works one page at a time in the order given (Poppler at `LOCATE_OCR_DPI` = 150, then Tesseract); once a consolidated table is found its next page is OCR'd next, and it stops when both are readable. This OCR only *locates* the table (keywords), so low resolution is fine; it records which pages were OCR'd.
 - `find_table_pages()`:
   - A page is a results table if it shows at least 2 of the 5 `TABLE_MARKERS` kinds: income, expenses, profit before tax, net profit and EPS.
     - Each kind is a regex covering company, NBFC, broker and bank wording, e.g. "Total Revenue", "Profit/(Loss) before Tax", "Earning per equity share", "Interest earned/expended", "Operating profit before provisions".
@@ -128,8 +135,8 @@ Each poll, `main()` calls `run_cycle()` and then `wait_for_checks()` until the n
   - Its type comes from `RESULT_HEADINGS` in its first 20 lines, and a table with an unrecognised title is "untitled".
   - The first page in `TABLE_PREFERENCE` order (consolidated, standalone, generic, untitled) is sent, together with the next page.
   - There is **no keyword fallback**. If no page is a results table, even after OCR, `get_result_text` returns `(None, "no results table found")` and `extract_financials` raises `SkipFiling`.
-- `extract_from_text(text, model)` sends `EXTRACTION_PROMPT` plus the page text with `max_tokens=1500` and no truncation. The JSON is sliced from the first `{` to the last `}`.
-- **Scanned result pages go to the model as images** (since 2026-10-07; Tiaan Consumer and Golkonda Aluminium came back with impossible figures from Tesseract digits). `extract_from_page_images()` sends the selected scanned pages as grayscale PNGs at `IMAGE_DPI` (150), long edge capped at `IMAGE_MAX_EDGE` (1568, Claude's limit), and text-layer pages as text. Rendering time is `timings["render"]`.
+- `extract_from_text(text, model)` sends `EXTRACTION_PROMPT` plus the page text with `max_tokens=1500`, `temperature=0` (two reads of the same PDF differed on 9 Oct 2026) and no truncation. The JSON is sliced from the first `{` to the last `}`.
+- **Scanned result pages go to the model as images** (`is_scan()`: OCR'd by us, or a full-page scan even if its own text layer was used to find it — scanner digits can't be trusted) (since 2026-10-07; Tiaan Consumer and Golkonda Aluminium came back with impossible figures from Tesseract digits). `extract_from_page_images()` sends the selected scanned pages as grayscale PNGs at `IMAGE_DPI` (150), long edge capped at `IMAGE_MAX_EDGE` (1568, Claude's limit), and text-layer pages as text. Rendering time is `timings["render"]`.
   - If the image call fails, the selected scanned pages are re-OCR'd at `FALLBACK_OCR_DPI` (250) and sent as text. A provider error that rejects images sets `_images_rejected` and text is used for the rest of the run; other errors fall back for that filing only. `SEND_SCANS_AS_IMAGES = False` restores the old text-only behaviour.
   - Not yet verified live: whether AICredits passes `image_url` PNG parts through to Haiku. The fallback covers a refusal; watch for a "Provider rejected page images" warning.
 - `get_result_text()` still returns `(text, reason)` for `compare_models.py`; scanned pages there are locating-quality OCR text.
@@ -141,8 +148,8 @@ Each poll, `main()` calls `run_cycle()` and then `wait_for_checks()` until the n
 
 ### After extraction (`obtain_financials`), in this order
 1. **Old quarter first**: if `period_end` (from the validated result, or the raw JSON when validation failed, e.g. no unit) is before `SCORE_FROM_QUARTER`, the filing is `OLD` and never retried. A date over 400 days old only counts if all three column dates line up, so a misread year is retried instead.
-2. Missing extraction / revenue / PAT → retry. 3. Quarter unknown → retry. 4. Column dates don't line up → retry.
-5. **Sanity check** `numbers_problem()` on the current and year-ago columns: total income must not be below revenue, no expense line above total expenses, and income − total expenses must be near PBT (within max(10% of income, 25% of PBT)) or PAT (within max(10% of income, 50% of PAT)). A failure sets `fin["check"]`: the row is saved with that reason in the `check` CSV column, logged as a `FLAG` warning, **never alerted**, and the company-quarter is **not** marked processed, so the other exchange's copy or a corrected filing can still score. The dashboard treats flagged rows as not alerted.
+2. Model call failed / reply not JSON → retry; model answered without usable figures, revenue or PAT → `MISS`, no retry. 3. Quarter unknown → retry. 4. Column dates don't line up → retry.
+5. **Sanity check** `numbers_problem()` on the current and year-ago columns: total income must not be below revenue, no expense line above total expenses, and income − total expenses (± `exceptional_items`, either sign, since tables print it both ways) must be near PBT (within max(10% of income, 25% of PBT)) or PAT (within max(10% of income, 50% of PAT)). `exceptional_items` is whatever the table prints between total expenses and PBT (exceptional items, share of associates/JVs); Bridge Securities (9 Oct 2026) was a false FLAG from a year-ago gain before it was extracted. A failure sets `fin["check"]`: the row is saved with that reason in the `check` CSV column, logged as a `FLAG` warning, **never alerted**, and the company-quarter is **not** marked processed, so a different copy (e.g. the other exchange's) can still score. It goes into `flagged_scrips.json` instead, and another copy that also fails saves no second row (`SKIP … already flagged`). The dashboard treats flagged rows as not alerted.
 
 ### Before download
 - `triage()` reads quarter-end dates written in the headline (`headline_period_ends`: 31.03.2025, 30th June 2026, September 30th, 2026, 30-Jun-2026, …). If the latest one is before `SCORE_FROM_QUARTER`, the filing is logged `OLD … per headline · not downloaded` and marked seen; counted as "N old quarter by headline" in the POLL summary. Using the latest date means a headline that also names a 30 Sep meeting is never skipped.
@@ -192,6 +199,7 @@ Growth is `_pct(curr, prev) = (curr - prev) / abs(prev) * 100`. `band_score` awa
 | `seen.json` | Filing ids finished with. Bare legacy ids load as `BSE:` ids. | ignored |
 | `processed_scrips.json` | `{ISIN}_{quarter}` keys (or the `{EXCHANGE}-{code}_{quarter}` fallback). `migrate_processed_keys()` upgrades legacy or fallback keys at startup and at the daily master refresh. It logs "Migrated N processed keys to ISIN format" and lists the keys still without an ISIN. | ignored (untracked 2026-09-26) |
 | `retry_counts.json` | filing id → failed attempts | ignored |
+| `flagged_scrips.json` | Company-quarter keys saved as FLAG (failed sanity check); a second failing copy is skipped | ignored |
 | `scrip_master.json` | `{"bse": {code: ISIN}, "nse": {symbol: ISIN}, "updated"}` | ignored |
 | `pead_results.csv` | One row per scored filing | ignored |
 | `raw_bse_sample.json`, `raw_nse_sample.json` | `--dump` output | ignored |
@@ -223,6 +231,8 @@ Growth is `_pct(curr, prev) = (curr - prev) / abs(prev) * 100`. `band_score` awa
   - There is no Quarter column in the table. The detail panel shows the quarter, the quarter-end date (or "quarter from filing date") and the basis.
   - `alerted(r)` is score ≥ threshold and quarter not UNKNOWN. It drives "Alerts sent", "Alerts only", ▲, the badge and the skyline colours.
   - `dashboard.html` links the Exch. cell to `/filing?url=<filing_url>&exchange=&scrip=`, or straight to the company's exchange page (dotted underline) when `filing_url` is blank. It only accepts https links on bseindia.com / nseindia.com.
+  - The company name (table and detail panel) links to Screener: `screenerUrl()` → `https://www.screener.in/company/<scrip>/` (BSE code or NSE symbol both work there), plus `consolidated/` when the row's basis is consolidated. No link when the scrip has unexpected characters.
+  - Clicking a row selects it and opens a quick view under it (`quickView()` / `placeQuick()`, `S.openId`): two columns. Left: revenue, EBITDA, PAT and EPS for the three quarters (this quarter bold) with QoQ and YoY, plus EBITDA and net margins with their change in percentage points (labels all left-aligned, no indent). Right: the score and its factors from `scorecard()` with fill bars. All numbers in the primary text colour; direction is a small green/red arrow. The sanity-check reason, if any, runs underneath. Stacks to one column under 1100 px. Clicking the open row closes it; it stays open across data refreshes.
 - **`/filing` in dashboard.py**: BSE moves result PDFs from `AttachLive` to `AttachHis` after a few months. Checked 2026-09-26: May filings 404 on AttachLive and load from AttachHis, mid-August ones are in both, and today's are only on AttachLive.
   - `resolve_filing()` checks AttachLive, then AttachHis, by fetching the first 8 bytes and looking for `%PDF`. It redirects (302) to the first one that works, else to the company page.
   - Results are cached for 6h. NSE archive links pass through unchecked. Any other URL is never fetched.

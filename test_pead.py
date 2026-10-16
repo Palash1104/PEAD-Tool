@@ -52,8 +52,12 @@ def fresh_state_dir():
     pt.RETRIES_FILE = os.path.join(d, "retries.json")
     pt.SCRIP_MASTER_FILE = os.path.join(d, "master.json")
     pt.CHECKPOINT_FILE = os.path.join(d, "checkpoint.json")
+    pt.FLAGGED_FILE = os.path.join(d, "flagged.json")
     pt.ANNOUNCEMENTS_DB = os.path.join(d, "announcements.db")
     pt._last_blocked_alert.clear()
+    pt._pdf_memory.clear()
+    pt._empty_answers.clear()
+    pt._credits.update(out=False, since=None, next_try=0.0, detail="")
     return d
 
 class FakeResponse:
@@ -317,9 +321,67 @@ def flaky(url, headers=None, timeout=None):
     if page == 2:
         raise pt.requests.ConnectionError("reset")
     return FakeResponse(200, {"Table": [row(100 + page)]})
+known_before = {"x"}
 with mock.patch.object(pt.requests, "get", flaky), mock.patch.object(pt.time, "sleep"):
-    got, pages = pt.fetch_bse_filings(set())
-check("later page failing keeps earlier pages", [f["id"] for f in got] == ["BSE:n101"] and pages == 1, (got, pages))
+    try:
+        pt.fetch_bse_filings(known_before)
+        check("a later page failing fails the whole read", False)
+    except RuntimeError as e:
+        check("a later page failing fails the whole read (nothing half-read, ids untouched)",
+              "page 2 failed" in str(e) and known_before == {"x"}, (str(e), known_before))
+
+# One day at a time, oldest first; ids only remembered once every day was read
+from datetime import timedelta
+day_calls = []
+def by_day(url, headers=None, timeout=None):
+    day = url.split("strPrevDate=")[1].split("&")[0]
+    day_calls.append((day, url.split("strToDate=")[1].split("&")[0], int(url.split("pageno=")[1].split("&")[0])))
+    return FakeResponse(200, {"Table": [dict(row(int(day[-2:]) * 10 + i), TotalPageCnt=1) for i in range(2)]})
+two_days_ago = date.today() - timedelta(days=2)
+known_days = set()
+with mock.patch.object(pt.requests, "get", by_day), mock.patch.object(pt.time, "sleep"):
+    got, pages = pt.fetch_bse_filings(known_days, since=two_days_ago)
+check("catch-up reads BSE one day at a time, oldest first",
+      [(a, b) for a, b, _ in day_calls] == [(f"{two_days_ago + timedelta(days=n):%Y%m%d}",) * 2 for n in range(3)]
+      and len(got) == 6 and pages == 3 and len(known_days) == 6, (day_calls, pages))
+
+weekday = date(2026, 10, 8)      # a Thursday
+check("an empty past weekday can't be right", pt.empty_day_is_wrong(weekday, datetime(2026, 10, 9, 20, 27)))
+check("an empty weekend day can be", not pt.empty_day_is_wrong(date(2026, 10, 10), datetime(2026, 10, 12, 9, 0)))
+check("today: empty before 10 am is fine, after it isn't",
+      not pt.empty_day_is_wrong(weekday, datetime(2026, 10, 8, 7, 30)) and pt.empty_day_is_wrong(weekday, datetime(2026, 10, 8, 10, 0)))
+
+def empty_middle_day(url, headers=None, timeout=None):
+    day = url.split("strPrevDate=")[1].split("&")[0]
+    if day == f"{two_days_ago + timedelta(days=1):%Y%m%d}":
+        return FakeResponse(200, {"Table": []})
+    return FakeResponse(200, {"Table": [dict(row(int(day[-2:]) * 10), TotalPageCnt=1)]})
+known_days = set()
+with mock.patch.object(pt.requests, "get", empty_middle_day), mock.patch.object(pt.time, "sleep"), \
+     mock.patch.object(pt, "empty_day_is_wrong", lambda day, now=None: True):
+    try:
+        pt.fetch_bse_filings(known_days, since=two_days_ago)
+        check("an impossible empty day fails the read", False)
+    except RuntimeError as e:
+        check("an impossible empty day fails the read (9 Oct 2026: 8 Oct was skipped)",
+              "empty answer for" in str(e) and known_days == set(), (str(e), known_days))
+with mock.patch.object(pt.requests, "get", empty_middle_day), mock.patch.object(pt.time, "sleep"), \
+     mock.patch.object(pt, "empty_day_is_wrong", lambda day, now=None: False):
+    got, pages = pt.fetch_bse_filings(set(), since=two_days_ago)
+check("a believable empty day is just empty", len(got) == 2, got)
+
+pt._empty_answers.clear()
+outcomes = []
+with mock.patch.object(pt.requests, "get", empty_middle_day), mock.patch.object(pt.time, "sleep"), \
+     mock.patch.object(pt, "empty_day_is_wrong", lambda day, now=None: True):
+    for _ in range(pt.EMPTY_ANSWERS_BELIEVED):
+        try:
+            outcomes.append(len(pt.fetch_bse_filings(set(), since=two_days_ago)[0]))
+        except RuntimeError:
+            outcomes.append("failed")
+check("a day still empty after 10 polls is taken as a quiet day (a holiday can't stall the catch-up)",
+      outcomes == ["failed"] * (pt.EMPTY_ANSWERS_BELIEVED - 1) + [2], outcomes)
+pt._empty_answers.clear()
 
 with mock.patch.object(pt.requests, "get", side_effect=pt.requests.ConnectionError("down")):
     try:
@@ -745,7 +807,7 @@ failing = pt.normalise_bse(bse_raw("f1", 111, "Result", "2026-09-24T10:00:00"))
 crashing = pt.normalise_bse(bse_raw("c1", 444, "Result", "2026-09-24T10:00:00"))
 intimation = pt.normalise_bse(bse_raw("i1", 333, "Board Meeting", "2026-09-24T10:00:00", sub="Board Meeting Intimation for Financial Results"))
 outcome = pt.normalise_bse(bse_raw("o1", 222, "Board Meeting", "2026-09-24T10:00:00", sub="Board Meeting Outcome for Financial Results"))
-behaviour = {failing["attachment_url"]: mk(pat=[1, 1, 1]),            # no revenue → failure
+behaviour = {failing["attachment_url"]: None,                          # model call failed → retried
              crashing["attachment_url"]: RuntimeError("kaboom"),
              outcome["attachment_url"]: good_fin}
 extract, calls = counting_extract(behaviour)
@@ -1016,17 +1078,52 @@ check("no 'Sleeping' lines", not logs.has("Sleeping"))
 fresh_state_dir()
 flaky = pt.normalise_bse(bse_raw("r1", 911, "Result", "2026-09-24T10:00:00"))
 boom_f = pt.normalise_bse(bse_raw("r2", 912, "Result", "2026-09-24T10:00:00"))
-extract, calls = counting_extract({flaky["attachment_url"]: mk(pat=[1, 1, 1]), boom_f["attachment_url"]: RuntimeError("kaboom")})
+extract, calls = counting_extract({flaky["attachment_url"]: None, boom_f["attachment_url"]: RuntimeError("kaboom")})
 with LogCapture() as logs:
     run_main(4, bse=lambda k: [flaky, boom_f], extract=extract)
 check("RETRY line: reason and retry count",
-      logs.has_line("RETRY", "Co 911", "missing current-quarter revenue or PAT · retry 1/3"), logs.terminal())
+      logs.has_line("RETRY", "Co 911", "could not extract financials · retry 1/3"), logs.terminal())
 check("RETRY line when giving up", logs.has_line("RETRY", "Co 911", "gave up after 4 attempts"))
+check("POLL summary counts the retries", logs.has_line("POLL", "done · 2 result filings", "2 of them retries"),
+      [m for st, _, m in logs.records if st == "POLL"])
+
 check("crash: one ERROR line at ERROR level, traceback only in DEBUG",
       any(st == "ERROR" and lvl == logging.ERROR and "Co 912" in m and "unexpected error: RuntimeError: kaboom · retry 1/3" in m
           for st, lvl, m in logs.records)
       and not any("Traceback" in m for _, m in logs.terminal()), logs.terminal())
 
+# The model answered without revenue or PAT: one MISS line, never retried (9 Oct 2026: 52 of 59 calls were such retries)
+fresh_state_dir()
+no_rev = pt.normalise_bse(bse_raw("m1", 921, "Result", "2026-10-09T16:00:00"))
+all_null = pt.normalise_bse(bse_raw("m2", 922, "Result", "2026-10-09T16:01:00"))
+def answered_nothing(pdf, ambiguous=False, timings=None, raw_out=None, **kw):
+    name = pdf.decode()[len("%PDF-"):]
+    calls[name] = calls.get(name, 0) + 1
+    if name == no_rev["attachment_url"]:
+        return mk(period_end="2026-09-30", pat=[1, 1, 1], total_income=[9, 4, 1])
+    if raw_out is not None:
+        raw_out["data"] = {"basis": None, "unit": None, "revenue_from_operations": [None, None, None]}
+    return None
+calls = {}
+with LogCapture() as logs:
+    run_main(4, bse=lambda k: [no_rev, all_null], extract=answered_nothing)
+check("no revenue: MISS, read once, not retried",
+      logs.has_line("MISS", "Co 921", "no current-quarter revenue from operations in the table · not retried")
+      and calls[no_rev["attachment_url"]] == 1 and "BSE:m1" in pt.load_seen(), (calls, logs.terminal()))
+check("model answered with nothing usable: MISS, not retried",
+      logs.has_line("MISS", "Co 922", "the model found no figures it could use") and calls[all_null["attachment_url"]] == 1
+      and pt.load_retries() == {}, (calls, logs.terminal()))
+
+# The same PDF filed again (BSE "Board Meeting" + "Result", or on NSE too) is read once
+fresh_state_dir()
+copy_a = pt.normalise_bse(bse_raw("d1", 931, "Result", "2026-10-09T16:35:00", sub="Financial Results", attach="same.pdf"))
+copy_b = pt.normalise_bse(bse_raw("d2", 931, "Result", "2026-10-09T16:41:00", sub="Unaudited Financial Results", attach="same.pdf"))
+calls = {}
+with LogCapture() as logs:
+    run_main(1, bse=lambda k: [copy_a, copy_b], extract=answered_nothing)
+check("an identical PDF is not read again",
+      sum(calls.values()) == 1 and logs.has_line("SKIP", "Co 931", "same PDF as the BSE 09 Oct 16:35 filing (MISS) · not read again"),
+      (calls, logs.terminal()))
 # A "Result" filing without a table names its headline
 fresh_state_dir()
 no_tab = pt.normalise_bse(bse_raw("n1", 913, "Result", "2026-09-26T17:32:26",
@@ -1695,6 +1792,82 @@ with mock.patch.object(pt.client.chat.completions, "create", fake_create):
     except pt.SkipFiling:
         check("scanned PDF with no table after OCR -> SkipFiling", not sent_requests)
 
+def scan_with_text_layer(pages, layers):
+    """Scanned pages that carry the scanner's own invisible text layer (like GM
+    Breweries, 8 Oct 2026): a full-page JPEG plus `layers[i]` as text render mode 3."""
+    scans = pdfium.PdfDocument(scanned_pdf(pages))
+    objs = ["<< /Type /Catalog /Pages 2 0 R >>", None, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"]
+    streams, kids = {}, []
+    for i, lines in enumerate(layers):
+        im = scans[i].render(scale=100 / 72).to_pil().convert("RGB")
+        jpg = io.BytesIO()
+        im.save(jpg, "JPEG", quality=85)
+        objs.append(f"<< /Type /XObject /Subtype /Image /Width {im.width} /Height {im.height} /ColorSpace /DeviceRGB "
+                    f"/BitsPerComponent 8 /Filter /DCTDecode /Length {len(jpg.getvalue())} >>")
+        streams[len(objs)] = jpg.getvalue()
+        img_ref = len(objs)
+        text = " ".join("(" + l.replace("(", "\\(").replace(")", "\\)") + ") Tj T*" for l in lines)
+        body = f"q 595 0 0 842 0 0 cm /Im1 Do Q BT 3 Tr /F1 9 Tf 12 TL 40 800 Td {text} ET"
+        objs.append(f"<< /Length {len(body)} >>")
+        streams[len(objs)] = body.encode("latin-1")
+        objs.append(f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] "
+                    f"/Resources << /Font << /F1 3 0 R >> /XObject << /Im1 {img_ref} 0 R >> >> /Contents {len(objs)} 0 R >>")
+        kids.append(f"{len(objs)} 0 R")
+    objs[1] = f"<< /Type /Pages /Kids [{' '.join(kids)}] /Count {len(kids)} >>"
+    out, offsets = b"%PDF-1.4\n", []
+    for n, o in enumerate(objs, 1):
+        offsets.append(len(out))
+        out += f"{n} 0 obj\n{o}\n".encode("latin-1")
+        if n in streams:
+            out += b"stream\n" + streams[n] + b"\nendstream\n"
+        out += b"endobj\n"
+    xref = len(out)
+    out += f"xref\n0 {len(objs) + 1}\n0000000000 65535 f \n".encode()
+    out += "".join(f"{o:010d} 00000 n \n" for o in offsets).encode()
+    out += f"trailer\n<< /Size {len(objs) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF".encode()
+    return out
+
+# The scanner's layer: row names without figures, one table marker, padded past LOW_TEXT_PAGE_CHARS
+GARBLE = ["Begd. Office : Ganesh Niwas, S. Veer Savarkar Marg, Prabhadevi", "Particulars", "Finance Cost",
+          "Depreciation and amortisation expenses", "Tax exoenses I Current & Deffered Taxes",
+          "Loss on fair valuation oI investment in equiW shares (Net of"]
+GARBLE_CONS = ["Consolidated Unaudited Financial results for the"] + GARBLE
+layered = scan_with_text_layer(PAGES, [COVER, GARBLE, NOTES * 4, GARBLE_CONS, NOTES * 4])
+ocr_order = []
+real_ocr = pt.ocr_page
+def spy_order(pdf_bytes, page_num, dpi=pt.LOCATE_OCR_DPI):
+    ocr_order.append(page_num)
+    return real_ocr(pdf_bytes, page_num, dpi)
+with mock.patch.object(pt.client.chat.completions, "create", fake_create), mock.patch.object(pt, "ocr_page", spy_order):
+    import pdfplumber as _pp
+    with _pp.open(io.BytesIO(layered)) as _doc:
+        layer_ok = all(len((pg.extract_text() or "").strip()) >= pt.LOW_TEXT_PAGE_CHARS for pg in _doc.pages) \
+                   and all(pt.is_scanned_page(pg) for pg in _doc.pages)
+        no_table_in_layer = pt.find_table_pages([pg.extract_text() or "" for pg in _doc.pages]) == ([], None)
+    check("test PDF: scans with a full text layer that shows no table", layer_ok and no_table_in_layer)
+    sent_requests.clear()
+    fin = pt.extract_financials(layered)
+    sent = sent_page_labels(sent_requests[0]["messages"][0]["content"]) if sent_requests else []
+    check("scans with a garbled text layer are OCR'd, the consolidated-looking page first (GM Breweries)",
+          fin is not None and sent == [IMG(4), IMG(5)] and ocr_order == [4, 5], (ocr_order, sent))
+    with _pp.open(io.BytesIO(text_pdf(PAGES))) as _doc:
+        check("a text PDF has no scanned pages", not any(pt.is_scanned_page(pg) for pg in _doc.pages))
+
+    # A scan whose own layer does show the table: found without OCR, still sent as an image
+    readable = scan_with_text_layer(PAGES, [COVER, table_lines("Standalone"), NOTES * 4, table_lines("Consolidated"), NOTES * 4])
+    ocr_order.clear()
+    sent_requests.clear()
+    pt.extract_financials(readable)
+    sent = sent_page_labels(sent_requests[0]["messages"][0]["content"]) if sent_requests else []
+    check("scan with a usable layer: no OCR, but its pages go as images (its digits can't be trusted)",
+          ocr_order == [] and sent == [IMG(4), IMG(5)], (ocr_order, sent))
+
+check("OCR'd 'lncome' still counts as income",
+      pt.classify_result_page("Sales / lncome from operations 2,97,657\nFinance Cost\n") == "untitled")
+check("table hints: a consolidated title ranks first",
+      pt.table_hints("Consolidated Unaudited Financial results for the\nFinance Cost") >
+      pt.table_hints("Unaudited Financial results for the\nFinance Cost") > pt.table_hints("Finance Cost"))
+
 # ─────────────────────────────────────────────────────────────
 section("old quarter from the headline (7 Oct 2026 live run)")
 
@@ -1771,6 +1944,20 @@ check("expense line above total expenses fails",
                                                             total_expenses=[90, 80, 70], other_expenses=[500, 1, 1], pbt=[11, 11, 11])) or ""))
 check("high-margin company with only PAT passes (tax gap allowed)",
       pt.numbers_problem(fin_with(revenue_from_operations=[200, 150, 100], total_expenses=[100, 80, 50], pat=[70, 50, 35])) is None)
+check("Bridge Securities year-ago gain no longer flagged once the exceptional item is read",
+      pt.numbers_problem(fin_with(revenue_from_operations=[0.171, 0.4231, 0.1715], total_income=[0.1715, 0.4231, 0.1715],
+                                  total_expenses=[0.0289, 0.1287, 0.0306], exceptional_items=[None, None, 0.2516],
+                                  pbt=[0.1426, -0.1287, 0.3925], pat=[0.143, -0.1283, 0.3929])) is None)
+check("exceptional item printed as a positive loss still adds up",
+      pt.numbers_problem(fin_with(revenue_from_operations=[100, 90, 80], total_income=[100, 90, 80], total_expenses=[60, 60, 60],
+                                  exceptional_items=[30, None, None], pbt=[10, 30, 20])) is None)
+check("without the exceptional item it's still caught, with the item named when there is one",
+      "income 0.17 minus expenses 0.03 = 0.14, but PBT is 0.39" in (pt.numbers_problem(fin_with(
+          revenue_from_operations=[0.171, 0.4231, 0.1715], total_income=[0.1715, 0.4231, 0.1715],
+          total_expenses=[0.0289, 0.1287, 0.0306], pbt=[0.1426, -0.1287, 0.3925])) or "")
+      and "plus exceptional items 1.00 = 41.00, but PBT is 10.00" in (pt.numbers_problem(fin_with(
+          revenue_from_operations=[100, 90, 80], total_income=[100, 90, 80], total_expenses=[60, 60, 60],
+          exceptional_items=[1, None, None], pbt=[10, 30, 20])) or ""))
 check("exceptional item within 10% of income passes",
       pt.numbers_problem(fin_with(revenue_from_operations=[1000, 900, 800], total_income=[1000, 900, 800],
                                   total_expenses=[900, 820, 720], pbt=[80, 80, 80])) is None)
@@ -1792,6 +1979,20 @@ check("garbled row saved with its check reason, clean copy alerted",
       [(r["scrip"], bool(r["check"])) for r in rows] == [("500777", True), ("GARB", False)] and alerts == ["NSE:Co GARB"], (rows, alerts))
 check("only the clean copy closes the company-quarter",
       set(json.load(open(pt.PROCESSED_SCRIPS_FILE))) == {"INE777A01011_Q2FY27"} and {"BSE:g1", "NSE:g2"} <= pt.load_seen())
+
+# Two copies that both fail the check: one FLAG row, not two (Bridge Securities, 9 Oct 2026)
+fresh_state_dir()
+garbled_2 = pt.normalise_bse(bse_raw("g3", 500777, "Result", "2026-10-07T10:06:00", attach="g3.pdf"))
+extract, calls = counting_extract({garbled_bse["attachment_url"]: mk(period_end="2026-09-30", **GARBLED),
+                                   garbled_2["attachment_url"]: mk(period_end="2026-09-30", **GARBLED)})
+with LogCapture() as logs:
+    alerts = run_main(2, bse=lambda k: [garbled_bse, garbled_2], extract=extract,
+                      master={"bse": {"500777": "INE777A01011"}, "nse": {}})
+rows = list(csv.DictReader(open(pt.RESULTS_CSV, encoding="utf-8")))
+check("a second failing copy saves no second row",
+      len(rows) == 1 and logs.has_line("SKIP", "Co 500777", "already flagged") and alerts == []
+      and json.load(open(pt.FLAGGED_FILE)) == ["INE777A01011_Q2FY27"] and json.load(open(pt.PROCESSED_SCRIPS_FILE)) == [],
+      (rows, logs.terminal()))
 
 # ─────────────────────────────────────────────────────────────
 section("catch-up filings")
@@ -1907,6 +2108,11 @@ check("POLL line counts that poll's announcements and what they were",
 check("the alert comes before its poll's POLL line",
       out.index(poll_2[0]) == next(i for i, l in enumerate(out) if l.startswith("ALERT")) + 1, out)
 
+fake_state = type("S", (), {"fetched": {"BSE": 3, "NSE": 0}, "window": {"results": 1, "retries": 3}})()
+check("POLL line counts retries apart from new results (9 Oct 2026: retries showed as '12 results')",
+      pt.poll_line(fake_state) == ("BSE 3 new  ·  NSE 0 new  ·  1 result  ·  3 retries", None), pt.poll_line(fake_state))
+check("MISS lines are yellow in the terminal", pt.STATUS_COLOURS.get("MISS") == "yellow")
+
 line_rec = logging.LogRecord("pead_console", logging.INFO, __file__, 1, "BSE 0 new  ·  NSE 0 new  ·  nothing relevant", None, None)
 line_rec.word, line_rec.style = "POLL", "dim"
 check("POLL line coloured dim as a whole when enabled",
@@ -2002,18 +2208,20 @@ urls = []
 def record_bse(url, headers=None, timeout=None):
     urls.append(url)
     return FakeResponse(200, {"Table": []})
-with mock.patch.object(pt.requests, "get", record_bse):
+with mock.patch.object(pt.requests, "get", record_bse), mock.patch.object(pt, "empty_day_is_wrong", lambda d, now=None: False):
     pt.fetch_bse_filings(set(), since=yesterday)
     pt.fetch_bse_filings(set())
-check("BSE asks for the date range",
-      f"strPrevDate={yesterday:%Y%m%d}" in urls[0] and f"strToDate={today:%Y%m%d}" in urls[0]
-      and f"strPrevDate={today:%Y%m%d}" in urls[1], urls)
+check("BSE asks for each day from the resume day",
+      f"strPrevDate={yesterday:%Y%m%d}" in urls[0] and f"strToDate={yesterday:%Y%m%d}" in urls[0]
+      and f"strPrevDate={today:%Y%m%d}" in urls[1] and f"strToDate={today:%Y%m%d}" in urls[1]
+      and f"strPrevDate={today:%Y%m%d}" in urls[2] and len(urls) == 3, urls)
 urls.clear()
 class RecordingNse:
     def get(self, url, timeout=15):
         urls.append(url)
         return FakeResponse(200, [])
-pt.fetch_nse_filings(RecordingNse(), since=yesterday)
+with mock.patch.object(pt, "empty_day_is_wrong", lambda d, now=None: False):
+    pt.fetch_nse_filings(RecordingNse(), since=yesterday)
 check("NSE asks for the date range",
       f"from_date={yesterday:%d-%m-%Y}" in urls[0] and f"to_date={today:%d-%m-%Y}" in urls[0], urls)
 
@@ -2058,6 +2266,74 @@ run_main(1, bse=bse_fails, extract=extract)
 marks = pt.load_checkpoint()
 check("a failed exchange keeps its old checkpoint (read again next time)",
       marks["BSE"] == night and marks["NSE"].date() == today, marks)
+
+# ─────────────────────────────────────────────────────────────
+section("out of AICredits credits")
+
+class FakeAPIError(Exception):
+    def __init__(self, status, msg):
+        super().__init__(msg)
+        self.status_code = status
+
+check("402 means out of credits", pt.is_credit_error(FakeAPIError(402, "Payment Required")))
+check("400 'insufficient credits' means out of credits",
+      pt.is_credit_error(FakeAPIError(400, "Insufficient credits. Please top up your wallet")))
+check("429 'exceeded your current quota' means out of credits",
+      pt.is_credit_error(FakeAPIError(429, "You exceeded your current quota, please check your plan and billing details")))
+check("a plain rate limit is not", not pt.is_credit_error(FakeAPIError(429, "Rate limit reached for requests")))
+check("a server error is not", not pt.is_credit_error(FakeAPIError(500, "Internal server error")))
+check("an image refusal is not",
+      not pt.is_credit_error(FakeAPIError(400, "messages.0.content.1.image.source.base64.media_type: image not supported")))
+
+def reset_credits():
+    pt._credits.update(out=False, since=None, next_try=0.0, detail="")
+
+credit_pdf = text_pdf(PAGES)
+held_f = pt.normalise_bse(bse_raw("cr1", 600001, "Result", "2026-07-20T10:00:00"))
+model_calls, downloads = {"n": 0}, {"n": 0}
+def credit_download(filing, client):
+    downloads["n"] += 1
+    return credit_pdf
+def broke_then_topped_up(**kw):
+    model_calls["n"] += 1
+    if model_calls["n"] <= 2:
+        raise FakeAPIError(402, "Insufficient credits. Please top up your wallet.")
+    return Resp(MODEL_JSON)
+
+fresh_state_dir(); reset_credits()
+with mock.patch.object(pt.client.chat.completions, "create", broke_then_topped_up), \
+     mock.patch.object(pt, "CREDITS_RECHECK_SEC", 0), TerminalCapture() as term:
+    run_main(4, bse=lambda k: [held_f], extract=pt.extract_financials, download=credit_download)
+out = term.lines()
+check("terminal says once that credits ran out, and once that they're back",
+      sum("AICredits is out of credits" in l for l in out) == 1 and sum("AICredits credits are back" in l for l in out) == 1, out)
+check("POLL line counts the result waiting for credits",
+      any(l.startswith("POLL") and "1 waiting for credits" in l for l in out), out)
+rows = list(csv.DictReader(open(pt.RESULTS_CSV, encoding="utf-8")))
+check("the result waited without using retries, then was scored once credits were back",
+      model_calls["n"] == 3 and len(rows) == 1 and pt.load_retries() == {} and "BSE:cr1" in pt.load_seen(), (model_calls, rows))
+
+fresh_state_dir(); reset_credits()
+model_calls["n"], downloads["n"] = 0, 0
+def always_broke(**kw):
+    model_calls["n"] += 1
+    raise FakeAPIError(402, "Insufficient credits")
+with mock.patch.object(pt.client.chat.completions, "create", always_broke), TerminalCapture() as term:
+    run_main(3, bse=lambda k: [held_f], extract=pt.extract_financials, download=credit_download)
+check("while waiting for credits: no more model calls or downloads, no retry used, not marked seen",
+      model_calls["n"] == 1 and downloads["n"] == 1 and pt.load_retries() == {} and "BSE:cr1" not in pt.load_seen(),
+      (model_calls, downloads))
+check("every POLL line keeps counting the result waiting for credits",
+      sum(l.startswith("POLL") and "waiting for credits" in l for l in term.lines()) == 2, term.lines())
+
+fresh_state_dir(); reset_credits()
+model_calls["n"] = 0
+vague_cr = pt.normalise_bse(bse_raw("cr2", 600002, "Board Meeting", "2026-07-20T11:00:00", sub="Outcome of Board Meeting held today"))
+with mock.patch.object(pt.client.chat.completions, "create", always_broke):
+    run_main(1, bse=lambda k: [vague_cr], extract=pt.extract_financials, download=credit_download)
+check("a vague outcome checked in the background waits for credits too",
+      model_calls["n"] == 1 and pt.load_retries() == {} and "BSE:cr2" not in pt.load_seen(), model_calls)
+reset_credits()
 
 # ─────────────────────────────────────────────────────────────
 section("compare_models.py")

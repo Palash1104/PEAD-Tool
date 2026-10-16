@@ -12,3 +12,4 @@ archive/
 scan_checkpoint.json
 pead_terminal.log*
 announcements.db*
+flagged_scrips.json

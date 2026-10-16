@@ -19,6 +19,7 @@ import os
 from dotenv import load_dotenv
 import argparse
 import base64
+import hashlib
 import json
 import re
 import html
@@ -82,6 +83,7 @@ SEEN_FILE = "seen.json"
 RESULTS_CSV = "pead_results.csv"
 PROCESSED_SCRIPS_FILE = "processed_scrips.json"   # "{ISIN}_{quarter}" keys
 RETRIES_FILE = "retry_counts.json"                # filing id → failed attempts
+FLAGGED_FILE = "flagged_scrips.json"              # company-quarters saved with a failed sanity check
 SCRIP_MASTER_FILE = "scrip_master.json"           # BSE code / NSE symbol → ISIN
 CHECKPOINT_FILE = "scan_checkpoint.json"          # exchange → when its last completed poll started
 
@@ -177,7 +179,7 @@ ANSI = {
 }
 STATUS_COLOURS = {
     "ALERT": "green", "SCORE": "cyan",
-    "FLAG": "yellow", "RETRY": "yellow", "WARN": "yellow",
+    "FLAG": "yellow", "RETRY": "yellow", "WARN": "yellow", "MISS": "yellow",
     "ERROR": "red",
 }
 DIM_STATUSES = {"SKIP", "OLD", "NONE"}         # handled, nothing to act on
@@ -349,6 +351,12 @@ def load_processed_scrips() -> set:
 def save_processed_scrips(data: set):
     save_json(PROCESSED_SCRIPS_FILE, sorted(data))
 
+def load_flagged() -> set:
+    return set(load_json(FLAGGED_FILE, []))
+
+def save_flagged(data: set):
+    save_json(FLAGGED_FILE, sorted(data))
+
 def load_retries() -> dict:
     return load_json(RETRIES_FILE, {})
 
@@ -501,9 +509,10 @@ class ExchangeBlocked(Exception):
 
 class SkipFiling(Exception):
     """The filing can never yield a score (no results table, not a PDF, old
-    quarter): skip it for good, no retry. status is its terminal status word
-    (NONE for no results table, OLD for an old quarter, else SKIP);
-    model_called says whether the model had already read it."""
+    quarter, figures the model couldn't find): skip it for good, no retry.
+    status is its terminal status word (NONE for no results table, OLD for an
+    old quarter, MISS when the model answered without revenue or PAT, else
+    SKIP); model_called says whether the model had already read it."""
 
     def __init__(self, reason: str, model_called: bool = False, status: str = "SKIP"):
         super().__init__(reason)
@@ -511,8 +520,9 @@ class SkipFiling(Exception):
         self.status = status
 
 class RetryFiling(Exception):
-    """A failure worth retrying on a later poll (download, model, missing values,
-    column dates that don't line up)."""
+    """A failure worth retrying on a later poll: the download or the model call
+    failed, the reply wasn't JSON, or the column dates don't line up. Not when
+    the model answered without the figures: the same PDF reads the same."""
 
 class QuarterUnknown(RetryFiling):
     """The PDF never said which quarter it is (no usable period_end). Retried like
@@ -686,18 +696,61 @@ def fetch_bse_page(page: int, from_day: date, to_day: date | None = None) -> lis
     r.raise_for_status()
     return r.json().get("Table") or []
 
-def fetch_bse_filings(known_ids: set, since: date | None = None) -> tuple:
-    """New BSE announcements from `since` (default today) to today, newest
-    first, paging until a page has no new rows or the last page
-    (TotalPageCnt) is reached. Returns (new filings, pages read).
+def empty_day_is_wrong(day: date, now: datetime | None = None) -> bool:
+    """Whether an exchange answering "no announcements" for `day` can't be
+    true: any past weekday, or today on a weekday from 10 am. Both exchanges
+    get hundreds a day. BSE's API sometimes answers with an empty list (7 Oct
+    2026 21:12, 9 Oct 2026 20:27); taken at face value on 9 Oct it moved the
+    checkpoint past all of 8 Oct, which was never read."""
+    now = now or datetime.now()
+    if day.weekday() >= 5:          # weekends can be genuinely quiet
+        return False
+    return day < now.date() or now.hour >= 10
 
-    known_ids holds the NEWSIDs fetched on earlier polls and is updated in
-    place, so a normal poll reads page 1 and one page of already-known rows.
-    A failure on page 1 raises (nothing was read); a later page failing keeps
-    what the earlier pages returned.
+EMPTY_ANSWERS_BELIEVED = 10     # consecutive empty answers for one day before it's taken as quiet (a holiday)
+_empty_answers = {}             # (exchange, day) → consecutive empty answers
+
+def unbelievable_empty(exchange: str, day: date, wrong: bool) -> bool:
+    """An empty answer (for the range starting `day`) that should fail the
+    read: `wrong` per empty_day_is_wrong, and not yet EMPTY_ANSWERS_BELIEVED
+    times in a row (~5 minutes of polls). After that the day is taken as
+    genuinely quiet, so a holiday can't stall the catch-up for good."""
+    if not wrong:
+        return False
+    n = _empty_answers.get((exchange, day), 0) + 1
+    _empty_answers[(exchange, day)] = n
+    if n == EMPTY_ANSWERS_BELIEVED:
+        log.warning(f"{exchange}: {day:%d %b} came back empty {n} times in a row; taking it as a quiet day (holiday?)")
+    return n < EMPTY_ANSWERS_BELIEVED
+
+def fetch_bse_filings(known_ids: set, since: date | None = None) -> tuple:
+    """New BSE announcements from `since` (default today) to today, one day
+    at a time (each day ~25 pages at most, so a long catch-up never hits the
+    page cap). Returns (new filings, pages read).
+
+    known_ids holds the NEWSIDs fetched on earlier polls; it is updated only
+    if every page was read, so a failed read is repeated in full next poll.
+    Raises if any page fails, or a day's first page comes back empty when it
+    can't be (empty_day_is_wrong).
     """
     today = date.today()
-    first_day = min(since or today, today)
+    day = min(since or today, today)
+    fresh_ids, filings, pages = set(), [], 0
+
+    while day <= today:
+        got, read = fetch_bse_day(day, known_ids, fresh_ids)
+        filings += got
+        pages += read
+        day += timedelta(days=1)
+
+    known_ids.update(fresh_ids)
+    return filings, pages
+
+def fetch_bse_day(day: date, known_ids: set, fresh_ids: set) -> tuple:
+    """One day's new BSE announcements, newest first, paging until a page has
+    no new rows or the last page (TotalPageCnt). New NEWSIDs are added to
+    fresh_ids. Any page failing raises: keeping the pages before it would let
+    the checkpoint move past the rows after it, which would never be read."""
     filings = []
 
     for page in range(1, BSE_MAX_PAGES + 1):
@@ -705,27 +758,31 @@ def fetch_bse_filings(known_ids: set, since: date | None = None) -> tuple:
             time.sleep(0.5)   # only a startup backlog reads this deep; go gently
 
         try:
-            rows = fetch_bse_page(page, first_day, today)
+            rows = fetch_bse_page(page, day, day)
         except ExchangeBlocked:
             raise
         except Exception as e:
             if page == 1:
                 raise
-            log.warning(f"BSE: page {page} failed ({e}); keeping {len(filings)} new announcements from earlier pages")
-            page -= 1
-            break
+            raise RuntimeError(f"{day:%d %b} page {page} failed: {e}") from e
 
-        new_rows = [
-            row for row in rows
-            if str(row.get("NEWSID") or row.get("DT_TM") or "") not in known_ids
-        ]
+        if page == 1:
+            if not rows and unbelievable_empty("BSE", day, empty_day_is_wrong(day)):
+                raise RuntimeError(f"empty answer for {day:%d %b}, not believable")
+            if rows:
+                _empty_answers.pop(("BSE", day), None)
+
+        new_rows = []
+        for row in rows:
+            rid = str(row.get("NEWSID") or row.get("DT_TM") or "")
+            if rid not in known_ids and rid not in fresh_ids:
+                fresh_ids.add(rid)
+                new_rows.append(row)
 
         if not new_rows:
             break
 
-        for row in new_rows:
-            known_ids.add(str(row.get("NEWSID") or row.get("DT_TM") or ""))
-            filings.append(normalise_bse(row))
+        filings += [normalise_bse(row) for row in new_rows]
 
         try:
             if page >= int(rows[0].get("TotalPageCnt") or BSE_MAX_PAGES):
@@ -733,7 +790,7 @@ def fetch_bse_filings(known_ids: set, since: date | None = None) -> tuple:
         except (TypeError, ValueError):
             pass
     else:
-        log.warning(f"BSE: stopped at the {BSE_MAX_PAGES}-page cap, older filings may be missed")
+        log.warning(f"BSE: stopped at the {BSE_MAX_PAGES}-page cap for {day:%d %b}, older filings may be missed")
 
     return filings, page
 
@@ -749,6 +806,14 @@ def fetch_nse_filings(nse: NseClient, since: date | None = None) -> list:
     r.raise_for_status()
     data = r.json()
     rows = data if isinstance(data, list) else data.get("data") or []
+
+    if rows:
+        _empty_answers.pop(("NSE", first_day), None)
+    else:
+        wrong = any(empty_day_is_wrong(first_day + timedelta(days=n)) for n in range((today - first_day).days + 1))
+        if unbelievable_empty("NSE", first_day, wrong):
+            raise RuntimeError(f"empty answer from {first_day:%d %b}, not believable")
+
     return [normalise_nse(row) for row in rows]
 
 def download_pdf(filing: dict, nse: NseClient):
@@ -1084,6 +1149,7 @@ Extract these values exactly as printed, in the table's own unit (do NOT convert
 - employee_expense: Employee Benefit Expense
 - other_expenses: Other Expenses
 - total_expenses: Total Expenses
+- exceptional_items: whatever the table prints between Total Expenses and Profit Before Tax — exceptional or extraordinary items, share of profit/(loss) of associates and joint ventures (add them up if there are several); a gain positive, a loss negative; null if there is none
 - pbt: Profit Before Tax
 - pat: Profit After Tax for the quarter
 - basic_eps: Basic Earnings Per Share in Rs.
@@ -1111,6 +1177,7 @@ Return ONLY a JSON object, no explanation, no markdown:
 "employee_expense":[cq,pq,ly],
 "other_expenses":[cq,pq,ly],
 "total_expenses":[cq,pq,ly],
+"exceptional_items":[cq,pq,ly],
 "pbt":[cq,pq,ly],
 "pat":[cq,pq,ly],
 "basic_eps":[cq,pq,ly]
@@ -1131,6 +1198,7 @@ FIN_KEYS = [
     "employee_expense",
     "other_expenses",
     "total_expenses",
+    "exceptional_items",
     "pbt",
     "pat",
     "basic_eps",
@@ -1160,6 +1228,7 @@ MAX_PDF_PAGES       = 25
 AMBIGUOUS_OCR_PAGES = 8     # OCR budget for outcomes whose headline names no results
 MIN_TEXT_CHARS      = 500   # whole PDF below this → treat as scanned, OCR it all
 LOW_TEXT_PAGE_CHARS = 200   # no table in text layer → OCR pages below this
+SCAN_IMAGE_COVER    = 0.85  # a page this much covered by one image is a scan, whatever text it carries
 HEADING_LINES       = 20    # a result table's title sits near the top of its page
 
 # Scanned pages. OCR only has to find which pages hold the results table
@@ -1183,7 +1252,7 @@ _images_rejected     = False # set if the provider refuses images; then text for
 # provisions"). Real text layers are noisy: ESDS and Purple Style show two.
 TABLE_MARKERS = {
     "income": re.compile(
-        r"revenue\s+from\s+operations|income\s+from\s+operations|total\s+income"
+        r"revenue\s+from\s+operations|[il1]ncome\s+from\s+operations|total\s+[il1]ncome"
         r"|total\s+revenue|interest\s+(?:earned|income)|net\s+sales"
     ),
     "expenses": re.compile(
@@ -1271,27 +1340,33 @@ def ocr_page(pdf_bytes: bytes, page_num: int, dpi: int = LOCATE_OCR_DPI) -> str:
 
 def ocr_pages(pdf_bytes: bytes, page_texts: list, indices: list,
               timings: dict | None = None, ocred: set | None = None) -> list:
-    """OCR the given pages one at a time, replacing their text.
+    """OCR the given pages one at a time, in the order given, replacing their text.
 
-    Stops early once a consolidated table and its next page are both readable.
-    Adds the time spent to timings["ocr"]; adds each OCR'd page index to ocred.
+    Stops early once a consolidated table and its next page are both readable
+    (a consolidated table's next page is OCR'd next). Adds the time spent to
+    timings["ocr"]; adds each OCR'd page index to ocred.
     """
     log.debug(f"running OCR on pages {[i + 1 for i in indices]}")
 
     started = time.monotonic()
     page_texts = list(page_texts)
+    order = list(indices)
     pending = set(indices)
 
     try:
-        for idx in indices:
+        while order:
+            idx = order.pop(0)
             page_texts[idx] = ocr_page(pdf_bytes, idx + 1)
             pending.discard(idx)
             if ocred is not None:
                 ocred.add(idx)
 
             pages, basis = find_table_pages(page_texts)
-            if basis == "consolidated" and not pending.intersection(pages):
-                break
+            if basis == "consolidated":
+                waiting = [i for i in pages if i in pending]
+                if not waiting:
+                    break
+                order = waiting + [i for i in order if i not in waiting]
 
     except Exception as e:
         log.warning(f"OCR extraction failed: {e}", extra=QUIET)
@@ -1321,6 +1396,30 @@ def find_result_pages(pdf_bytes: bytes, ocr_page_limit: int = MAX_PDF_PAGES,
         ocr_spent = timings.get("ocr", 0) - ocr_before
         timings["scan"] = timings.get("scan", 0) + time.monotonic() - started - ocr_spent
 
+def is_scanned_page(page) -> bool:
+    """One image covers (nearly) the whole page: a scan. Its text layer, if
+    any, came from the scanner's own OCR and can't be trusted."""
+    try:
+        area = float(page.width) * float(page.height)
+        return area > 0 and any(
+            (float(im["x1"]) - float(im["x0"])) * (float(im["bottom"]) - float(im["top"])) >= SCAN_IMAGE_COVER * area
+            for im in page.images
+        )
+    except Exception:
+        return False
+
+def table_hints(text: str) -> int:
+    """How much a page's text looks like a results table, for OCR order:
+    one point per kind of line item, plus 3 for a consolidated results title
+    (2 for any other results title)."""
+    lower = text.lower()
+    heading = " ".join(lower.splitlines()[:HEADING_LINES])
+    points = sum(1 for pattern in TABLE_MARKERS.values() if pattern.search(lower))
+    for basis, pattern in RESULT_HEADINGS:
+        if pattern.search(heading):
+            return points + (3 if basis == "consolidated" else 2)
+    return points
+
 def _find_result_pages(pdf_bytes: bytes, ocr_page_limit: int, timings: dict) -> dict:
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         page_count = min(len(pdf.pages), MAX_PDF_PAGES)
@@ -1328,6 +1427,7 @@ def _find_result_pages(pdf_bytes: bytes, ocr_page_limit: int, timings: dict) -> 
             page.extract_text() or ""
             for page in pdf.pages[:page_count]
         ]
+        scans = {i for i, page in enumerate(pdf.pages[:page_count]) if is_scanned_page(page)}
 
     real_chars = sum(len(t.strip()) for t in page_texts)
     ocred = set()
@@ -1351,16 +1451,27 @@ def _find_result_pages(pdf_bytes: bytes, ocr_page_limit: int, timings: dict) -> 
             page_texts = ocr_pages(pdf_bytes, page_texts, low_text, timings, ocred)
             selected, basis = find_table_pages(page_texts)
 
+        # Scans that carry the scanner's own text layer: that layer can be too
+        # garbled to show the table (GM Breweries, 8 Oct 2026: row names but
+        # no figures). OCR them ourselves, the most table-like first.
+        rescan = [i for i in sorted(scans) if i < ocr_page_limit and i not in ocred]
+        if not selected and rescan:
+            rescan.sort(key=lambda i: -table_hints(page_texts[i]))      # stable: page order on ties
+            log.debug("no result table in the scans' own text layer, OCR-ing the scanned pages")
+            page_texts = ocr_pages(pdf_bytes, page_texts, rescan, timings, ocred)
+            selected, basis = find_table_pages(page_texts)
+
     found = {
         "pages": selected,
         "basis": basis,
         "reason": f"{basis} table" if selected else "no results table found",
         "texts": page_texts,
         "ocr": ocred,
+        "scans": scans,
     }
 
     if selected:
-        scanned = [i + 1 for i in selected if i in ocred]
+        scanned = [i + 1 for i in selected if i in ocred or i in scans]
         log.debug(
             f"selected pages {[i + 1 for i in selected]} ({found['reason']}"
             f"{f', scanned: {scanned}' if scanned else ''})"
@@ -1385,6 +1496,11 @@ def get_result_text(pdf_bytes: bytes, ocr_page_limit: int = MAX_PDF_PAGES,
         return None, found["reason"]
 
     return pages_as_text(found), found["reason"]
+
+def is_scan(found: dict, i: int) -> bool:
+    """Page i is a scan: OCR'd by us, or an image with the scanner's text layer.
+    Scans go to the model as images (their text is not trustworthy)."""
+    return i in found["ocr"] or i in found.get("scans", ())
 
 def page_image_data_url(pdf_bytes: bytes, page_num: int) -> str:
     """One PDF page as a grayscale PNG data URL, long edge at most IMAGE_MAX_EDGE."""
@@ -1482,6 +1598,72 @@ class ModelCallFailed(Exception):
     """The API call itself failed (not a bad answer). Only raised for image
     calls, so extract_financials can fall back to OCR text."""
 
+# ── OUT OF CREDITS ────────────────────────────────────────────
+#
+# When the AICredits wallet is empty every model call fails. Treated as an
+# ordinary failure, each result would burn its retries within two minutes and
+# be dropped. Instead the terminal says so once, results that need the model
+# wait in `pending` without using up retries, and one model call is tried
+# every CREDITS_RECHECK_SEC to see whether credits are back.
+
+class CreditsExhausted(Exception):
+    """The model provider refused for lack of credits (or we're still waiting
+    for them). Never a retry: the filing is held until credits are back."""
+
+CREDITS_RECHECK_SEC = 300
+CREDIT_ERROR_WORDS = ("insufficient", "credit", "balance", "quota", "billing", "payment",
+                      "top up", "top-up", "recharge", "funds", "wallet")
+_credits = {"out": False, "since": None, "next_try": 0.0, "detail": ""}
+_credits_lock = threading.Lock()
+
+def is_credit_error(error: BaseException) -> bool:
+    """An API error that means the account has no credits left: HTTP 402, or
+    a 400/401/403/429 whose message talks about credits, balance or quota."""
+    status = getattr(error, "status_code", None)
+    text = str(error).lower()
+    if status == 402:
+        return True
+    if status in (400, 401, 403, 429):
+        return any(w in text for w in CREDIT_ERROR_WORDS)
+    return any(w in text for w in ("insufficient credit", "insufficient balance", "credit balance", "out of credits"))
+
+def credits_waiting() -> bool:
+    """Credits ran out and it isn't time to try again yet (read-only)."""
+    with _credits_lock:
+        return _credits["out"] and time.monotonic() < _credits["next_try"]
+
+def _credits_call_allowed() -> bool:
+    """Before a model call: allowed unless credits are out; when they are,
+    one call is let through every CREDITS_RECHECK_SEC to see if they're back."""
+    with _credits_lock:
+        if not _credits["out"]:
+            return True
+        if time.monotonic() >= _credits["next_try"]:
+            _credits["next_try"] = time.monotonic() + CREDITS_RECHECK_SEC
+            return True
+        return False
+
+def _note_credits_out(error: BaseException):
+    with _credits_lock:
+        first = not _credits["out"]
+        _credits.update(out=True, next_try=time.monotonic() + CREDITS_RECHECK_SEC, detail=shorten(str(error), 120))
+        if first:
+            _credits["since"] = datetime.now()
+    if first:
+        log.error(f"AICredits: out of credits ({shorten(str(error), 200)}) · results wait, checking every "
+                  f"{CREDITS_RECHECK_SEC // 60} min", extra=QUIET)
+        say(f"AICredits is out of credits — top up. Results wait and are read when credits are back "
+            f"(checked every {CREDITS_RECHECK_SEC // 60} min)", "red")
+
+def _note_credits_ok():
+    with _credits_lock:
+        if not _credits["out"]:
+            return
+        since = _credits["since"]
+        _credits.update(out=False, since=None, next_try=0.0, detail="")
+    log.info(f"AICredits: credits are back (out since {since:%H:%M})" if since else "AICredits: credits are back", extra=QUIET)
+    say("AICredits credits are back — reading the results that waited", "green")
+
 def _call_model(content, model: str, timings: dict | None = None,
                 raw_out: dict | None = None, raise_api_errors: bool = False) -> dict | None:
     """One extraction call via AICredits; validated financials or None.
@@ -1491,6 +1673,9 @@ def _call_model(content, model: str, timings: dict | None = None,
     even when it fails validation (obtain_financials reads period_end from it).
     Adds the call time to timings["model"].
     """
+    if not _credits_call_allowed():
+        raise CreditsExhausted("waiting for AICredits credits")
+
     started = time.monotonic()
 
     try:
@@ -1498,11 +1683,18 @@ def _call_model(content, model: str, timings: dict | None = None,
             response = client.chat.completions.create(
                 model=model,
                 max_tokens=1500,
+                temperature=0,      # same page, same reading (9 Oct 2026: two reads of one PDF differed)
                 messages=[{"role": "user", "content": content}],
             )
         finally:
             if timings is not None:
                 timings["model"] = timings.get("model", 0) + time.monotonic() - started
+
+        if not getattr(response, "choices", None):
+            # Some gateways answer 200 with an error body instead of choices
+            extra = getattr(response, "model_extra", None) or {}
+            raise RuntimeError(f"no answer from the model: {getattr(response, 'error', None) or extra.get('error') or extra}")
+        _note_credits_ok()
 
         raw = response.choices[0].message.content or ""
         data = json.loads(raw[raw.find("{"):raw.rfind("}") + 1])
@@ -1525,6 +1717,9 @@ def _call_model(content, model: str, timings: dict | None = None,
         log.warning(f"Model JSON parse error: {e}", extra=QUIET)
         return None
     except Exception as e:
+        if is_credit_error(e):
+            _note_credits_out(e)
+            raise CreditsExhausted(str(e)) from e
         if raise_api_errors:
             raise ModelCallFailed(str(e)) from e
         log.warning(f"Model extraction failed: {e}", extra=QUIET)
@@ -1544,7 +1739,7 @@ def extract_from_page_images(pdf_bytes: bytes, found: dict, model: str,
     parts = [{"type": "text", "text": EXTRACTION_PROMPT}]
 
     for i in found["pages"]:
-        if i in found["ocr"]:
+        if is_scan(found, i):
             parts.append({"type": "text", "text": f"--- PAGE {i + 1} (scanned page image) ---"})
             parts.append({"type": "image_url", "image_url": {"url": page_image_data_url(pdf_bytes, i + 1)}})
         else:
@@ -1594,11 +1789,13 @@ def extract_financials(pdf_bytes: bytes, model: str | None = None,
         raise SkipFiling(found["reason"], status="NONE")
 
     model = model or EXTRACTION_MODEL
-    scanned = [i for i in found["pages"] if i in found["ocr"]]
+    scanned = [i for i in found["pages"] if is_scan(found, i)]
 
     if scanned and SEND_SCANS_AS_IMAGES and not _images_rejected:
         try:
             return extract_from_page_images(pdf_bytes, found, model, timings, raw_out)
+        except CreditsExhausted:
+            raise
         except ModelCallFailed as e:
             _note_image_failure(e)
         except Exception as e:      # rendering failed
@@ -1651,6 +1848,11 @@ def numbers_problem(fin: dict) -> str | None:
                 if part is not None and total_expenses >= 0 and part > total_expenses * 1.02 + 0.05:
                     return f"{label}: {key.replace('_', ' ')} {part:,.2f} above total expenses {total_expenses:,.2f}"
 
+            # Exceptional items / associates sit between expenses and PBT
+            # (Bridge Securities, 9 Oct 2026: a year-ago gain of ₹25 L
+            # flagged a correct reading). Their sign is printed inconsistently,
+            # so either direction counts as adding up.
+            extra = at("exceptional_items", i) or 0
             implied = income - total_expenses
 
             if pbt is not None:
@@ -1662,10 +1864,11 @@ def numbers_problem(fin: dict) -> str | None:
             else:
                 continue
 
-            if abs(implied - actual) > tolerance:
+            if all(abs(implied + sign * extra - actual) > tolerance for sign in (1, -1)):
+                plus = f" plus exceptional items {extra:,.2f}" if extra else ""
                 return (
-                    f"{label}: income {income:,.2f} minus expenses {total_expenses:,.2f} "
-                    f"= {implied:,.2f}, but {name} is {actual:,.2f}"
+                    f"{label}: income {income:,.2f} minus expenses {total_expenses:,.2f}{plus} "
+                    f"= {implied + extra:,.2f}, but {name} is {actual:,.2f}"
                 )
 
     return None
@@ -2176,13 +2379,33 @@ def log_filing_details(filing: dict, isin):
         f"headline from {'+'.join(filing['headline_fields']) or 'no headline field'}: {filing['headline']!r}"
     )
 
+# The same PDF is often filed two to four times (BSE "Board Meeting" and
+# "Result", and NSE). Byte-identical copies are read once per run: each PDF
+# already handled is remembered with what came of it.
+PDF_MEMORY_SIZE = 5000
+_pdf_memory = {}                 # sha256 → "BSE 16:35 filing (MISS)"
+_pdf_memory_lock = threading.Lock()
+
+def remember_pdf(digest: str, filing: dict, outcome: str):
+    when = filing.get("exchange_dt")
+    label = f"{filing['exchange']}{f' {when:%d %b %H:%M}' if when else ''} filing ({outcome})"
+    with _pdf_memory_lock:
+        if len(_pdf_memory) >= PDF_MEMORY_SIZE:
+            _pdf_memory.pop(next(iter(_pdf_memory)))
+        _pdf_memory[digest] = label
+
+def earlier_copy(digest: str) -> str | None:
+    with _pdf_memory_lock:
+        return _pdf_memory.get(digest)
+
 def obtain_financials(filing: dict, nse: NseClient, ambiguous: bool = False,
                       timings: dict | None = None) -> dict:
     """Download the PDF and extract validated financials.
 
     Touches no scanner state, so the checker thread can run it too. Raises
     RetryFiling on a failure worth retrying (QuarterUnknown when the PDF gives
-    no usable period_end), SkipFiling when retrying can't help.
+    no usable period_end), SkipFiling when retrying can't help — including a
+    byte-identical copy of a PDF already handled this run.
     """
     timings = {} if timings is None else timings
 
@@ -2200,6 +2423,22 @@ def obtain_financials(filing: dict, nse: NseClient, ambiguous: bool = False,
         raise SkipFiling(f"attachment is not a PDF (starts {pdf[:8]!r})")
 
     log.debug(f"{filing['exchange']} {filing['company']}: PDF {len(pdf) / (1024 * 1024):.1f} MB")
+
+    digest = hashlib.sha256(pdf).hexdigest()
+    earlier = earlier_copy(digest)
+    if earlier:
+        raise SkipFiling(f"same PDF as the {earlier} · not read again")
+
+    try:
+        fin = _read_financials(pdf, filing, ambiguous, timings)
+    except SkipFiling as e:
+        remember_pdf(digest, filing, e.status)
+        raise
+    remember_pdf(digest, filing, "read")
+    return fin
+
+def _read_financials(pdf: bytes, filing: dict, ambiguous: bool, timings: dict) -> dict:
+    """obtain_financials after the download: extract, then validate."""
     raw_out = {}
     fin = extract_financials(pdf, ambiguous=ambiguous, timings=timings, raw_out=raw_out)
     filed_on = (filing["exchange_dt"] or datetime.now()).date()
@@ -2218,11 +2457,23 @@ def obtain_financials(filing: dict, nse: NseClient, ambiguous: bool = False,
             status="OLD",
         )
 
+    # The model answered but without usable figures (an insurer's or bank's
+    # format, a shell company with no revenue, the wrong pages): the same PDF
+    # reads the same, so no retry (9 Oct 2026: 52 of 59 model calls were such
+    # retries). Only a failed call or a reply that isn't JSON is retried.
+    answered = "data" in raw_out
+
     if not fin:
+        if answered:
+            raise SkipFiling("the model found no figures it could use · not retried", model_called=True, status="MISS")
         raise RetryFiling("could not extract financials")
 
     if not has_core_values(fin):
-        raise RetryFiling("missing current-quarter revenue or PAT")
+        missing = " or ".join(
+            name for key, name in (("revenue_from_operations", "revenue from operations"), ("pat", "PAT"))
+            if fin[key][0] is None
+        )
+        raise SkipFiling(f"no current-quarter {missing} in the table · not retried", model_called=True, status="MISS")
 
     if not pdf_quarter(fin, filed_on):
         raise QuarterUnknown(quarter_unknown_reason(fin, filed_on), fin)
@@ -2234,13 +2485,15 @@ def obtain_financials(filing: dict, nse: NseClient, ambiguous: bool = False,
     fin["check"] = numbers_problem(fin) or ""
     return fin
 
-def score_filing(filing: dict, isin, fin: dict, processed: set, timings: dict) -> tuple:
+def score_filing(filing: dict, isin, fin: dict, processed: set, timings: dict,
+                 flagged: set = frozenset()) -> tuple:
     """Quarter key, duplicate check, score, CSV and alert.
 
     Returns (processed key, status word, line text); the key is returned too
     when the PDF's period shows the quarter was already scored. The quarter
     always comes from the PDF's period_end. Raises SkipFiling for a quarter
-    before SCORE_FROM_QUARTER.
+    before SCORE_FROM_QUARTER. flagged: company-quarters already saved with a
+    failed sanity check; another failing copy saves no second row.
     """
     exchange_dt = filing["exchange_dt"]
     filed_on = (exchange_dt or datetime.now()).date()
@@ -2261,6 +2514,11 @@ def score_filing(filing: dict, isin, fin: dict, processed: set, timings: dict) -
     if key in processed:
         return key, "SKIP", with_timings(f"{key} already scored (quarter from PDF)", timings)
 
+    if fin.get("check") and key in flagged:
+        # Another copy of a filing already saved as FLAG (Bridge Securities,
+        # 9 Oct 2026, filed the same PDF twice on BSE: two identical rows)
+        return key, "SKIP", with_timings(f"{key} already flagged, numbers still don't add up · no second row", timings)
+
     score, bd = compute_pead_score(fin)
     save_result_csv(filing, score, fin, quarter)
     summary = f"{score:4.1f}/50  {quarter}  {fin.get('basis', 'unknown')}"
@@ -2269,10 +2527,11 @@ def score_filing(filing: dict, isin, fin: dict, processed: set, timings: dict) -
         summary += f"  rejected: {reason[:1].lower()}{reason[1:]}"
 
     if fin.get("check"):
-        # Saved for reference, never alerted. The key isn't returned, so the
-        # other exchange's copy (or a corrected filing) can still be scored.
+        # Saved for reference, never alerted. The company-quarter stays open
+        # (a different copy, e.g. the other exchange's, can still be scored);
+        # it's recorded as flagged so a copy that fails too saves no second row.
         summary += f"  numbers don't add up ({fin['check']}) · no alert"
-        return None, "FLAG", with_timings(summary, timings, exchange_dt, "scored")
+        return key, "FLAG", with_timings(summary, timings, exchange_dt, "scored")
 
     if score >= PEAD_THRESHOLD:
         sent = send_telegram(
@@ -2290,7 +2549,7 @@ def score_filing(filing: dict, isin, fin: dict, processed: set, timings: dict) -
     return key, "SCORE", with_timings(summary, timings, exchange_dt, "scored")
 
 def process_filing(filing: dict, isin, processed: set, nse: NseClient,
-                   timings: dict | None = None) -> tuple:
+                   timings: dict | None = None, flagged: set = frozenset()) -> tuple:
     """Clear result filings, on the main thread: obtain financials, then score.
 
     Returns score_filing's (key, status, text). Raises RetryFiling or
@@ -2298,7 +2557,7 @@ def process_filing(filing: dict, isin, processed: set, nse: NseClient,
     """
     timings = {} if timings is None else timings
     fin = obtain_financials(filing, nse, timings=timings)
-    return score_filing(filing, isin, fin, processed, timings)
+    return score_filing(filing, isin, fin, processed, timings, flagged)
 
 class AmbiguousChecker:
     """One background thread for ambiguous board meeting outcomes.
@@ -2341,6 +2600,8 @@ class AmbiguousChecker:
 
         try:
             result["fin"] = obtain_financials(filing, self.nse, ambiguous=True, timings=timings)
+        except CreditsExhausted as e:
+            result["credits"] = e
         except SkipFiling as e:
             result["skip"] = e
         except RetryFiling as e:
@@ -2362,6 +2623,8 @@ class ScannerState:
         self.nse = nse
         self.seen = load_seen()
         self.retries = load_retries()          # filing id → failed attempts
+        self.flagged = load_flagged()          # company-quarters saved as FLAG
+        self.held = set()                      # filing ids waiting for model credits (in pending, no retry used)
         self.pending = {}                      # filing id → filing awaiting retry
         self.bse_known_ids = set()             # BSE NEWSIDs fetched on earlier polls
         self.nse_known_ids = set()             # NSE filing ids fetched on earlier polls
@@ -2436,6 +2699,7 @@ class ScannerState:
         self.seen.add(fid)
         save_seen(self.seen)
         self.pending.pop(fid, None)
+        self.held.discard(fid)
 
         if self.retries.pop(fid, None) is not None:
             save_retries(self.retries)
@@ -2505,8 +2769,11 @@ def triage(filing: dict, state: ScannerState) -> str:
 
     return kind
 
-def record_success(filing: dict, state: ScannerState, key: str | None):
-    if key:      # None for a flagged result: saved, but the company-quarter stays open
+def record_success(filing: dict, state: ScannerState, key: str | None, status: str = "SCORE"):
+    if key and status == "FLAG":       # saved, but the company-quarter stays open
+        state.flagged.add(key)
+        save_flagged(state.flagged)
+    elif key and status != "SKIP":
         state.processed.add(key)
         save_processed_scrips(state.processed)
     state.finish(filing["id"])
@@ -2524,6 +2791,7 @@ def record_retry(filing: dict, state: ScannerState, reason: str, timings: dict,
     so each filing leaves at most one row.
     """
     fid = filing["id"]
+    state.held.discard(fid)
     attempts = state.retries.get(fid, 0) + 1
 
     if attempts > MAX_RETRIES:
@@ -2567,13 +2835,29 @@ def record_skip(filing: dict, state: ScannerState, skip: "SkipFiling", timings: 
     report(skip.status, filing, with_timings(text, timings), console=not quiet)
     state.finish(filing["id"])
 
+def hold_for_credits(filing: dict, state: ScannerState):
+    """Keep a filing for when model credits are back: in pending, retry count
+    untouched, a WAIT line in the log file only (the POLL line counts them)."""
+    fid = filing["id"]
+    state.pending[fid] = filing
+    if fid not in state.held:
+        state.held.add(fid)
+        report("WAIT", filing, "waiting for AICredits credits · no retry used", console=False)
+
 def handle_clear(filing: dict, state: ScannerState):
+    if credits_waiting():
+        hold_for_credits(filing, state)
+        return
+
     isin = lookup_isin(filing, state.master)
     log_filing_details(filing, isin)
     timings = {}
 
     try:
-        key, status, text = process_filing(filing, isin, state.processed, state.nse, timings)
+        key, status, text = process_filing(filing, isin, state.processed, state.nse, timings, state.flagged)
+    except CreditsExhausted:
+        hold_for_credits(filing, state)
+        return
     except SkipFiling as e:
         record_skip(filing, state, e, timings)
         return
@@ -2585,10 +2869,13 @@ def handle_clear(filing: dict, state: ScannerState):
         return
 
     report_result(status, filing, text)
-    record_success(filing, state, key)
+    record_success(filing, state, key, status)
 
 def handle_ambiguous(filing: dict, state: ScannerState) -> bool:
     """Queue an ambiguous outcome for the checker; True if newly queued."""
+    if credits_waiting():
+        hold_for_credits(filing, state)
+        return False
     if not state.checker.submit(filing):
         return False
 
@@ -2606,6 +2893,10 @@ def apply_ambiguous_result(result: dict, state: ScannerState):
     if fid in state.seen:      # e.g. the company's clear filing was scored meanwhile
         return
 
+    if result.get("credits"):
+        hold_for_credits(filing, state)
+        return
+
     if result["skip"]:
         record_skip(filing, state, result["skip"], timings, ambiguous=True)
         return
@@ -2621,7 +2912,7 @@ def apply_ambiguous_result(result: dict, state: ScannerState):
 
     try:
         key, status, text = score_filing(
-            filing, lookup_isin(filing, state.master), result["fin"], state.processed, timings
+            filing, lookup_isin(filing, state.master), result["fin"], state.processed, timings, state.flagged
         )
     except SkipFiling as e:
         record_skip(filing, state, e, timings)
@@ -2634,7 +2925,7 @@ def apply_ambiguous_result(result: dict, state: ScannerState):
         return
 
     report_result(status, filing, text)
-    record_success(filing, state, key)
+    record_success(filing, state, key, status)
 
 def drain_checks(state: ScannerState):
     """Apply every checker result that is ready, without waiting."""
@@ -2679,8 +2970,11 @@ def run_cycle(state: ScannerState):
     ambiguous = []
 
     for filing in filings:
+        retrying = filing["id"] in state.pending and filing["id"] not in state.held
         verdict = triage(filing, state)
         counts[verdict] = counts.get(verdict, 0) + 1
+        if retrying and verdict in ("results", "ambiguous"):     # an earlier poll's failure, tried again
+            counts[f"retried {verdict}"] = counts.get(f"retried {verdict}", 0) + 1
 
         if verdict == "results":
             handle_clear(filing, state)
@@ -2695,6 +2989,7 @@ def run_cycle(state: ScannerState):
     state.unpublished = []
     state.save_poll_marks()
 
+    retried = counts.get("retried results", 0) + counts.get("retried ambiguous", 0)
     log.info(
         " · ".join([
             "done",
@@ -2702,15 +2997,22 @@ def run_cycle(state: ScannerState):
             plural(counts.get("intimation", 0), "intimation") + " skipped",
             *([f"{counts['old']} old quarter by headline"] if counts.get("old") else []),
             f"{queued} ambiguous queued",
+            *([f"{retried} of them retries"] if retried else []),
             f"{counts.get('not relevant', 0)} not relevant",
             f"checker queue: {len(state.checker.in_flight)} pending",
         ]),
         extra={"status": "POLL", "console": False},
     )
 
-    for key, n in [("results", counts.get("results", 0)), ("intimations", counts.get("intimation", 0)),
-                   ("old by title", counts.get("old", 0)), ("outcomes to check", queued)]:
+    # The terminal counts new filings, retries and filings held for credits apart
+    held_now = len(state.held)
+    new_results = max(0, counts.get("results", 0) - counts.get("retried results", 0) - held_now)
+    new_outcomes = max(0, queued - counts.get("retried ambiguous", 0))
+    for key, n in [("results", new_results), ("intimations", counts.get("intimation", 0)),
+                   ("old by title", counts.get("old", 0)), ("outcomes to check", new_outcomes),
+                   ("retries", retried)]:
         state.window[key] = state.window.get(key, 0) + n
+    state.window["waiting for credits"] = held_now
 
     terminal_summary(state)
 
@@ -2720,6 +3022,8 @@ SUMMARY_WORDS = [   # window key, singular, plural — the "Caught up" line
     ("outcomes without results", "outcome without results", "outcomes without results"),
     ("intimations", "intimation skipped", "intimations skipped"),
     ("old by title", "old result skipped by title", "old results skipped by title"),
+    ("retries", "earlier failure retried", "earlier failures retried"),
+    ("waiting for credits", "result waiting for AICredits credits", "results waiting for AICredits credits"),
 ]
 POLL_WORDS = [      # shorter, for the per-poll line
     ("results", "result", "results"),
@@ -2727,6 +3031,8 @@ POLL_WORDS = [      # shorter, for the per-poll line
     ("outcomes without results", "outcome without results", "outcomes without results"),
     ("intimations", "intimation skipped", "intimations skipped"),
     ("old by title", "old result skipped", "old results skipped"),
+    ("retries", "retry", "retries"),
+    ("waiting for credits", "waiting for credits", "waiting for credits"),
 ]
 
 def summary_parts(window: dict, words: list = SUMMARY_WORDS) -> list:
@@ -2744,7 +3050,7 @@ def poll_line(state) -> tuple:
         for ex in ("BSE", "NSE")
     ]
     found = summary_parts(state.window, POLL_WORDS)
-    if any(state.fetched.get(ex) is None for ex in ("BSE", "NSE")):
+    if any(state.fetched.get(ex) is None for ex in ("BSE", "NSE")) or state.window.get("waiting for credits"):
         style = "yellow"
     else:
         style = None if found else "dim"

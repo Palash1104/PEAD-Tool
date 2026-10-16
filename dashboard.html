@@ -235,6 +235,9 @@ table.results tbody tr.sel { background: color-mix(in srgb, var(--accent) 12%, t
 .scorebar .mini span { display: block; height: 100%; background: var(--below); border-radius: 3px; }
 .scorebar .mini span.hit { background: var(--accent); }
 .co { max-width: 280px; overflow: hidden; text-overflow: ellipsis; display: inline-block; vertical-align: bottom; }
+/* Company names open the company on Screener; underlined like the Exch. links */
+a.co, a.d-co { color: inherit; text-decoration: underline; text-decoration-color: var(--text-muted); text-underline-offset: 3px; }
+a.co:hover, a.d-co:hover { color: var(--accent); text-decoration-color: var(--accent); }
 .up { color: var(--good); } .down { color: var(--bad); }
 /* Exch. text stays as it was, with an underline marking it as a link */
 .ex-link { color: inherit; text-decoration: underline; text-decoration-color: var(--text-muted); text-underline-offset: 3px; }
@@ -299,7 +302,47 @@ body:not(.past-view) .past-only { display: none !important; }
   .filters input[type=search] { min-width: 0; flex: 1; }
   .factor { grid-template-columns: 100px 1fr 50px; }
 }
+/* Quick view: a row's figures, opened under it by clicking the row */
+table.results tbody tr.open > td { border-bottom-color: transparent; }
+table.results tbody tr.exp-row, table.results tbody tr.exp-row:hover { background: var(--surface-2); cursor: default; }
+table.results tbody tr.exp-row > td { padding: 4px 14px 14px; white-space: normal; }
+/* Two columns: the figures on the left, the score breakdown on the right.
+   Every number in the primary text colour; direction shown by a small arrow. */
+table.results .quick { display: grid; grid-template-columns: minmax(0, auto) minmax(300px, 420px); gap: 16px 56px; align-items: start; padding: 10px 6px 4px; }
+table.results .quick.in { animation: quickIn .16s ease-out; }
+@keyframes quickIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+@media (max-width: 1100px) { table.results .quick { grid-template-columns: minmax(0, 1fr); } }
+table.results .quick .qcap { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: .05em; margin-bottom: 8px; }
+table.results .quick .qmeta { font-size: 12px; color: var(--text-muted); margin-bottom: 10px; }
+table.results .quick table { border-collapse: collapse; font-size: 13.5px; width: 100%; }
+table.results .quick th, table.results .quick td { padding: 8px 18px; text-align: right; border-bottom: 1px solid var(--grid); white-space: nowrap; color: var(--text-primary); }
+table.results .quick th:first-child, table.results .quick td:first-child { text-align: left; padding-left: 0; color: var(--text-secondary); }
+table.results .quick th:last-child, table.results .quick td:last-child { padding-right: 0; }
+table.results .quick thead th { color: var(--text-muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; padding-top: 0; }
+table.results .quick tbody tr:last-child td { border-bottom: none; }
+table.results .quick td.cq { font-weight: 700; }
+table.results .quick tr.sub td { font-size: 12.5px; }
+table.results .quick td.gap { padding-left: 30px; }
+table.results .quick .arw { font-size: 9px; margin-right: 5px; vertical-align: 1px; }
+table.results .quick .arw.up { color: var(--good); } table.results .quick .arw.down { color: var(--bad); }
+/* Score panel */
+table.results .quick .qside { border-left: 1px solid var(--grid); padding-left: 28px; }
+table.results .quick .qtotal { display: flex; align-items: baseline; gap: 10px; margin-bottom: 12px; }
+table.results .quick .qtotal .n { font-size: 26px; font-weight: 700; letter-spacing: -.02em; color: var(--text-primary); }
+table.results .quick .qtotal .n small { font-size: 14px; font-weight: 600; color: var(--text-muted); }
+table.results .quick .qtotal .st { font-size: 12px; color: var(--text-secondary); }
+table.results .quick .qtotal .st.hit { color: var(--accent); } table.results .quick .qtotal .st.flag { color: var(--warn); }
+table.results .quick .qf { display: grid; grid-template-columns: 1fr auto 90px 42px; align-items: center; gap: 12px; padding: 6px 0; font-size: 12.5px; border-bottom: 1px solid var(--grid); }
+table.results .quick .qf:last-child { border-bottom: none; }
+table.results .quick .qf .fn { color: var(--text-secondary); }
+table.results .quick .qf .fv { color: var(--text-primary); text-align: right; }
+table.results .quick .qf .fv em { font-style: normal; color: var(--text-muted); font-size: 11px; margin-left: 4px; }
+table.results .quick .qf .fb { height: 5px; border-radius: 3px; background: var(--grid); overflow: hidden; }
+table.results .quick .qf .fb i { display: block; height: 100%; background: var(--accent); border-radius: 3px; }
+table.results .quick .qf .fp { text-align: right; color: var(--text-primary); font-weight: 700; }
+table.results .quick .qwarn { grid-column: 1 / -1; font-size: 12px; color: var(--warn); }
 @media (prefers-reduced-motion: reduce) {
+  table.results .quick.in { animation: none; }
   .tile, .factor .fill { transition: none; }
   .dot.pulse { animation: none; }
 }
@@ -430,7 +473,7 @@ body:not(.past-view) .past-only { display: none !important; }
     <div class="card-head">
       <div>
         <h2>Scored results</h2>
-        <div class="desc">Click a row to see it in the detail panel. Click a column to sort.</div>
+        <div class="desc">Click a row to open its figures under it (again to close), a company name to open it on Screener, a column to sort.</div>
       </div>
     </div>
     <div class="table-wrap">
@@ -482,6 +525,7 @@ const S = {
   shown: 20,
   f: { q: "", days: 0, kind: "all", ex: "all" },
   lastSig: "",
+  openId: null,          // row whose quick view is open under it
   quarter: new URLSearchParams(location.search).get("quarter") || "",   // ?quarter=Q1FY27
   quarters: [],
   currentQuarter: "",
@@ -540,6 +584,13 @@ function companyPage(r) {
   return r.exchange === "BSE"
     ? `https://www.bseindia.com/stock-share-price/x/x/${encodeURIComponent(r.scrip)}/`
     : `https://www.nseindia.com/get-quotes/equity?symbol=${encodeURIComponent(r.scrip)}`;
+}
+
+// The company on Screener: BSE code or NSE symbol both work there; the
+// consolidated view when the result was consolidated. "" without a code.
+function screenerUrl(r) {
+  if (!/^[A-Za-z0-9&._-]+$/.test(r.scrip || "")) return "";
+  return `https://www.screener.in/company/${encodeURIComponent(r.scrip)}/${r.basis === "consolidated" ? "consolidated/" : ""}`;
 }
 
 // Via dashboard.py's /filing, which finds where BSE keeps the PDF now
@@ -811,7 +862,9 @@ function renderDetail() {
     : r.check ? "⚠ Numbers don't add up · no alert"
     : r.quarter === "UNKNOWN" ? "Quarter unknown · no alert" : "No alert";
   $("d-badge").className = "badge" + (hit ? " alert" : (r.check || r.quarter === "UNKNOWN") ? " off" : "");
-  $("d-name").textContent = r.company;
+  $("d-name").innerHTML = screenerUrl(r)
+    ? `<a class="d-co" href="${esc(screenerUrl(r))}" target="_blank" rel="noopener" title="Open ${esc(r.company)} on Screener">${esc(r.company)}</a>`
+    : esc(r.company);
   $("d-name").title = r.company;
   $("d-meta").innerHTML = `${esc(r.exchange)} · <a href="${esc(companyPage(r))}" target="_blank" rel="noopener" style="color:var(--accent)">${esc(r.scrip)}</a> · ${esc(r.tsStr)}`;
   $("d-quarter").innerHTML = quarterLine(r);
@@ -845,6 +898,89 @@ function renderDetail() {
   $("d-note").textContent = note;
 }
 
+/* ─────────────── Quick view (click a row) ─────────────── */
+// The row's figures as a small table under it: three quarters, growth,
+// margins and the score line. One open at a time; clicking it again closes it.
+function quickView(r, animate) {
+  const margin = (a, rev) => a != null && rev ? a / rev * 100 : null;
+  const pp = (a, b) => a == null || b == null ? null : a - b;
+  const big = (v) => v == null ? "–" : Math.abs(v) >= 1000
+    ? (v > 0 ? "+" : "−") + Math.round(Math.abs(v)).toLocaleString("en-IN") + "%" : fmtPct(v);
+  const fmtPp = (v) => v == null ? "–" : (v > 0 ? "+" : "") + v.toFixed(1) + " pp";
+  const fmtM = (v) => v == null ? "–" : v.toFixed(1) + "%";
+  // A change: the number in the text colour, its direction as a small coloured arrow
+  const chg = (v, text) => v == null || v === 0 ? text
+    : `<span class="arw ${v > 0 ? "up" : "down"}">${v > 0 ? "▲" : "▼"}</span>${text}`;
+
+  const ebM = [margin(r.ebCq, r.revCq), margin(r.ebPq, r.revPq), margin(r.ebLy, r.revLy)];
+  const netM = [margin(r.patCq, r.revCq), margin(r.patPq, r.revPq), margin(r.patLy, r.revLy)];
+  const amount = (name, cq, pq, ly) => {
+    const q = pct(cq, pq), y = pct(cq, ly);
+    return `<tr><td>${name}</td><td class="cq">${fmtNum(cq)}</td><td>${fmtNum(pq)}</td><td>${fmtNum(ly)}</td>
+      <td class="gap">${chg(q, big(q))}</td><td>${chg(y, big(y))}</td></tr>`;
+  };
+  const marginRow = (name, m) => {
+    const q = pp(m[0], m[1]), y = pp(m[0], m[2]);
+    return `<tr class="sub"><td>${name}</td><td class="cq">${fmtM(m[0])}</td><td>${fmtM(m[1])}</td><td>${fmtM(m[2])}</td>
+      <td class="gap">${chg(q, fmtPp(q))}</td><td>${chg(y, fmtPp(y))}</td></tr>`;
+  };
+  const meta = [r.qkey && r.qkey !== "UNKNOWN" ? esc(r.qkey) : "quarter unknown",
+                r.periodEnd ? "quarter ended " + esc(fmtPeriodEnd(r.periodEnd) || r.periodEnd) : "",
+                r.basis ? esc(r.basis) : "", "₹ crore, EPS in ₹"].filter(Boolean).join(" · ");
+  const figures = `<div>
+    <div class="qcap">Quarterly figures</div>
+    <div class="qmeta">${meta}</div>
+    <table>
+      <thead><tr><th></th><th>This qtr</th><th>Last qtr</th><th>Year ago</th><th class="gap">QoQ</th><th>YoY</th></tr></thead>
+      <tbody>
+        ${amount("Revenue", r.revCq, r.revPq, r.revLy)}
+        ${amount("EBITDA", r.ebCq, r.ebPq, r.ebLy)}
+        ${marginRow("EBITDA margin", ebM)}
+        ${amount("PAT", r.patCq, r.patPq, r.patLy)}
+        ${marginRow("Net margin", netM)}
+        ${amount("EPS (₹)", r.epsCq, null, r.epsLy)}
+      </tbody>
+    </table>
+  </div>`;
+
+  // Right column: the score and how it was built
+  const sc = scorecard(r);
+  const hit = alerted(r);
+  const status = hit ? `<span class="st hit">▲ Alert sent</span>`
+    : r.check ? `<span class="st flag">⚠ Flagged, not alerted</span>`
+    : `<span class="st">No alert (below ${fmtScore(S.threshold)})</span>`;
+  const rows = sc.rejected
+    ? `<div class="qf"><span class="fn">Rejected: ${esc(sc.rejected)}</span><span></span><span></span><span></span></div>`
+    : sc.factors.map((f) => `<div class="qf">
+        <span class="fn">${esc(f.name)}</span>
+        <span class="fv">${esc(f.val)}${f.tag ? `<em>${esc(f.tag)}</em>` : ""}</span>
+        <span class="fb"><i style="width:${(f.pts / f.max * 100).toFixed(0)}%"></i></span>
+        <span class="fp">${fmtScore(f.pts)}/${f.max}</span>
+      </div>`).join("");
+  const side = `<div class="qside">
+    <div class="qcap">PEAD score</div>
+    <div class="qtotal"><span class="n">${fmtScore(r.score)}<small>/50</small></span>${status}</div>
+    ${rows}
+  </div>`;
+
+  return `<div class="quick${animate ? " in" : ""}">${figures}${side}
+    ${r.check ? `<div class="qwarn">⚠ Numbers don't add up: ${esc(r.check)}. Saved for reference, not alerted.</div>` : ""}
+  </div>`;
+}
+
+// Put the open quick view under its row (after every table render too)
+function placeQuick(animate = false) {
+  const tbody = $("tbl").querySelector("tbody");
+  tbody.querySelectorAll("tr.exp-row").forEach((x) => x.remove());
+  tbody.querySelectorAll("tr.open").forEach((x) => x.classList.remove("open"));
+  if (!S.openId) return;
+  const tr = [...tbody.querySelectorAll("tr[data-id]")].find((t) => t.dataset.id === S.openId);
+  const r = S.rows.find((x) => x.id === S.openId);
+  if (!tr || !r) return;
+  tr.classList.add("open");
+  tr.insertAdjacentHTML("afterend", `<tr class="exp-row"><td colspan="8">${quickView(r, animate)}</td></tr>`);
+}
+
 /* ─────────────── Table ─────────────── */
 function renderTable() {
   const k = S.sortKey, d = S.sortDir;
@@ -862,7 +998,9 @@ function renderTable() {
     const hit = alerted(r);
     return `<tr data-id="${esc(r.id)}" class="${r.id === S.selectedId ? "sel" : ""}">
       <td class="mono">${esc(r.tsStr.slice(5, 16))}</td>
-      <td><span class="co" title="${esc(r.company)}">${esc(r.company)}</span></td>
+      <td>${screenerUrl(r)
+        ? `<a class="co" href="${esc(screenerUrl(r))}" target="_blank" rel="noopener" title="Open ${esc(r.company)} on Screener">${esc(r.company)}</a>`
+        : `<span class="co" title="${esc(r.company)}">${esc(r.company)}</span>`}</td>
       <td>${r.filingUrl
         ? `<a class="ex-link" href="${esc(filingLink(r))}" target="_blank" rel="noopener" title="Open the result filing on ${esc(r.exchange)}">${esc(r.exchange)}</a>`
         : `<a class="ex-link fallback" href="${esc(companyPage(r))}" target="_blank" rel="noopener" title="Filing link wasn't recorded for this row; opens the company's ${esc(r.exchange)} page">${esc(r.exchange)}</a>`}</td>
@@ -873,6 +1011,7 @@ function renderTable() {
       <td class="num">${fmtNum(r.rev)}</td>
     </tr>`;
   }).join("") || `<tr><td colspan="8" style="text-align:center;color:var(--text-muted);padding:24px">No results match these filters.</td></tr>`;
+  placeQuick();
   $("more-btn").style.display = list.length > S.shown ? "inline-block" : "none";
   $("more-btn").textContent = `Show more (${list.length - S.shown} hidden)`;
   document.querySelectorAll("#tbl th").forEach((th) => {
@@ -1006,9 +1145,9 @@ function renderLog() {
   const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 30;
   el.innerHTML = (log.lines || []).map((l) => {
     // Same colours as the terminal, from the status word after the time
-    const c = /^\S+\s+ERROR\b|FAILED|BLOCKED|Access Denied|isn't answering|is blocking/.test(l) ? "e"
-      : /^\S+\s+(WARN|WARNING|RETRY|FLAG)\b|^\S+\s+POLL\b.*not answering/.test(l) ? "w"
-      : /^\S+\s+ALERT\b|Above threshold|Telegram sent|answering again/.test(l) ? "a"
+    const c = /^\S+\s+ERROR\b|FAILED|BLOCKED|Access Denied|isn't answering|is blocking|out of credits/.test(l) ? "e"
+      : /^\S+\s+(WARN|WARNING|RETRY|FLAG|MISS)\b|^\S+\s+POLL\b.*(not answering|waiting for credits)/.test(l) ? "w"
+      : /^\S+\s+ALERT\b|Above threshold|Telegram sent|answering again|credits are back/.test(l) ? "a"
       : /^\S+\s+(SCORE\b|Scanning from)/.test(l) ? "s"
       : /^\S+\s+PEAD scanner\b/.test(l) ? "b"
       : /^\S+\s+(SKIP|OLD|NONE)\b|^\S+\s+POLL\b.*nothing relevant|^\S+\s+─|^\S+\s+[\d,]+ BSE \+ [\d,]+ NSE companies/.test(l) ? "d" : "";
@@ -1319,7 +1458,11 @@ function choose(id) {
 }
 $("tbl").querySelector("tbody").addEventListener("click", (e) => {
   const tr = e.target.closest("tr[data-id]");
-  if (tr && !e.target.closest("a")) choose(tr.dataset.id);
+  if (!tr || e.target.closest("a")) return;
+  const id = tr.dataset.id;
+  choose(id);
+  S.openId = S.openId === id ? null : id;      // clicking the open row closes it
+  placeQuick(true);
 });
 document.querySelectorAll("#tbl th").forEach((th) => th.addEventListener("click", () => {
   const k = th.dataset.k;
