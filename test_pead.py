@@ -30,6 +30,10 @@ import pead_tool as pt
 import compare_models
 import dashboard
 
+# pead_tool loaded .env; an old EXTRACTION_MODEL line there (ignored by the
+# scanner) would add a startup warning to every banner the tests check
+os.environ.pop("EXTRACTION_MODEL", None)
+
 # Most fixtures are Q1FY27 results; the quarter-cutoff tests set the real value back
 CONFIGURED_SCORE_FROM_QUARTER = pt.SCORE_FROM_QUARTER
 pt.SCORE_FROM_QUARTER = "Q1FY20"
@@ -1656,7 +1660,8 @@ with mock.patch.object(pt.client.chat.completions, "create", fake_create):
         content = sent_requests[0]["messages"][0]["content"] if sent_requests else ""
         sent_pages = sent_page_labels(content)
         ok = (fin is not None and fin["revenue_from_operations"][0] == 662.58 and fin["period_end"] == "2026-06-30"
-              and sent_requests[0]["max_tokens"] == 1500 and sent_requests[0]["model"] == pt.EXTRACTION_MODEL
+              and sent_requests[0]["max_tokens"] == pt.model_call_params(pt.EXTRACTION_MODEL)["max_tokens"]
+              and sent_requests[0]["model"] == pt.EXTRACTION_MODEL
               and sent_pages == expect_pages)
         if isinstance(content, str) and len(expect_pages) == 2:
             ok = ok and "consolidated" in content.split("PDF TEXT:")[-1].split("--- PAGE 5")[0].lower()
@@ -2326,6 +2331,55 @@ check("while waiting for credits: no more model calls or downloads, no retry use
 check("every POLL line keeps counting the result waiting for credits",
       sum(l.startswith("POLL") and "waiting for credits" in l for l in term.lines()) == 2, term.lines())
 
+# A filing waiting in memory holds the saved checkpoint back to its day, so a restart
+# fetches it again (16 Oct 2026: results held for credits from 10-15 Oct were lost
+# when the next run started from 16 Oct)
+from datetime import timedelta as _td
+two_days_ago = (datetime.now() - _td(days=2)).replace(hour=11, minute=0, second=0, microsecond=0)
+old_held = pt.normalise_bse(bse_raw("cr9", 600009, "Result", two_days_ago.isoformat()))
+fresh_state_dir(); reset_credits()
+model_calls["n"] = 0
+with mock.patch.object(pt.client.chat.completions, "create", always_broke):
+    run_main(1, bse=lambda k: [old_held], extract=pt.extract_financials, download=credit_download)
+marks = pt.load_checkpoint()
+check("checkpoint saved at the waiting filing's time, not the poll's",
+      marks.get("BSE") == two_days_ago and marks.get("NSE", datetime.min).date() == date.today(), marks)
+
+reset_credits()
+fetch_since.clear()
+with mock.patch.object(pt.client.chat.completions, "create", lambda **kw: Resp(MODEL_JSON)):
+    run_main(1, bse=lambda k: [old_held], extract=pt.extract_financials, download=credit_download)
+marks = pt.load_checkpoint()
+check("the restart fetches BSE from that day again, and reads the filing",
+      fetch_since[0] == ("BSE", two_days_ago.date()) and "BSE:cr9" in pt.load_seen(), (fetch_since[:2], pt.load_seen()))
+check("once it's handled the checkpoint moves on", marks.get("BSE", datetime.min).date() == date.today(), marks)
+
+# The same for a filing waiting for a retry
+fresh_state_dir(); reset_credits()
+retry_f = pt.normalise_bse(bse_raw("rt9", 600019, "Result", two_days_ago.isoformat()))
+extract, calls = counting_extract({retry_f["attachment_url"]: None})
+run_main(1, bse=lambda k: [retry_f], extract=extract)
+check("a filing waiting for a retry holds the checkpoint back too",
+      pt.load_checkpoint().get("BSE") == two_days_ago and pt.load_retries().get("BSE:rt9") == 1, pt.load_checkpoint())
+
+# --from: catch up from a given day, past the 7-day limit; handled filings aren't read again
+fresh_state_dir(); reset_credits()
+nine_days_ago = date.today() - _td(days=9)
+pt.save_checkpoint({"BSE": datetime.now() - _td(hours=1), "NSE": datetime.now() - _td(hours=1)})
+done_f = pt.normalise_bse(bse_raw("fd1", 600021, "Result", (datetime.now() - _td(days=8)).isoformat(timespec="seconds")))
+todo_f = pt.normalise_bse(bse_raw("fd2", 600022, "Result", (datetime.now() - _td(days=8)).isoformat(timespec="seconds")))
+pt.save_seen({"BSE:fd1"})
+fetch_since.clear()
+extract, calls = counting_extract({todo_f["attachment_url"]: good_fin, done_f["attachment_url"]: good_fin})
+with TerminalCapture() as term:
+    run_main(1, bse=lambda k: [done_f, todo_f], extract=extract, argv=["--from", nine_days_ago.isoformat()])
+check("--from fetches both exchanges from that day, past the 7-day limit",
+      fetch_since[:2] == [("BSE", nine_days_ago), ("NSE", nine_days_ago)], fetch_since[:2])
+check("--from reads only what wasn't handled yet", list(calls) == [todo_f["attachment_url"]], calls)
+check("--from says so in the header", any("--from" in l for l in term.lines()), term.lines())
+check("--from is for that run only: the checkpoint then moves on",
+      pt.load_checkpoint().get("BSE", datetime.min).date() == date.today(), pt.load_checkpoint())
+
 fresh_state_dir(); reset_credits()
 model_calls["n"] = 0
 vague_cr = pt.normalise_bse(bse_raw("cr2", 600002, "Board Meeting", "2026-07-20T11:00:00", sub="Outcome of Board Meeting held today"))
@@ -2362,6 +2416,23 @@ out = io.StringIO()
 with mock.patch.object(pt.client.chat.completions, "create", side_effect=AssertionError("model called")), mock.patch("sys.stdout", out):
     result = compare_models.compare_pdf(cover_path, "model-a", "model-b")
 check("compare skips PDFs without a results table", result["mismatches"] is None and "no results table found" in out.getvalue())
+
+called = []
+def one_model_create(**kw):
+    called.append(kw["model"])
+    return Resp(MODEL_JSON)
+out = io.StringIO()
+with mock.patch.object(pt.client.chat.completions, "create", one_model_create), mock.patch("sys.stdout", out):
+    result = compare_models.compare_pdf(pdf_path, "model-a")
+report = out.getvalue()
+check("one model alone: only that model is called", called == ["model-a"], called)
+check("one model alone: its values are printed",
+      result["fin"]["revenue_from_operations"][0] == 662.58 and "662.58 / 600.00 / 500.00" in report and not result["failed"], report[-600:])
+check("one model alone: the summary line shows the figures",
+      compare_models.summary_status(result, False) == "read · consolidated · revenue 662.58 Cr · PAT 70.00 Cr · quarter ended 2026-06-30",
+      compare_models.summary_status(result, False))
+check("summary for a PDF without a table",
+      compare_models.summary_status({"mismatches": None, "failed": [], "fin": None}, False) == "skipped: no results table found")
 
 section("announcements shared with BASIS (additive)")
 import sqlite3
@@ -2444,6 +2515,197 @@ with mock.patch.object(pt, "publish_announcements",
              master={"bse": {"500001": "INE000A01011"}, "nse": {}}, events=events)
 check("announcements are shared only after the poll's alerts are sent",
       events == ["alert", "alert", ("publish", ["BSE:r1", "NSE:r2"])], events)
+
+# The ISIN lookup misses one copy (17 Oct 2026: E2E Networks scored from NSE, then again
+# from BSE): the company name catches it, in the same run and after a restart
+section("BSE and NSE copies matched by company name")
+check("company_key: the two exchanges' spellings match",
+      all(pt.company_key(a) == pt.company_key(b) for a, b in [
+          ("E2E Networks Limited", "E2E Networks Ltd"), ("The Federal Bank Limited", "Federal Bank Ltd"),
+          ("Indo Rama Synthetics (India) Limited", "INDO RAMA SYNTHETICS (INDIA) LTD."), ("Modison Limited", "Modison Ltd-$"),
+          ("Aditya Birla Fashion and Retail Limited", "Aditya Birla Fashion & Retail Ltd")]))
+check("company_key: different companies stay apart",
+      len({pt.company_key(n) for n in ("HDFC Bank Ltd", "HDFC Life Insurance Company Limited", "Tata Motors Ltd",
+                                       "Tata Motors Finance Ltd")}) == 4 and pt.company_key("") == "")
+
+def named(raw, name, field):
+    raw[field] = name
+    return raw
+e2e_nse = pt.normalise_nse(named(nse_raw("e1", "E2E", "INE255Z01020", "24-Sep-2026 10:00:00"), "E2E Networks Limited", "sm_name"))
+e2e_bse = pt.normalise_bse(named(bse_raw("e2", 544021, "Result", "2026-09-24T10:05:00"), "E2E Networks Ltd", "SLONGNAME"))
+
+fresh_state_dir()
+extract, calls = counting_extract({e2e_nse["attachment_url"]: good_fin, e2e_bse["attachment_url"]: good_fin})
+with TerminalCapture() as term:
+    alerts = run_main(1, bse=lambda k: [e2e_bse], nse=lambda c: [e2e_nse], extract=extract,
+                      master={"bse": {}, "nse": {}})         # BSE code unknown → no ISIN for the BSE copy
+rows = list(csv.DictReader(open(pt.RESULTS_CSV, encoding="utf-8")))
+check("same run: BSE copy without an ISIN is skipped by name, not downloaded or scored",
+      list(calls) == [e2e_nse["attachment_url"]] and alerts == ["NSE:E2E Networks Limited"] and len(rows) == 1,
+      (calls, alerts, len(rows)))
+check("…with a SKIP line that says why",
+      any("already scored from the other exchange" in l for l in term.lines()), term.lines())
+
+extract, calls = counting_extract({e2e_bse["attachment_url"]: good_fin})
+alerts = run_main(1, bse=lambda k: [e2e_bse], extract=extract, master={"bse": {}, "nse": {}})
+check("after a restart too (names come from the results file)",
+      not calls and not alerts and len(list(csv.DictReader(open(pt.RESULTS_CSV, encoding="utf-8")))) == 1, (calls, alerts))
+
+# The quarter printed in the PDF is checked as well (the filing-date guess can differ)
+fresh_state_dir()
+pt.initialize_csv()
+key, status, text = pt.score_filing(e2e_bse, None, dict(good_fin), set(), {},
+                                    scored_names={("e2e networks", "Q1FY27")})
+check("score_filing: same name and PDF quarter → SKIP, no row",
+      status == "SKIP" and "other exchange" in text and len(list(csv.DictReader(open(pt.RESULTS_CSV, encoding="utf-8")))) == 0,
+      (status, text))
+
+# Only scored rows close a company-quarter: a FLAG row or an UNKNOWN quarter leaves it open
+fresh_state_dir()
+pt.initialize_csv()
+pt.save_result_csv(e2e_nse, 30, dict(good_fin), "Q1FY27")
+pt.save_result_csv(pt.normalise_nse(named(nse_raw("f1", "FLG", "INE111A01011", "24-Sep-2026 10:00:00"), "Flagged Co Ltd", "sm_name")),
+                   30, dict(good_fin, check="Q1: income doesn't add up"), "Q1FY27")
+pt.save_result_csv(pt.normalise_nse(named(nse_raw("u1", "UNK", "INE222A01011", "24-Sep-2026 10:00:00"), "Unknown Co Ltd", "sm_name")),
+                   30, dict(good_fin), "UNKNOWN")
+check("scored names from the results file: FLAG and UNKNOWN rows left out",
+      pt.scored_names_from_csv() == {("e2e networks", "Q1FY27")}, pt.scored_names_from_csv())
+
+
+section("Claude Haiku 5.5 (thinking models)")
+from types import SimpleNamespace
+
+class Resp5:
+    """A reply as a thinking model sends it: finish_reason and token usage."""
+    def __init__(self, content, finish="stop", usage=None):
+        self.choices = [SimpleNamespace(message=SimpleNamespace(content=content), finish_reason=finish)]
+        self.usage = usage
+
+def usage(tokens_in, tokens_out, thinking):
+    return SimpleNamespace(prompt_tokens=tokens_in, completion_tokens=tokens_out,
+                           completion_tokens_details=SimpleNamespace(reasoning_tokens=thinking))
+
+check("the scanner uses Haiku 5.5", pt.EXTRACTION_MODEL == "anthropic/claude-haiku-5.5", pt.EXTRACTION_MODEL)
+import subprocess
+probe = subprocess.run(
+    [sys.executable, "-c", "import pead_tool as pt; print(pt.EXTRACTION_MODEL)"],
+    cwd=os.path.dirname(os.path.abspath(__file__)), capture_output=True, text=True, timeout=120,
+    env={**os.environ, "EXTRACTION_MODEL": "anthropic/claude-haiku-4-5"},
+)
+fresh_state_dir()
+with mock.patch.dict(os.environ, {"EXTRACTION_MODEL": "anthropic/claude-haiku-4-5"}), TerminalCapture() as term:
+    run_main(1)
+check("an EXTRACTION_MODEL line in .env gets a startup warning",
+      any("EXTRACTION_MODEL in .env is ignored" in l for l in term.lines()), term.lines())
+fresh_state_dir()
+with TerminalCapture() as term:
+    run_main(1)
+check("no warning without one", not any("EXTRACTION_MODEL" in l for l in term.lines()), term.lines())
+check("an EXTRACTION_MODEL in the environment doesn't switch it to 4.5",
+      probe.stdout.strip().splitlines()[-1:] == ["anthropic/claude-haiku-5.5"], (probe.stdout[-200:], probe.stderr[-300:]))
+
+legacy = {"max_tokens": pt.LEGACY_MAX_TOKENS, "temperature": 0}
+saved_effort = pt.EXTRACTION_EFFORT
+pt.EXTRACTION_EFFORT = None
+check("Claude 3/4 keep temperature 0 and 1500 tokens",
+      all(pt.model_call_params(m) == legacy for m in
+          ("anthropic/claude-haiku-4-5", "anthropic/claude-haiku-4.5", "anthropic/claude-sonnet-4",
+           "anthropic/claude-3-5-haiku", "claude-3.7-sonnet", "anthropic/claude-opus-4-1")))
+check("Claude 5.x: no temperature, room to think",
+      all(pt.model_call_params(m) == {"max_tokens": pt.THINKING_MAX_TOKENS} for m in
+          ("anthropic/claude-haiku-5.5", "anthropic/claude-haiku-5-5", "anthropic/claude-sonnet-5.5")))
+check("other models get the thinking settings", pt.model_call_params("google/gemini-2.5-flash") == {"max_tokens": pt.THINKING_MAX_TOKENS})
+pt.EXTRACTION_EFFORT = "low"
+check("EXTRACTION_EFFORT goes to Claude 5.x only",
+      pt.model_call_params("anthropic/claude-haiku-5.5").get("extra_body") == {"reasoning_effort": "low"}
+      and pt.model_call_params("anthropic/claude-haiku-4-5") == legacy)
+pt.EXTRACTION_EFFORT = None
+
+sent = {}
+def record_create(**kw):
+    sent[kw["model"]] = kw
+    return Resp(MODEL_JSON)
+with mock.patch.object(pt.client.chat.completions, "create", record_create):
+    pt.extract_from_text("PAGE TEXT", "anthropic/claude-haiku-5.5")
+    pt.extract_from_text("PAGE TEXT", "anthropic/claude-haiku-4-5")
+five, four = sent.get("anthropic/claude-haiku-5.5", {}), sent.get("anthropic/claude-haiku-4-5", {})
+check("the 5.5 call sends no temperature", "temperature" not in five and five.get("max_tokens") == pt.THINKING_MAX_TOKENS, five.keys())
+check("the 4.5 call is unchanged", four.get("temperature") == 0 and four.get("max_tokens") == 1500, four.keys())
+check("no effort setting is sent unless asked", "extra_body" not in five)
+
+# What comes back: thinking in the text, thinking blocks, notes around the JSON
+FINAL = '{"basis":"standalone","unit":"crores","revenue_from_operations":[1,2,3],"pat":[4,5,6]}'
+DRAFT = '{"basis":"consolidated","unit":"lakhs","revenue_from_operations":[9,9,9],"pat":[9,9,9]}'
+check("<think> text is dropped",
+      pt.parse_answer(pt.answer_text(SimpleNamespace(content=f"<think>Column 1 is {DRAFT}?</think>\n{FINAL}")))["basis"] == "standalone")
+check("thinking blocks in a content list are dropped",
+      pt.parse_answer(pt.answer_text(SimpleNamespace(content=[
+          {"type": "thinking", "thinking": f"maybe {DRAFT}"},
+          {"type": "text", "text": FINAL},
+      ])))["unit"] == "crores")
+check("an unfinished <think> leaves no answer", pt.answer_text(SimpleNamespace(content=f"<think>looking at {DRAFT}")) == "")
+check("notes around the JSON: the last object with figures wins",
+      pt.parse_answer(f"First guess: {DRAFT}. Checking the header again. {{\"note\": 1}} Final: {FINAL} done")["basis"] == "standalone")
+check("a fenced JSON answer still parses", pt.parse_answer(f"```json\n{FINAL}\n```")["pat"] == [4, 5, 6])
+check("a single object without figures is still the answer (→ MISS, as before)",
+      pt.parse_answer('Sorry: {"note": "no table"}') == {"note": "no table"})
+for label, text in [("an empty answer", ""), ("objects without figures", 'Saw {"page": 4} and {"page": 5}, no table')]:
+    try:
+        pt.parse_answer(text)
+        check(f"{label} is a parse error", False)
+    except json.JSONDecodeError:
+        check(f"{label} is a parse error", True)
+
+THINKING_REPLY = f"<think>The consolidated table is on page 5. {DRAFT}</think>\n" + MODEL_JSON
+with mock.patch.object(pt.client.chat.completions, "create", lambda **kw: Resp5(THINKING_REPLY)):
+    fin = pt.extract_from_text("PAGE TEXT", "anthropic/claude-haiku-5.5")
+check("a reply with thinking still extracts the figures",
+      fin is not None and fin["revenue_from_operations"][0] == 662.58 and fin["basis"] == "consolidated", fin)
+
+# The token limit ended the reply before the JSON: a retry, never a MISS
+fresh_state_dir()
+raw_out = {}
+with mock.patch.object(pt.client.chat.completions, "create",
+                       lambda **kw: Resp5("<think>Reading every line of the table", finish="length")):
+    fin = pt.extract_from_text("PAGE TEXT", "anthropic/claude-haiku-5.5", raw_out=raw_out)
+check("cut off by the token limit → None, marked cut off, not answered",
+      fin is None and raw_out.get("cut_off") and "data" not in raw_out, raw_out)
+with mock.patch.object(pt.client.chat.completions, "create", lambda **kw: Resp5("", finish="length")):
+    try:
+        pt._read_financials(text_pdf(PAGES), {"exchange_dt": datetime(2026, 7, 20, 15, 0)}, False, {})
+        check("a cut-off reply is retried, with the reason", False)
+    except pt.RetryFiling as e:
+        check("a cut-off reply is retried, with the reason", "ran out of tokens" in str(e), e)
+    except pt.SkipFiling as e:
+        check("a cut-off reply is retried, with the reason", False, f"skipped: {e}")
+with mock.patch.object(pt.client.chat.completions, "create", lambda **kw: Resp5(MODEL_JSON, finish="length")):
+    fin = pt.extract_from_text("PAGE TEXT", "anthropic/claude-haiku-5.5")
+check("a complete JSON is used even when the limit was reached", fin is not None and fin["pat"][0] == 70.0, fin)
+
+# Token counts, for checking the cost, and which model AICredits says answered
+pt.usage_totals.clear()
+pt.answered_by.clear()
+def served_reply(**kw):
+    reply = Resp5(MODEL_JSON, usage=usage(5200, 1400, 900))
+    reply.model = "claude-haiku-5-5-20261007"
+    return reply
+with mock.patch.object(pt.client.chat.completions, "create", served_reply):
+    pt.extract_from_text("PAGE TEXT", "anthropic/claude-haiku-5.5")
+    pt.extract_from_text("PAGE TEXT", "anthropic/claude-haiku-5.5")
+check("the answering model's name is kept",
+      pt.answered_by == {"anthropic/claude-haiku-5.5": {"claude-haiku-5-5-20261007"}}, pt.answered_by)
+check("token usage adds up per model",
+      pt.usage_totals.get("anthropic/claude-haiku-5.5") == {"calls": 2, "in": 10400, "out": 2800, "thinking": 1800},
+      pt.usage_totals)
+line = compare_models.usage_line("anthropic/claude-haiku-5.5")
+check("compare_models prices the tokens", "2 calls" in line and "$0.0024" in line and "1,800 thinking" in line, line)
+check("compare_models shows who answered", line.endswith("answered by (as AICredits reports it): claude-haiku-5-5-20261007"), line)
+check("compare_models without a price shows tokens only",
+      compare_models.usage_line("x/unknown") == "  x/unknown: no token counts reported")
+pt.usage_totals.clear()
+pt.answered_by.clear()
+pt.EXTRACTION_EFFORT = saved_effort
+
 
 print(f"\nFAILURES: {fails}")
 sys.exit(1 if fails else 0)

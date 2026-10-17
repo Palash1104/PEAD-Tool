@@ -7,7 +7,7 @@ Post-Earnings Announcement Drift scanner for Indian stocks. It polls BSE and NSE
 | File | What it is |
 |---|---|
 | [pead_tool.py](pead_tool.py) | The scanner. It is one procedural module with no package structure. |
-| [compare_models.py](compare_models.py) | Runs a folder of saved PDFs through two models and prints the extracted values side by side. |
+| [compare_models.py](compare_models.py) | Runs a folder of saved PDFs through Haiku 5.5 (same route as the scanner, scans as images) and prints the extracted values, then the tokens and cost. `--model-b` adds a second model side by side. |
 | [dashboard.py](dashboard.py) + [dashboard.html](dashboard.html) | Local read-only dashboard (`py dashboard.py`, http://127.0.0.1:8050). Standard library only. Reads the state files, `archive/*/pead_results.csv`, `pead_tool.log` (live status, timings, exchange health) and `pead_terminal.log` (the Scanner log panel; falls back to `pead_tool.log` without DEBUG if it's missing). Its one outbound request is `/filing` (below). |
 | [test_pead.py](test_pead.py) | Offline tests. Run `python test_pead.py` and expect `FAILURES: 0`. Network, model and Telegram are mocked, and state files go to a temp dir. The PDF section uses the real pdfplumber, Poppler and Tesseract (about 15s of OCR). Keep it passing and extend it with any change. |
 
@@ -16,15 +16,18 @@ Post-Earnings Announcement Drift scanner for Indian stocks. It polls BSE and NSE
 ```
 python pead_tool.py            # poll forever
 python pead_tool.py --verbose  # same, with DEBUG detail in the terminal too
+python pead_tool.py --from 2026-10-09   # catch up from that day this run (no 7-day limit); handled filings aren't read again
 python pead_tool.py --dump     # save raw_bse_sample.json + raw_nse_sample.json, log field names and scrip-master counts, exit
-python compare_models.py pdfs/ --model-b <aicredits-model-name>   # --model-a defaults to EXTRACTION_MODEL
+python compare_models.py pdfs/                   # Haiku 5.5 alone; --effort low|medium|high sets its thinking
+python compare_models.py pdfs/ --model-b <aicredits-model-name>   # side by side with another model
 python test_pead.py
 ```
 
 - Dependencies are in `requirements.txt` (unpinned). The tests also use Pillow and pypdfium2, which come with pdfplumber/pdf2image.
 - On this machine the Python 3.14 install (`py`) has the deps. The Python 3.10 on PATH does **not**. Needs Python 3.10+.
 - Tesseract is expected at `C:\Program Files\Tesseract-OCR\tesseract.exe` and Poppler at `C:\poppler\Library\bin` (hardcoded).
-- `.env` needs `AICREDITS_API_KEY`, `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`; the script raises at import if any is missing. `EXTRACTION_MODEL` is optional and defaults to `anthropic/claude-haiku-4-5`. Never print or commit `.env`.
+- `.env` needs `AICREDITS_API_KEY`, `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`; the script raises at import if any is missing. `EXTRACTION_EFFORT` (low / medium / high) is optional and only sent to Claude 5.x, as `reasoning_effort`; unset leaves the model's default. Never print or commit `.env`.
+- **The model is Claude Haiku 5.5 only** (`EXTRACTION_MODEL = "anthropic/claude-haiku-5.5"`, fixed in code since 2026-10-17). An `EXTRACTION_MODEL` line in `.env` is ignored, with a warning at startup. **Never switch to, fall back to, or test against Haiku 4.5 unless the user explicitly asks.**
 
 ## Pipeline
 
@@ -69,7 +72,7 @@ Each poll, `main()` calls `run_cycle()` and then `wait_for_checks()` until the n
   - the `⏱` marker
 
 **Timings.**
-- `obtain_financials` records download time, `get_result_text` page-scan and OCR time, and `extract_from_text` model time, all in a `timings` dict.
+- `obtain_financials` records download time, `find_result_pages` page-scan and OCR time, and `_call_model` model time, all in a `timings` dict.
 - `format_timings` appends them to the filing's line, e.g. `⏱ download 1.2s · page scan 0.3s · OCR 6.1s · model 3.4s · exchange→alert 2m 13s` ("exchange→scored" when there is no alert).
 
 1. **Fetch** (`poll_exchanges`)
@@ -102,6 +105,7 @@ Each poll, `main()` calls `run_cycle()` and then `wait_for_checks()` until the n
    - The ISIN comes from the NSE filing itself, or from the scrip master for BSE (`lookup_isin`).
    - The pre-check key is `{ISIN}_{quarter}`, with the quarter estimated from the filing date (`reporting_quarter`). This cheap dedup skip is the only use of the filing-date estimate; it never decides a score. While the ISIN is unknown the key is `{EXCHANGE}-{code}_{quarter}`.
    - If the key is already in `processed_scrips`, the filing is marked seen and skipped.
+   - **Second check, by company name** (since 2026-10-17: E2E Networks and Shoppers Stop were scored once from NSE and again from BSE because the two ISIN keys differed). `company_key()` lowercases the name and drops Ltd/Limited, "The" and punctuation ("&" becomes "and"), so "E2E Networks Ltd" and "E2E Networks Limited" match. `state.scored_names` holds `(company_key, quarter)` for every scored company-quarter: seeded at startup from `pead_results.csv` by `scored_names_from_csv()` (FLAG rows and UNKNOWN quarters left out, so they stay open as with the ISIN key) and added to by `record_success` on SCORE/ALERT. Checked in `triage` (filing-date quarter, before downloading) and in `score_filing` (PDF quarter); the SKIP line reads "<quarter> already scored from the other exchange (same company name)". Not stored in `processed_scrips.json`, so the dashboard's count is unchanged.
 5. **`process_filing()`** = `obtain_financials()` + `score_filing()`. The first downloads (NSE via the session), extracts and validates; it touches no state, so the checker thread shares it. The second computes the real key, scores, writes the CSV and alerts, on the main thread only.
    - `obtain_financials` validates in this order:
      1. `has_core_values` (current revenue **and** PAT).
@@ -134,12 +138,18 @@ Each poll, `main()` calls `run_cycle()` and then `wait_for_checks()` until the n
     - A page whose heading matches `NOT_TABLE_HEADINGS` (cash flow, assets and liabilities, balance sheet) is not a table unless the heading also names the results.
   - Its type comes from `RESULT_HEADINGS` in its first 20 lines, and a table with an unrecognised title is "untitled".
   - The first page in `TABLE_PREFERENCE` order (consolidated, standalone, generic, untitled) is sent, together with the next page.
-  - There is **no keyword fallback**. If no page is a results table, even after OCR, `get_result_text` returns `(None, "no results table found")` and `extract_financials` raises `SkipFiling`.
-- `extract_from_text(text, model)` sends `EXTRACTION_PROMPT` plus the page text with `max_tokens=1500`, `temperature=0` (two reads of the same PDF differed on 9 Oct 2026) and no truncation. The JSON is sliced from the first `{` to the last `}`.
+  - There is **no keyword fallback**. If no page is a results table, even after OCR, `find_result_pages` gives reason "no results table found" and `extract_financials` raises `SkipFiling`.
+- `EXTRACTION_PROMPT` has a **bank section** (since 2026-10-17; Axis, HDFC, IDBI and Central Bank of India had come back MISS because banks print no "Revenue from operations"): revenue = Interest earned, EBITDA = Operating profit before provisions and contingencies, finance cost = Interest expended, total expenses = total expenditure without provisions, and provisions go into `exceptional_items` as a negative number, so `numbers_problem` still adds up. Insurers' formats are not covered (still MISS).
+- `extract_from_text(text, model)` sends `EXTRACTION_PROMPT` plus the page text, with no truncation. The other call settings come from `model_call_params(model)`:
+  - Claude 3.x / 4.x: `max_tokens=1500`, `temperature=0` (two reads of the same PDF differed on 9 Oct 2026).
+  - Claude 5.x (Haiku 5.5, the scanner's model since 2026-10-17) and any other model: no temperature (5.x refuses anything but its default) and `max_tokens=THINKING_MAX_TOKENS` (8000), because its thinking, on by default, counts toward the limit. `EXTRACTION_EFFORT` is added as `extra_body={"reasoning_effort": ...}` when set. Without temperature 0, a re-read can differ; the same-PDF memory keeps one PDF from being read twice.
+  - The reply: `answer_text()` drops thinking (`<think>`/`<thinking>` text and thinking parts of a content list), then `parse_answer()` takes the first `{` to the last `}`; if that isn't JSON, the last object holding any `FIN_KEYS` is used. No such object is a parse error (retried).
+  - `finish_reason == "length"` with no JSON means thinking used up the tokens: a warning, `raw_out["cut_off"]`, and the filing is retried ("the model ran out of tokens before answering"), never a MISS.
+  - `note_usage()` logs each call's tokens at DEBUG (`in`, `out`, thinking, finish) and adds them to `usage_totals`, which `compare_models.py` prints with the cost from its `PRICES`.
 - **Scanned result pages go to the model as images** (`is_scan()`: OCR'd by us, or a full-page scan even if its own text layer was used to find it — scanner digits can't be trusted) (since 2026-10-07; Tiaan Consumer and Golkonda Aluminium came back with impossible figures from Tesseract digits). `extract_from_page_images()` sends the selected scanned pages as grayscale PNGs at `IMAGE_DPI` (150), long edge capped at `IMAGE_MAX_EDGE` (1568, Claude's limit), and text-layer pages as text. Rendering time is `timings["render"]`.
   - If the image call fails, the selected scanned pages are re-OCR'd at `FALLBACK_OCR_DPI` (250) and sent as text. A provider error that rejects images sets `_images_rejected` and text is used for the rest of the run; other errors fall back for that filing only. `SEND_SCANS_AS_IMAGES = False` restores the old text-only behaviour.
-  - Not yet verified live: whether AICredits passes `image_url` PNG parts through to Haiku. The fallback covers a refusal; watch for a "Provider rejected page images" warning.
-- `get_result_text()` still returns `(text, reason)` for `compare_models.py`; scanned pages there are locating-quality OCR text.
+  - Not yet verified live for Haiku 5.5 (AICredits lists it with Vision): whether `image_url` PNG parts pass through. The fallback covers a refusal; watch for a "Provider rejected page images" warning.
+- `compare_models.py` locates the pages once with `find_result_pages`, then calls `extract_financials` for each model, so scans go as images just as in the scanner. With no `--model-b` only Haiku 5.5 is called, and the SUMMARY shows each PDF's basis, revenue, PAT and quarter.
 - `_call_model(..., raw_out=)` puts the model's raw JSON in `raw_out["data"]` even when validation fails, so `obtain_financials` can still see `period_end`.
 - `normalise_financials()` validates the reply:
   - Every `FIN_KEYS` entry becomes a 3-float list `[cq, pq, ly]`.
@@ -159,6 +169,8 @@ Each poll, `main()` calls `run_cycle()` and then `wait_for_checks()` until the n
 
 ## Resuming after a stop
 - `scan_checkpoint.json` holds, per exchange, when its last completed poll started. It is saved at the end of each cycle (after the cycle's clear filings are handled), and only for exchanges whose fetch succeeded.
+  - **Held back for waiting filings** (since 2026-10-17): `marks_to_save()` saves each exchange's mark no later than its oldest filing still in `state.pending` (waiting for credits or a retry). Those live only in memory, so a restart must fetch their day again. On 16 Oct 2026 credits ran out at the start of a catch-up from 9 Oct; 72 results from 10–15 Oct were held, the checkpoint moved to 16 Oct, and the next run never fetched them. The in-memory `checkpoint` still moves on each cycle, so polling stays light while the run lasts.
+  - `--from YYYY-MM-DD` sets `state.from_day` and both in-memory marks to that day's 00:00 for this run: the catch-up reads from there, past `MAX_RESUME_DAYS`, and `seen.json` keeps handled filings from being read again. The banner says "Scanning from … · --from: every filing since then that wasn't handled yet is read". After the first cycle the checkpoint moves on as usual.
 - `ScannerState.resume_from(exchange)` returns the first day to fetch: the checkpoint's day if it's before today, at most `MAX_RESUME_DAYS` (7) back, else None (today only). `fetch_bse_filings(known, since=)` and `fetch_nse_filings(nse, since=)` request that date range (BSE `strPrevDate`/`strToDate`, NSE `from_date`/`to_date`).
 - So a stop at 9 pm and a restart at 4 pm next day reads from 9 pm yesterday, and the first poll after midnight also re-reads yesterday (closes the midnight gap). `seen.json` stops anything already handled from being processed twice. On the first poll the terminal's counts only include announcements newer than the checkpoint (minus 2 min); later polls count every new row.
 - `ScannerState.last_stop()` is the earlier of the two checkpoints; `resumed_since()` is that, floored at `MAX_RESUME_DAYS` back, also for a same-day restart (today is re-read, but what came before that time was already handled). None when there is no checkpoint. The banner's third line says it: "Scanning from 21:01 yesterday · where the last scan stopped", "Scanning from 00:00 today · no earlier run to pick up from", or the capped variant. `when_text()` gives "HH:MM today / yesterday / on Mon 05 Oct".

@@ -9,7 +9,10 @@ SETUP:
 
 CONFIG (.env):
   AICREDITS_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-  EXTRACTION_MODEL  (optional, default anthropic/claude-haiku-4-5)
+  EXTRACTION_EFFORT (optional: low / medium / high thinking for Claude 5.x;
+                     unset = the model's own default)
+  The model is fixed to Claude Haiku 5.5 (EXTRACTION_MODEL below); an
+  EXTRACTION_MODEL line in .env is ignored.
 
 RUN:
   python pead_tool.py          poll forever
@@ -55,7 +58,10 @@ POPPLER_PATH = r"C:\poppler\Library\bin" if os.path.isdir(r"C:\poppler\Library\b
 AICREDITS_API_KEY  = os.getenv("AICREDITS_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
-EXTRACTION_MODEL   = os.getenv("EXTRACTION_MODEL") or "anthropic/claude-haiku-4-5"
+# Haiku 5.5 only (17 Oct 2026). Not configurable from .env: Haiku 4.5 is
+# used only if the user explicitly asks for it.
+EXTRACTION_MODEL   = "anthropic/claude-haiku-5.5"
+EXTRACTION_EFFORT  = (os.getenv("EXTRACTION_EFFORT") or "").strip().lower() or None
 
 if not all([
     AICREDITS_API_KEY,
@@ -1109,6 +1115,34 @@ def processed_key(filing: dict, isin: str | None, quarter: str) -> str:
         return f"{isin}_{quarter}"
     return f"{filing['exchange']}-{filing['code']}_{quarter}"
 
+# A company's BSE and NSE copies normally collide on the ISIN key. When the
+# ISIN lookup misses for one copy (17 Oct 2026: E2E Networks and Shoppers Stop
+# were scored once from NSE and again from BSE), the name catches it: both
+# exchanges print the same name apart from Ltd/Limited, "The" and punctuation.
+_NAME_NOISE = re.compile(r"\b(?:limited|ltd|the)\b")
+QUARTER_RE = re.compile(r"Q[1-4]FY\d{2}")
+
+def company_key(name: str) -> str:
+    """A company's name as both exchanges print it: "E2E Networks Ltd" and
+    "E2E Networks Limited" give the same key, "e2e networks"."""
+    text = re.sub(r"[^a-z0-9]+", " ", (name or "").lower().replace("&", " and "))
+    return " ".join(_NAME_NOISE.sub(" ", text).split())
+
+def scored_names_from_csv() -> set:
+    """(company_key, quarter) of every company-quarter in RESULTS_CSV that was
+    scored: rows whose numbers didn't add up (FLAG) and UNKNOWN quarters leave
+    the company-quarter open, as they do for the ISIN key."""
+    names = set()
+    try:
+        with open(RESULTS_CSV, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                company, quarter = company_key(row.get("company")), (row.get("quarter") or "").strip()
+                if company and QUARTER_RE.fullmatch(quarter) and not (row.get("check") or "").strip():
+                    names.add((company, quarter))
+    except OSError:
+        pass
+    return names
+
 KEY_RE = re.compile(r"(?:(BSE|NSE)-)?(.+)_(Q[1-4]FY\d{2})")
 
 def migrate_processed_keys(processed: set, master: dict) -> set:
@@ -1161,6 +1195,20 @@ Also report:
 - prev_period_end: the "quarter ended" date of the previous quarter column (Column 2), as YYYY-MM-DD
 - ly_period_end: the "quarter ended" date of the same quarter last year column (Column 3), as YYYY-MM-DD
   (use null for any of these dates the table doesn't show)
+
+BANKS: a bank's results table has no "Revenue from operations"; it shows Interest earned, Interest expended, Operating profit before provisions and contingencies, and Provisions and contingencies. For a bank's table use:
+- revenue_from_operations: Interest earned (its total)
+- total_income: Total income
+- ebitda: Operating profit before provisions and contingencies
+- finance_cost: Interest expended
+- depreciation: null unless the table prints it as its own line
+- employee_expense: Payments to and provisions for employees
+- other_expenses: Other operating expenses
+- total_expenses: Total expenditure (interest expended plus operating expenses), NOT including provisions and contingencies
+- exceptional_items: Provisions (other than tax) and contingencies as a negative number, plus any exceptional items printed before profit before tax
+- pbt: Profit from ordinary activities before tax
+- pat: Net profit for the quarter (consolidated results: after minority interest and share of associates, if the table shows them)
+- basic_eps: Basic EPS for the quarter, often listed under Analytical Ratios (not annualised)
 
 Return ONLY a JSON object, no explanation, no markdown:
 {
@@ -1485,18 +1533,6 @@ def pages_as_text(found: dict) -> str:
         for i in found["pages"]
     )
 
-def get_result_text(pdf_bytes: bytes, ocr_page_limit: int = MAX_PDF_PAGES,
-                    timings: dict | None = None) -> tuple:
-    """Text of the result table pages: (text, reason). text is None when no
-    page passes the results-table check, even after OCR. Scanned pages come
-    back as locating-quality OCR text (compare_models.py uses this)."""
-    found = find_result_pages(pdf_bytes, ocr_page_limit, timings)
-
-    if not found["pages"]:
-        return None, found["reason"]
-
-    return pages_as_text(found), found["reason"]
-
 def is_scan(found: dict, i: int) -> bool:
     """Page i is a scan: OCR'd by us, or an image with the scanner's text layer.
     Scans go to the model as images (their text is not trustworthy)."""
@@ -1664,13 +1700,113 @@ def _note_credits_ok():
     log.info(f"AICredits: credits are back (out since {since:%H:%M})" if since else "AICredits: credits are back", extra=QUIET)
     say("AICredits credits are back — reading the results that waited", "green")
 
+# Claude 3.x / 4.x answer straight away: temperature 0 keeps two reads of the
+# same page the same (9 Oct 2026: they differed), and 1500 tokens is ample.
+# Claude 5.x thinks before it answers (on by default), refuses any temperature
+# but its default, and counts the thinking toward max_tokens, so it gets no
+# temperature and room to think. Any model that isn't Claude 3/4 is treated
+# like 5.x. EXTRACTION_EFFORT is passed only to those.
+LEGACY_MAX_TOKENS   = 1500
+THINKING_MAX_TOKENS = 8000
+
+def model_call_params(model: str) -> dict:
+    """The chat.completions.create settings for this model, besides model and messages."""
+    version = re.search(r"claude-(?:(?:haiku|sonnet|opus)-)?(\d+)", model.lower())
+
+    if version and int(version.group(1)) <= 4:
+        return {"max_tokens": LEGACY_MAX_TOKENS, "temperature": 0}
+
+    params = {"max_tokens": THINKING_MAX_TOKENS}
+    if EXTRACTION_EFFORT:
+        params["extra_body"] = {"reasoning_effort": EXTRACTION_EFFORT}
+    return params
+
+_THINKING = re.compile(r"<(think|thinking)>.*?(?:</\1>|\Z)", re.S | re.I)
+
+def answer_text(message) -> str:
+    """The model's answer without its thinking. content is a string, or a list
+    of parts when a gateway passes Claude's thinking blocks through."""
+    content = getattr(message, "content", None)
+
+    if isinstance(content, list):
+        def field(part, key):
+            return part.get(key) if isinstance(part, dict) else getattr(part, key, None)
+        content = "".join(
+            field(part, "text") or ""
+            for part in content
+            if field(part, "type") in (None, "text", "output_text")
+        )
+
+    return _THINKING.sub("", content or "").strip()
+
+def parse_answer(text: str) -> dict:
+    """The extraction JSON in the model's answer. Normally the answer is just
+    the object; if the model wrote anything around it, the last object holding
+    figure keys is used. Raises json.JSONDecodeError when there is none."""
+    try:
+        data = json.loads(text[text.find("{"):text.rfind("}") + 1])
+        if isinstance(data, dict):
+            return data
+    except json.JSONDecodeError:
+        pass
+
+    decoder, found = json.JSONDecoder(), None
+    start = text.find("{")
+
+    while start != -1:
+        try:
+            obj, end = decoder.raw_decode(text, start)
+        except json.JSONDecodeError:
+            start = text.find("{", start + 1)
+            continue
+        if isinstance(obj, dict) and any(key in obj for key in FIN_KEYS):
+            found = obj
+        start = text.find("{", end)
+
+    if found is None:
+        raise json.JSONDecodeError("no JSON object with figures in the answer" if text else "empty answer", text, 0)
+    return found
+
+usage_totals = {}                # model → {"calls", "in", "out", "thinking"} tokens this run
+answered_by = {}                 # model asked for → names AICredits says answered
+
+def note_usage(model: str, response, finish) -> None:
+    """Add the call's token counts to usage_totals, the answering model's name
+    (as AICredits reports it) to answered_by, and both to the debug log."""
+    served = getattr(response, "model", None)
+    if isinstance(served, str) and served:
+        answered_by.setdefault(model, set()).add(served)
+        log.debug(f"{model} answered by {served}")
+
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return
+
+    details = getattr(usage, "completion_tokens_details", None)
+    tokens_in = getattr(usage, "prompt_tokens", 0) or 0
+    tokens_out = getattr(usage, "completion_tokens", 0) or 0
+    thinking = (getattr(details, "reasoning_tokens", 0) or 0) if details is not None else 0
+
+    totals = usage_totals.setdefault(model, {"calls": 0, "in": 0, "out": 0, "thinking": 0})
+    totals["calls"] += 1
+    totals["in"] += tokens_in
+    totals["out"] += tokens_out
+    totals["thinking"] += thinking
+
+    log.debug(
+        f"{model} tokens: {tokens_in} in, {tokens_out} out"
+        + (f" ({thinking} thinking)" if thinking else "")
+        + f", finish {finish}"
+    )
+
 def _call_model(content, model: str, timings: dict | None = None,
                 raw_out: dict | None = None, raise_api_errors: bool = False) -> dict | None:
     """One extraction call via AICredits; validated financials or None.
 
     content is the prompt string, or a list of text / image_url parts.
     raw_out, if given, receives the model's parsed JSON as raw_out["data"],
-    even when it fails validation (obtain_financials reads period_end from it).
+    even when it fails validation (obtain_financials reads period_end from it),
+    and raw_out["cut_off"] when the token limit ended the reply before any JSON.
     Adds the call time to timings["model"].
     """
     if not _credits_call_allowed():
@@ -1680,11 +1816,11 @@ def _call_model(content, model: str, timings: dict | None = None,
 
     try:
         try:
+            params = model_call_params(model)
             response = client.chat.completions.create(
                 model=model,
-                max_tokens=1500,
-                temperature=0,      # same page, same reading (9 Oct 2026: two reads of one PDF differed)
                 messages=[{"role": "user", "content": content}],
+                **params,
             )
         finally:
             if timings is not None:
@@ -1696,8 +1832,24 @@ def _call_model(content, model: str, timings: dict | None = None,
             raise RuntimeError(f"no answer from the model: {getattr(response, 'error', None) or extra.get('error') or extra}")
         _note_credits_ok()
 
-        raw = response.choices[0].message.content or ""
-        data = json.loads(raw[raw.find("{"):raw.rfind("}") + 1])
+        choice = response.choices[0]
+        finish = getattr(choice, "finish_reason", None)
+        note_usage(model, response, finish)
+
+        try:
+            data = parse_answer(answer_text(choice.message))
+        except json.JSONDecodeError:
+            if finish != "length":
+                raise
+            # Thinking counts toward max_tokens: it ran out before the JSON
+            log.warning(
+                f"{model} used all {params['max_tokens']} tokens before answering; will retry",
+                extra=QUIET,
+            )
+            if raw_out is not None:
+                raw_out["cut_off"] = True
+            return None
+
         log.debug(f"{model} extracted: {data}")
 
         if raw_out is not None:
@@ -2466,6 +2618,8 @@ def _read_financials(pdf: bytes, filing: dict, ambiguous: bool, timings: dict) -
     if not fin:
         if answered:
             raise SkipFiling("the model found no figures it could use · not retried", model_called=True, status="MISS")
+        if raw_out.get("cut_off"):
+            raise RetryFiling("the model ran out of tokens before answering")
         raise RetryFiling("could not extract financials")
 
     if not has_core_values(fin):
@@ -2486,7 +2640,7 @@ def _read_financials(pdf: bytes, filing: dict, ambiguous: bool, timings: dict) -
     return fin
 
 def score_filing(filing: dict, isin, fin: dict, processed: set, timings: dict,
-                 flagged: set = frozenset()) -> tuple:
+                 flagged: set = frozenset(), scored_names: set = frozenset()) -> tuple:
     """Quarter key, duplicate check, score, CSV and alert.
 
     Returns (processed key, status word, line text); the key is returned too
@@ -2494,6 +2648,8 @@ def score_filing(filing: dict, isin, fin: dict, processed: set, timings: dict,
     always comes from the PDF's period_end. Raises SkipFiling for a quarter
     before SCORE_FROM_QUARTER. flagged: company-quarters already saved with a
     failed sanity check; another failing copy saves no second row.
+    scored_names: (company_key, quarter) already scored, which catches the
+    other exchange's copy when the two ISIN keys differ.
     """
     exchange_dt = filing["exchange_dt"]
     filed_on = (exchange_dt or datetime.now()).date()
@@ -2513,6 +2669,10 @@ def score_filing(filing: dict, isin, fin: dict, processed: set, timings: dict,
 
     if key in processed:
         return key, "SKIP", with_timings(f"{key} already scored (quarter from PDF)", timings)
+
+    if (company_key(filing["company"]), quarter) in scored_names:
+        return key, "SKIP", with_timings(
+            f"{quarter} already scored from the other exchange (same company name)", timings)
 
     if fin.get("check") and key in flagged:
         # Another copy of a filing already saved as FLAG (Bridge Securities,
@@ -2549,7 +2709,8 @@ def score_filing(filing: dict, isin, fin: dict, processed: set, timings: dict,
     return key, "SCORE", with_timings(summary, timings, exchange_dt, "scored")
 
 def process_filing(filing: dict, isin, processed: set, nse: NseClient,
-                   timings: dict | None = None, flagged: set = frozenset()) -> tuple:
+                   timings: dict | None = None, flagged: set = frozenset(),
+                   scored_names: set = frozenset()) -> tuple:
     """Clear result filings, on the main thread: obtain financials, then score.
 
     Returns score_filing's (key, status, text). Raises RetryFiling or
@@ -2557,7 +2718,7 @@ def process_filing(filing: dict, isin, processed: set, nse: NseClient,
     """
     timings = {} if timings is None else timings
     fin = obtain_financials(filing, nse, timings=timings)
-    return score_filing(filing, isin, fin, processed, timings, flagged)
+    return score_filing(filing, isin, fin, processed, timings, flagged, scored_names)
 
 class AmbiguousChecker:
     """One background thread for ambiguous board meeting outcomes.
@@ -2619,11 +2780,14 @@ class ScannerState:
     """Everything that survives between polls; persisted parts saved as they change.
     Only the main thread uses it."""
 
+    from_day = None          # --from: this run's catch-up reads back to this day
+
     def __init__(self, nse: NseClient):
         self.nse = nse
         self.seen = load_seen()
         self.retries = load_retries()          # filing id → failed attempts
         self.flagged = load_flagged()          # company-quarters saved as FLAG
+        self.scored_names = scored_names_from_csv()   # (company_key, quarter) already scored
         self.held = set()                      # filing ids waiting for model credits (in pending, no retry used)
         self.pending = {}                      # filing id → filing awaiting retry
         self.bse_known_ids = set()             # BSE NEWSIDs fetched on earlier polls
@@ -2667,7 +2831,7 @@ class ScannerState:
         if not mark:
             return None
         today = date.today()
-        day = max(mark.date(), today - timedelta(days=MAX_RESUME_DAYS))
+        day = max(mark.date(), self.from_day or today - timedelta(days=MAX_RESUME_DAYS))
         return day if day < today else None
 
     def last_stop(self) -> datetime | None:
@@ -2682,7 +2846,7 @@ class ScannerState:
         stop = self.last_stop()
         if not stop:
             return None
-        floor = datetime.combine(date.today() - timedelta(days=MAX_RESUME_DAYS), datetime.min.time())
+        floor = datetime.combine(self.from_day or date.today() - timedelta(days=MAX_RESUME_DAYS), datetime.min.time())
         return max(stop, floor)
 
     def save_poll_marks(self):
@@ -2692,7 +2856,21 @@ class ScannerState:
         if self.poll_marks:
             self.checkpoint.update(self.poll_marks)
             self.poll_marks = {}
-            save_checkpoint(self.checkpoint)
+            save_checkpoint(self.marks_to_save())
+
+    def marks_to_save(self) -> dict:
+        """The checkpoint as saved to disk: each exchange's mark, held back to
+        its oldest filing still waiting (for credits or a retry). Those wait
+        only in memory, so a restart must fetch their day again (16 Oct 2026:
+        results held for credits from 10-15 Oct were never read, because the
+        next run started from 16 Oct). The in-memory marks move on as usual,
+        so polling stays light while the run lasts."""
+        marks = dict(self.checkpoint)
+        for filing in self.pending.values():
+            exchange, when = filing.get("exchange"), filing.get("exchange_dt")
+            if when and exchange in marks and when < marks[exchange]:
+                marks[exchange] = when
+        return marks
 
     def finish(self, fid: str):
         """Done with a filing for good: success, skip, or retries exhausted."""
@@ -2767,6 +2945,11 @@ def triage(filing: dict, state: ScannerState) -> str:
         state.finish(fid)
         return "duplicate"
 
+    if (company_key(filing["company"]), reporting_quarter(filed_on)) in state.scored_names:
+        report("SKIP", filing, f"{reporting_quarter(filed_on)} already scored from the other exchange (same company name)")
+        state.finish(fid)
+        return "duplicate"
+
     return kind
 
 def record_success(filing: dict, state: ScannerState, key: str | None, status: str = "SCORE"):
@@ -2776,6 +2959,7 @@ def record_success(filing: dict, state: ScannerState, key: str | None, status: s
     elif key and status != "SKIP":
         state.processed.add(key)
         save_processed_scrips(state.processed)
+        state.scored_names.add((company_key(filing["company"]), key.rsplit("_", 1)[-1]))
     state.finish(filing["id"])
 
 def report_result(status: str, filing: dict, text: str):
@@ -2854,7 +3038,8 @@ def handle_clear(filing: dict, state: ScannerState):
     timings = {}
 
     try:
-        key, status, text = process_filing(filing, isin, state.processed, state.nse, timings, state.flagged)
+        key, status, text = process_filing(filing, isin, state.processed, state.nse, timings,
+                                           state.flagged, state.scored_names)
     except CreditsExhausted:
         hold_for_credits(filing, state)
         return
@@ -2912,7 +3097,8 @@ def apply_ambiguous_result(result: dict, state: ScannerState):
 
     try:
         key, status, text = score_filing(
-            filing, lookup_isin(filing, state.master), result["fin"], state.processed, timings, state.flagged
+            filing, lookup_isin(filing, state.master), result["fin"], state.processed, timings,
+            state.flagged, state.scored_names
         )
     except SkipFiling as e:
         record_skip(filing, state, e, timings)
@@ -3282,6 +3468,14 @@ def main(argv=None):
         action="store_true",
         help="show DEBUG detail in the terminal too (pead_tool.log always has it)",
     )
+    parser.add_argument(
+        "--from",
+        dest="from_day",
+        type=date.fromisoformat,
+        metavar="YYYY-MM-DD",
+        help="catch up from this day instead of where the last scan stopped (no "
+             f"{MAX_RESUME_DAYS}-day limit); filings already handled are not read again",
+    )
     args = parser.parse_args(argv)
 
     configure_console(args.verbose)
@@ -3293,13 +3487,19 @@ def main(argv=None):
     global SCANNER_STARTED_AT
     SCANNER_STARTED_AT = datetime.now()
 
+    effort = (f" ({EXTRACTION_EFFORT} effort)"
+              if EXTRACTION_EFFORT and "temperature" not in model_call_params(EXTRACTION_MODEL) else "")
+
     log.info(
-        f"PEAD scanner · BSE + NSE · model {EXTRACTION_MODEL} · "
+        f"PEAD scanner · BSE + NSE · model {EXTRACTION_MODEL}{effort} · "
         f"alert at score ≥ {PEAD_THRESHOLD} · scoring from {SCORE_FROM_QUARTER}",
         extra=QUIET,
     )
-    say(f"PEAD scanner  ·  {EXTRACTION_MODEL.split('/')[-1]}  ·  alerts at {PEAD_THRESHOLD}+  ·  "
+    say(f"PEAD scanner  ·  {EXTRACTION_MODEL.split('/')[-1]}{effort}  ·  alerts at {PEAD_THRESHOLD}+  ·  "
         f"scoring {SCORE_FROM_QUARTER} results  ·  {SCANNER_STARTED_AT:%a %d %b %Y}", "bold")
+
+    if (os.getenv("EXTRACTION_MODEL") or EXTRACTION_MODEL) != EXTRACTION_MODEL:
+        log.warning(f"EXTRACTION_MODEL in .env is ignored; the scanner always uses {EXTRACTION_MODEL}")
 
     initialize_csv()
 
@@ -3313,9 +3513,16 @@ def main(argv=None):
     say(f"{len(state.master['bse']):,} BSE + {len(state.master['nse']):,} NSE companies  ·  "
         f"{len(state.processed)} scored this quarter  ·  {len(state.retries)} awaiting retry", "dim")
 
-    state.first_since = state.resumed_since()
     stop = state.last_stop()
-    if not state.first_since:
+    if args.from_day:
+        state.from_day = args.from_day
+        start = datetime.combine(args.from_day, datetime.min.time())
+        state.checkpoint = {"BSE": start, "NSE": start}
+    state.first_since = state.resumed_since()
+    if args.from_day:
+        say(f"Scanning from {when_text(state.first_since)}  ·  --from: every filing since then that wasn't "
+            f"handled yet is read", "cyan")
+    elif not state.first_since:
         say("Scanning from 00:00 today  ·  no earlier run to pick up from", "cyan")
     elif state.first_since > stop:
         say(f"Scanning from {when_text(state.first_since)}  ·  last scan was {when_text(stop)}, "

@@ -1,0 +1,128 @@
+Screener names read: 187 · scored this quarter (Q2FY27): 72
+
+SCORED: 72
+
+FLAGGED: 2
+  ICICI Pru Life (ICICIPRULI) (score 4.0)
+  Bridge Securitie (530249) (score 5.0)
+
+READ, NOT SCORED: 95
+  Pun. & Sind Bank (PSB) [SKIP BSE] same PDF as the NSE 17 Oct 18:41 filing (MISS) · not read again ⏱ download …
+  Rossari Biotech (ROSSARI) [RETRY NSE] could not extract financials · gave up after 4 attempts ⏱ download 0.1s…
+  Parin Enterpris. (PARIN) [MISS NSE] no current-quarter PAT in the table · not retried ⏱ download 1.3s · page …
+  Central Bank (CENTRALBK) [SKIP BSE] same PDF as the NSE 17 Oct 13:19 filing (MISS) · not read again ⏱ downloa…
+  Indo Cotspin (538838) [SKIP BSE] same PDF as the BSE 17 Oct 12:42 filing (NONE) · not read again ⏱ download 0…
+  Artson (522134) [SKIP BSE] same PDF as the BSE 16 Oct 19:16 filing (NONE) · not read again ⏱ download 0.5s
+  Himadri Special (HSCL) [SKIP BSE] same PDF as the NSE 16 Oct 18:19 filing (MISS) · not read again ⏱ download …
+  Bright Outdoor (543831) [MISS BSE] no current-quarter revenue from operations or PAT in the table · not retri…
+  DLF (DLF) [SKIP BSE] same PDF as the BSE 16 Oct 17:06 filing (MISS) · not read again ⏱ download 1.0s
+  Oberoi Realty (OBEROIRLTY) [SKIP NSE] same PDF as the NSE 16 Oct 18:11 filing (NONE) · not read again ⏱ downl…
+  SG Finserve (SGFIN) [SKIP BSE] same PDF as the NSE 16 Oct 14:00 filing (NONE) · not read again ⏱ download 1.0s
+  Ujjivan Small (UJJIVANSFB) [SKIP NSE] same PDF as the BSE 16 Oct 12:37 filing (NONE) · not read again ⏱ downl…
+  Narmada Macplast (517431) [WAIT BSE] waiting for AICredits credits · no retry used
+  CCL Products (CCL) [WAIT NSE] waiting for AICredits credits · no retry used
+  Kabra Extrusion (KABRAEXTRU) [WAIT NSE] waiting for AICredits credits · no retry used
+  MPF Systems (532470) [WAIT BSE] waiting for AICredits credits · no retry used
+  BFL Asset Finves (539662) [WAIT BSE] waiting for AICredits credits · no retry used
+  SBC Exports (SBC) [WAIT NSE] waiting for AICredits credits · no retry used
+  L&T Finance Ltd (LTF) [WAIT BSE] waiting for AICredits credits · no retry used
+  AVENIQUE (530701) [WAIT BSE] waiting for AICredits credits · no retry used
+  5paisa Capital (5PAISA) [WAIT BSE] waiting for AICredits credits · no retry used
+  Sh. Krish. Infr. (542146) [WAIT BSE] waiting for AICredits credits · no retry used
+  Mangalam World. (MWL) [WAIT BSE] waiting for AICredits credits · no retry used
+  Jio Financial (JIOFIN) [WAIT NSE] waiting for AICredits credits · no retry used
+  Sri Lotus (LOTUSDEV) [WAIT BSE] waiting for AICredits credits · no retry used
+  Carnation Inds. (530609) [WAIT BSE] waiting for AICredits credits · no retry used
+  Tuni Text. Mills (531411) [WAIT BSE] waiting for AICredits credits · no retry used
+  Mahindra EPC (MAHEPC) [WAIT BSE] waiting for AICredits credits · no retry used
+  Alok Industries (ALOKINDS) [WAIT BSE] waiting for AICredits credits · no retry used
+  Oriental Hotels (ORIENTHOT) [WAIT BSE] waiting for AICredits credits · no retry used
+  Tech Mahindra (TECHM) [WAIT BSE] waiting for AICredits credits · no retry used
+  USG Tech (532402) [WAIT BSE] waiting for AICredits credits · no retry used
+  Bombay Super Hyb (BSHSL) [WAIT BSE] waiting for AICredits credits · no retry used
+  Sterling & Wils. (SWSOLAR) [WAIT BSE] waiting for AICredits credits · no retry used
+  360 ONE (360ONE) [WAIT BSE] waiting for AICredits credits · no retry used
+  Angel One (ANGELONE) [WAIT BSE] waiting for AICredits credits · no retry used
+  Metro Brands (METROBRAND) [WAIT BSE] waiting for AICredits credits · no retry used
+  Cyient DLM (CYIENTDLM) [WAIT BSE] waiting for AICredits credits · no retry used
+  Butterfly Gan Ap (BUTTERFLY) [WAIT BSE] waiting for AICredits credits · no retry used
+  Heritage Foods (HERITGFOOD) [WAIT BSE] waiting for AICredits credits · no retry used
+  IIFL Finance (IIFL) [WAIT BSE] waiting for AICredits credits · no retry used
+  Persistent Systems (PERSISTENT) [WAIT NSE] waiting for AICredits credits · no retry used
+  Wipro (WIPRO) [WAIT BSE] waiting for AICredits credits · no retry used
+  Advik Capital (ADVIKCA) [WAIT BSE] waiting for AICredits credits · no retry used
+  HDFC Life Insur. (HDFCLIFE) [WAIT BSE] waiting for AICredits credits · no retry used
+  HDFC AMC (HDFCAMC) [WAIT BSE] waiting for AICredits credits · no retry used
+  I R F C (IRFC) [WAIT BSE] waiting for AICredits credits · no retry used
+  UCO Bank (UCOBANK) [WAIT BSE] waiting for AICredits credits · no retry used
+  Karur Vysya Bank (KARURVYSYA) [WAIT BSE] waiting for AICredits credits · no retry used
+  South Ind.Bank (SOUTHBANK) [WAIT BSE] waiting for AICredits credits · no retry used
+  Tips Music (TIPSMUSIC) [WAIT BSE] waiting for AICredits credits · no retry used
+  D B Corp (DBCORP) [WAIT BSE] waiting for AICredits credits · no retry used
+  Tata Comm (TATACOMM) [WAIT BSE] waiting for AICredits credits · no retry used
+  Orient Electric (ORIENTELEC) [WAIT BSE] waiting for AICredits credits · no retry used
+  Nestle India (NESTLEIND) [WAIT BSE] waiting for AICredits credits · no retry used
+  Indian Bank (INDIANB) [WAIT NSE] waiting for AICredits credits · no retry used
+  Polycab India (POLYCAB) [WAIT BSE] waiting for AICredits credits · no retry used
+  Fedbank Financi. (FEDFINA) [WAIT NSE] waiting for AICredits credits · no retry used
+  Aurique (517230) [WAIT BSE] waiting for AICredits credits · no retry used
+  Indus Finance (531841) [WAIT BSE] waiting for AICredits credits · no retry used
+  Viji Finance (VIJIFIN) [WAIT BSE] waiting for AICredits credits · no retry used
+  TTL Enterprises (514236) [WAIT BSE] waiting for AICredits credits · no retry used
+  ICICI Lombard (ICICIGI) [WAIT BSE] waiting for AICredits credits · no retry used
+  Hathway Cable (HATHWAY) [WAIT NSE] waiting for AICredits credits · no retry used
+  M R P L (MRPL) [WAIT BSE] waiting for AICredits credits · no retry used
+  Emmvee Photovol. (EMMVEE) [WAIT BSE] waiting for AICredits credits · no retry used
+  Adit.Birla Money (BIRLAMONEY) [WAIT NSE] waiting for AICredits credits · no retry used
+  Ardi Alliances (504370) [WAIT BSE] waiting for AICredits credits · no retry used
+  Bajaj Consumer (BAJAJCON) [WAIT NSE] waiting for AICredits credits · no retry used
+  CEAT (CEATLTD) [WAIT NSE] waiting for AICredits credits · no retry used
+  Rel. Indl. Infra (RIIL) [WAIT BSE] waiting for AICredits credits · no retry used
+  Polycon Intl. (531397) [WAIT BSE] waiting for AICredits credits · no retry used
+  Sulabh Engineers (508969) [WAIT BSE] waiting for AICredits credits · no retry used
+  Tata Technolog. (TATATECH) [WAIT BSE] waiting for AICredits credits · no retry used
+  Bacil Pharma (524516) [WAIT BSE] waiting for AICredits credits · no retry used
+  Leela Palaces Hotels (THELEELA) [WAIT BSE] waiting for AICredits credits · no retry used
+  HDB FINANC SER (HDBFS) [WAIT BSE] waiting for AICredits credits · no retry used
+  B H E L (BHEL) [WAIT NSE] waiting for AICredits credits · no retry used
+  Intl. Travel Hse (500213) [WAIT BSE] waiting for AICredits credits · no retry used
+  Talwal.Better (TALWALKARS) [SKIP NSE] same PDF as the BSE 13 Oct 18:18 filing (MISS) · not read again ⏱ downl…
+  Den Networks (DEN) [WAIT BSE] waiting for AICredits credits · no retry used
+  GTPL Hathway (GTPL) [WAIT NSE] waiting for AICredits credits · no retry used
+  IGC Industries (539449) [WAIT BSE] waiting for AICredits credits · no retry used
+  Blue Pearl Agri (514440) [SKIP BSE] same PDF as the BSE 13 Oct 16:07 filing (MISS) · not read again ⏱ downloa…
+  Inani Securities (531672) [WAIT BSE] waiting for AICredits credits · no retry used
+  Rudra Ecovation (514010) [WAIT BSE] waiting for AICredits credits · no retry used
+  Swan Defence (SWANDEF) [SKIP BSE] same PDF as the NSE 12 Oct 18:00 filing (OLD) · not read again ⏱ download 2…
+  Universal Arts (532378) [NONE BSE] no results table found · headline: 'Universal Arts Ltd - 532378 - Financia…
+  RBL Bank (RBLBANK) [SKIP BSE] same PDF as the NSE 12 Oct 16:39 filing (MISS) · not read again ⏱ download 2.7s
+  Hathway Bhawani (509073) [NONE BSE] no results table found · headline: 'Hathway Bhawani Cabletel & Datacom Lt…
+  Can Fin Homes (CANFINHOME) [RETRY BSE] could not extract financials · gave up after 4 attempts ⏱ download 0.4…
+  Waterways Leisur (CORDELIA) [RETRY BSE] missing current-quarter revenue or PAT · gave up after 4 attempts ⏱ d…
+  Canara HSBC (CANHLIFE) [RETRY BSE] missing current-quarter revenue or PAT · gave up after 4 attempts ⏱ downlo…
+  Jai Mata Glass (523467) [RETRY BSE] missing current-quarter revenue or PAT · gave up after 4 attempts ⏱ downl…
+  G M Breweries (GMBREW) [NONE NSE] no results table found ⏱ download 1.3s · page scan 0.4s · OCR 1.9s
+
+SKIPPED BY TITLE: 0
+
+NOT IN RECORDS: 18
+  PDF (SOURCE) no announcements since 2026-10-01 under this name
+  Supreme Power (SUPREMEPWR) no announcements since 2026-10-01 under this name
+  Ambani Orgochem (AMBANIORGO) no announcements since 2026-10-01 under this name
+  Infollion Resea. (INFOLLION) no announcements since 2026-10-01 under this name
+  ICICI Securities (ID) no announcements since 2026-10-01 under this name
+  Accent Microcell (ACCENTMIC) no announcements since 2026-10-01 under this name
+  PropsharePlatina (544295) announcements: BSE 2026-10-10 Others: Property Share Investment Trust - Propshare P…
+  PropshareTitania (544462) announcements: BSE 2026-10-10 Others: Propshare Titania SM REIT - IPO (Second schem…
+  Propshare Celestia (544752) announcements: BSE 2026-10-10 Others: PropShare Celestia - 544752 - Reg 23(5)(i):…
+  Abhishek Integr. (AILIMITED) no announcements since 2026-10-01 under this name
+  Grand Oak Canyon (GRANDOAK) no announcements since 2026-10-01 under this name
+  Karnika Industri (KARNIKA) no announcements since 2026-10-01 under this name
+  Lotus Chocolate (LOTUSCHO) no announcements since 2026-10-01 under this name
+  Onix Solar (ONIXSOLAR) no announcements since 2026-10-01 under this name
+  Ind Bank Housing (523465) announcements: BSE 2026-10-09 Company Update: Ind Bank Housing Ltd - 523465 - Annou…
+  Shaival Reality (SHAIVAL) no announcements since 2026-10-01 under this name
+  Hawa Engineers (539176) announcements: BSE 2026-10-17 Company Update: Hawa Engineers Ltd - 539176 - Complianc…
+  Hindusthan Insulators & (539984) announcements: BSE 2026-10-12 AGM/EGM: Hindusthan Insulators & Industries Lt…
+
+read, not scored by status: WAIT 72, SKIP 13, RETRY 5, NONE 3, MISS 2
