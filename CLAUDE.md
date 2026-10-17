@@ -219,7 +219,7 @@ Growth is `_pct(curr, prev) = (curr - prev) / abs(prev) * 100`. `band_score` awa
 | `pead_terminal.log` (+ `.1`–`.2`) | Copy of the clean terminal, UTF-8, rotating at 1 MB with 2 backups. Read by the dashboard's Scanner log panel. | ignored |
 
 - **Scrip master**: built from BSE `ListofScripData` and NSE `EQUITY_L.csv` / `SME_EQUITY_L.csv`, refreshed daily. `updated` is only stamped when both downloads succeed, and failed downloads keep the cached mappings. NSE filings also teach symbol → ISIN (`learn_isin`).
-- **CSV columns**: timestamp, company, scrip (code or symbol), score, revenue/pat/ebitda for cq, pq and ly, eps_cq, eps_ly, exchange, filing_url (the result PDF's `attachment_url`), period_end, quarter (e.g. `Q2FY27`, or `UNKNOWN`), basis, unit.
+- **CSV columns**: timestamp, company, scrip (code or symbol), score, revenue/pat/ebitda for cq, pq and ly, eps_cq, eps_ly, exchange, filing_url (the result PDF's `attachment_url`), period_end, quarter (e.g. `Q2FY27`, or `UNKNOWN`), basis, unit, check, eps_pq. `eps_pq` (last quarter's EPS) was extracted all along but only saved since 2026-10-18; older rows have it blank and the dashboard shows "–" there.
   - `initialize_csv()` appends any `CSV_ADDED_COLUMNS` an older file lacks:
     - `exchange`: old rows marked BSE
     - `filing_url`: blank for rows scored before 2026-09-26

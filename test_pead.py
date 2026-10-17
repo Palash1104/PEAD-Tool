@@ -659,8 +659,8 @@ with mock.patch.object(pt.requests, "post", side_effect=pt.requests.ConnectionEr
 # ─────────────────────────────────────────────────────────────
 section("CSV")
 
-NEW_COLUMNS = ["exchange", "filing_url", "period_end", "quarter", "basis", "unit", "check"]
-check("CSV header ends with the added columns", pt.CSV_HEADER[-7:] == NEW_COLUMNS, pt.CSV_HEADER)
+NEW_COLUMNS = ["exchange", "filing_url", "period_end", "quarter", "basis", "unit", "check", "eps_pq"]
+check("CSV header ends with the added columns", pt.CSV_HEADER[-8:] == NEW_COLUMNS, pt.CSV_HEADER)
 
 d = fresh_state_dir()
 with open(pt.RESULTS_CSV, "w", newline="", encoding="utf-8") as fh:
@@ -670,11 +670,14 @@ with open(pt.RESULTS_CSV, "w", newline="", encoding="utf-8") as fh:
 pt.initialize_csv()
 pt.save_result_csv(nse_filing, 40.0, mk(period_end="2026-09-30", basis="consolidated", **GOOD), "Q2FY27")
 rows = list(csv.reader(open(pt.RESULTS_CSV, encoding="utf-8")))
-check("pre-NSE CSV gains all seven added columns",
-      rows[0][-7:] == NEW_COLUMNS and rows[1][-7:] == ["BSE", "", "", "", "", "", ""], rows[1])
-check("new row records exchange, filing link, period_end, quarter, basis, unit, blank check",
-      rows[2][-7:] == ["NSE", nse_filing["attachment_url"], "2026-09-30", "Q2FY27", "consolidated", "crores", ""]
+check("pre-NSE CSV gains all eight added columns",
+      rows[0][-8:] == NEW_COLUMNS and rows[1][-8:] == ["BSE", "", "", "", "", "", "", ""], rows[1])
+check("new row records exchange, filing link, period_end, quarter, basis, unit, blank check, last quarter's EPS",
+      rows[2][-8:] == ["NSE", nse_filing["attachment_url"], "2026-09-30", "Q2FY27", "consolidated", "crores", "", "2.0"]
       and len(rows[2]) == len(pt.CSV_HEADER), rows[2])
+saved = list(csv.DictReader(open(pt.RESULTS_CSV, encoding="utf-8")))[-1]
+check("all three EPS columns saved: this quarter, last quarter, a year ago",
+      (saved["eps_cq"], saved["eps_pq"], saved["eps_ly"]) == ("3.0", "2.0", "1.0"), saved)
 pt.initialize_csv()
 check("migration is idempotent", list(csv.reader(open(pt.RESULTS_CSV, encoding="utf-8")))[0] == pt.CSV_HEADER)
 
@@ -686,18 +689,29 @@ with open(pt.RESULTS_CSV, "w", newline="", encoding="utf-8") as fh:
                + ["NSE", "https://nsearchives.nseindia.com/corporate/x.pdf"])
 pt.initialize_csv()
 rows = list(csv.reader(open(pt.RESULTS_CSV, encoding="utf-8")))
-check("existing columns kept, only period_end/quarter/basis/unit/check added",
-      rows[0] == pt.CSV_HEADER and rows[1][-7:] == ["NSE", "https://nsearchives.nseindia.com/corporate/x.pdf", "", "", "", "", ""], rows)
+check("existing columns kept, only period_end/quarter/basis/unit/check/eps_pq added",
+      rows[0] == pt.CSV_HEADER and rows[1][-8:] == ["NSE", "https://nsearchives.nseindia.com/corporate/x.pdf", "", "", "", "", "", ""], rows)
 
 d = fresh_state_dir()
 with open(pt.RESULTS_CSV, "w", newline="", encoding="utf-8") as fh:
-    csv.writer(fh).writerow(pt.CSV_HEADER[:-1])            # the file as it was until 2026-10-07
+    csv.writer(fh).writerow(pt.CSV_HEADER[:-2])            # the file as it was until 2026-10-07
 pt.initialize_csv()
 flagged = mk(period_end="2026-09-30", **GOOD)
 flagged["check"] = "this quarter: x"
 pt.save_result_csv(nse_filing, 12.0, flagged, "Q2FY27")
 rows = list(csv.reader(open(pt.RESULTS_CSV, encoding="utf-8")))
-check("check column added and written", rows[0] == pt.CSV_HEADER and rows[1][-1] == "this quarter: x", rows)
+check("check column added and written", rows[0] == pt.CSV_HEADER and rows[1][-2] == "this quarter: x", rows)
+
+d = fresh_state_dir()
+with open(pt.RESULTS_CSV, "w", newline="", encoding="utf-8") as fh:
+    w = csv.writer(fh)
+    w.writerow(pt.CSV_HEADER[:-1])                         # the file as it was until 2026-10-18
+    w.writerow(["2026-10-17 22:49:00", "E2E Networks Limited", "E2E", "37.5"] + [""] * 11
+               + ["NSE", "https://nsearchives.nseindia.com/corporate/e.pdf", "2026-09-30", "Q2FY27", "consolidated", "crores", ""])
+pt.initialize_csv()
+rows = list(csv.reader(open(pt.RESULTS_CSV, encoding="utf-8")))
+check("eps_pq added to an existing file, blank for its old rows",
+      rows[0] == pt.CSV_HEADER and len(rows[1]) == len(pt.CSV_HEADER) and rows[1][-1] == "" and rows[1][-2] == "", rows)
 
 # ─────────────────────────────────────────────────────────────
 section("main loop")

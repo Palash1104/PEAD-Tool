@@ -411,6 +411,7 @@ CSV_HEADER = [
     "basis",        # consolidated / standalone
     "unit",         # the table's unit before conversion to crores
     "check",        # blank, or why the figures failed the sanity check (never alerted)
+    "eps_pq",       # previous quarter's EPS (the two EPS columns above predate it)
 ]
 
 # Columns added after the CSV existed, with the value older rows get
@@ -422,6 +423,7 @@ CSV_ADDED_COLUMNS = {
     "basis": "",
     "unit": "",
     "check": "",            # sanity check added 2026-10-07
+    "eps_pq": "",           # extracted all along, but only saved since 2026-10-18
 }
 
 def initialize_csv():
@@ -498,6 +500,7 @@ def save_result_csv(filing, score, fin, quarter):
                 fin.get("basis") or "",
                 fin.get("unit") or "",
                 fin.get("check") or "",
+                eps[1],
             ])
     except OSError as e:
         # e.g. CSV open in Excel — don't let logging block the alert

@@ -652,7 +652,7 @@ function normalise(raw, i) {
     revCq: num(g("revenue_cq")), revPq: num(g("revenue_pq")), revLy: num(g("revenue_ly")),
     patCq: num(g("pat_cq")), patPq: num(g("pat_pq")), patLy: num(g("pat_ly")),
     ebCq: num(g("ebitda_cq")), ebPq: num(g("ebitda_pq")), ebLy: num(g("ebitda_ly")),
-    epsCq: num(g("eps_cq")), epsLy: num(g("eps_ly")),
+    epsCq: num(g("eps_cq")), epsPq: num(g("eps_pq")), epsLy: num(g("eps_ly")),   // eps_pq saved since 18 Oct 2026
     filingUrl: safeFilingUrl(g("filing_url")),
     quarter: (g("quarter") || "").trim().toUpperCase(),
     periodEnd: (g("period_end") || "").trim(),
@@ -885,7 +885,7 @@ function renderDetail() {
     ["Revenue", r.revCq, r.revPq, r.revLy],
     ["EBITDA", r.ebCq, r.ebPq, r.ebLy],
     ["PAT", r.patCq, r.patPq, r.patLy],
-    ["EPS (₹)", r.epsCq, null, r.epsLy],
+    ["EPS (₹)", r.epsCq, r.epsPq, r.epsLy],
   ];
   $("d-fin").innerHTML = `<thead><tr><th>₹ Cr</th><th>This qtr</th><th>Last qtr</th><th>Year ago</th></tr></thead><tbody>` +
     rowsF.map(([n, a, b, c]) => `<tr><td>${n}</td><td>${fmtNum(a)}</td><td>${fmtNum(b)}</td><td>${fmtNum(c)}</td></tr>`).join("") + "</tbody>";
@@ -938,7 +938,7 @@ function quickView(r, animate) {
         ${marginRow("EBITDA margin", ebM)}
         ${amount("PAT", r.patCq, r.patPq, r.patLy)}
         ${marginRow("Net margin", netM)}
-        ${amount("EPS (₹)", r.epsCq, null, r.epsLy)}
+        ${amount("EPS (₹)", r.epsCq, r.epsPq, r.epsLy)}
       </tbody>
     </table>
   </div>`;
