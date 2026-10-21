@@ -120,6 +120,7 @@ Each poll, `main()` calls `run_cycle()` and then `wait_for_checks()` until the n
    - **Out of credits** (`CreditsExhausted`, not a `RetryFiling`): `_call_model` recognises an AICredits refusal for lack of credits (`is_credit_error`: HTTP 402, or 400/401/403/429 whose message mentions credits, balance, quota, billing…). The terminal says so once in red (and `ERROR` in the log). Filings that need the model are held in `pending` (`state.held`, a `WAIT` line in the log file only), without using a retry or being marked seen; while waiting nothing is downloaded or sent to the model, except one model call every `CREDITS_RECHECK_SEC` (300) to check. When a call succeeds the terminal says the credits are back (green) and the held filings are read on the next polls. The POLL line shows "N waiting for credits" (yellow).
    - **Same PDF, read once**: `obtain_financials` hashes each PDF (sha256). A byte-identical copy of one already handled this run (`_pdf_memory`, in memory, last `PDF_MEMORY_SIZE`) is skipped with "same PDF as the … filing (STATUS)". Remembered on success and on `SkipFiling`, not on `RetryFiling`.
    - `QuarterUnknown` is a `RetryFiling` that carries the extraction. Only when the last attempt also fails does `record_retry` score it and write **one** CSV row with quarter `UNKNOWN`, never alerted or added to processed. The line reads "… · gave up after 4 attempts · saved as quarter UNKNOWN (x/50, no alert)". A retry that recovers leaves only the real row. The filing is retried on later polls, up to `MAX_RETRIES` (3) extra attempts. The counts persist in `retry_counts.json`, so restarts don't reset them.
+   - **A failed PDF download waits** (since 2026-10-19; UltraTech's NSE PDF failed four times within 90 s): `record_retry` sets `state.retry_after[fid]` from `DOWNLOAD_RETRY_DELAYS_SEC` (60, 300, 900), and `poll_exchanges` leaves the filing out until then. The line reads "PDF download failed · retry 1/3 in 1 min" (then 5 and 15 min). Other failures still retry on the next poll. `retry_after` is in memory only; after a restart the filing is tried at once.
    - `SkipFiling` is raised when retrying can't help: "no results table found", an attachment that isn't a PDF, a MISS or a same-PDF copy. The filing is then logged, marked seen and never retried.
    - Success, a skip, or giving up calls `state.finish()`, which marks the filing seen and clears its retry count.
 
@@ -139,6 +140,12 @@ Each poll, `main()` calls `run_cycle()` and then `wait_for_checks()` until the n
   - Its type comes from `RESULT_HEADINGS` in its first 20 lines, and a table with an unrecognised title is "untitled".
   - The first page in `TABLE_PREFERENCE` order (consolidated, standalone, generic, untitled) is sent, together with the next page.
   - There is **no keyword fallback**. If no page is a results table, even after OCR, `find_result_pages` gives reason "no results table found" and `extract_financials` raises `SkipFiling`.
+- **Next-best table on an empty answer** (since 2026-10-21; Adani Green's BSE PDF: scanned pages 10–11 were taken for the consolidated table and came back empty, while the standalone table was on page 4):
+  - `extract_financials` loops over candidates. If the model answers with no current-quarter figure for any line item (`answered_without_figures`: e.g. all null, or JSON that isn't an object), it immediately tries the next-best table from `next_candidate`.
+  - Candidates come from `table_candidates()`: every page that is a results table, in `TABLE_PREFERENCE` order, then page order. A candidate whose first page was already sent (e.g. as a continuation page) is skipped.
+  - If no table is left, the unread pages (scans and near-empty pages not yet OCR'd, within the OCR limit) are OCR'd one at a time, most table-like first, until a new table and its next page are readable.
+  - At most `MAX_EXTRA_TABLE_TRIES` (2) extra calls, all in the same attempt, with no wait for a retry. A reply with some figures (even without revenue or PAT), a failed call or non-JSON never triggers it.
+  - `raw_out["tried"]` lists the spans sent ("10–11", "4–5"); a final MISS names them: "the model found no figures it could use (pages 10–11, 4–5 tried) · not retried". The switch is logged at DEBUG.
 - `EXTRACTION_PROMPT` has a **bank section** (since 2026-10-17; Axis, HDFC, IDBI and Central Bank of India had come back MISS because banks print no "Revenue from operations"): revenue = Interest earned, EBITDA = Operating profit before provisions and contingencies, finance cost = Interest expended, total expenses = total expenditure without provisions, and provisions go into `exceptional_items` as a negative number, so `numbers_problem` still adds up. Insurers' formats are not covered (still MISS).
 - `extract_from_text(text, model)` sends `EXTRACTION_PROMPT` plus the page text, with no truncation. The other call settings come from `model_call_params(model)`:
   - Claude 3.x / 4.x: `max_tokens=1500`, `temperature=0` (two reads of the same PDF differed on 9 Oct 2026).
@@ -252,7 +259,7 @@ Growth is `_pct(curr, prev) = (curr - prev) / abs(prev) * 100`. `band_score` awa
 
 ## Config (top of `pead_tool.py`)
 
-- `PEAD_THRESHOLD = 35`, `POLL_INTERVAL_SEC = 30`, `MAX_RETRIES = 3`, `BLOCKED_ALERT_SEC = 3600`
+- `PEAD_THRESHOLD = 35`, `POLL_INTERVAL_SEC = 30`, `MAX_RETRIES = 3`, `DOWNLOAD_RETRY_DELAYS_SEC = (60, 300, 900)`, `BLOCKED_ALERT_SEC = 3600`
 - `SCORE_FROM_QUARTER = "Q2FY27"`: earlier quarters, by the PDF's period_end, are ignored, and a result without a usable period_end is never scored. `test_pead.py` sets it to "Q1FY20" for its Q1FY27 fixtures, and the cutoff tests restore the real value.
 - `SMALL_BASE_PAT_CR = 1`, `SMALL_BASE_REV_CR = 10`
 - The Telegram emoji tiers are hardcoded separately in `send_telegram` (🚀 ≥40, ✅ ≥30).

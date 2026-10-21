@@ -73,6 +73,10 @@ if not all([
 PEAD_THRESHOLD     = 35
 POLL_INTERVAL_SEC  = 30
 MAX_RETRIES        = 3      # extra attempts per failed filing, one per poll
+# ...except a failed PDF download, retried after 1, 5 and 15 minutes: the file
+# may not be up yet or the server is struggling (19 Oct 2026: UltraTech's NSE
+# PDF failed four times within 90 seconds)
+DOWNLOAD_RETRY_DELAYS_SEC = (60, 300, 900)
 BLOCKED_ALERT_SEC  = 3600   # Telegram at most hourly about an exchange blocking us
 
 # Only results whose PDF says which quarter they are get scored. An earlier
@@ -1343,6 +1347,13 @@ RESULT_HEADINGS = [
 # Table pages whose title matched none of the above rank last, as "untitled"
 TABLE_PREFERENCE = ["consolidated", "standalone", "generic", "untitled"]
 
+# When the model answers with no figures at all, the page finder probably
+# picked the wrong table (Adani Green, 21 Oct 2026: two scanned pages taken for
+# the consolidated table came back empty; the standalone table was on page 4).
+# The next-best candidate tables are then tried at once, at most this many,
+# never resending a table already sent. Only then is it a MISS.
+MAX_EXTRA_TABLE_TRIES = 2
+
 def classify_result_page(text: str) -> str | None:
     lower = text.lower()
 
@@ -1362,6 +1373,12 @@ def classify_result_page(text: str) -> str | None:
 
 def with_next_page(idx: int, page_texts: list) -> list:
     return [i for i in (idx, idx + 1) if i < len(page_texts)]
+
+def table_candidates(page_texts: list) -> list:
+    """Every results-table page as (index, basis), best first: TABLE_PREFERENCE
+    order, then page order. find_table_pages sends the first one."""
+    found = [(i, basis) for i, text in enumerate(page_texts) if (basis := classify_result_page(text))]
+    return sorted(found, key=lambda c: (TABLE_PREFERENCE.index(c[1]), c[0]))
 
 def find_table_pages(page_texts: list) -> tuple:
     """Result table page plus its continuation, in TABLE_PREFERENCE order.
@@ -1519,6 +1536,7 @@ def _find_result_pages(pdf_bytes: bytes, ocr_page_limit: int, timings: dict) -> 
         "texts": page_texts,
         "ocr": ocred,
         "scans": scans,
+        "ocr_limit": ocr_page_limit,
     }
 
     if selected:
@@ -1529,6 +1547,78 @@ def _find_result_pages(pdf_bytes: bytes, ocr_page_limit: int, timings: dict) -> 
         )
 
     return found
+
+def page_span(pages: list) -> str:
+    """[9, 10] → "10–11" (1-based)."""
+    pages = sorted(pages)
+    return f"{pages[0] + 1}" if len(pages) == 1 else f"{pages[0] + 1}–{pages[-1] + 1}"
+
+def next_candidate(pdf_bytes: bytes, found: dict, sent: set, timings: dict | None = None) -> dict | None:
+    """The next-best results table whose first page hasn't been sent yet, as a
+    `found` dict for it, or None.
+
+    If every table already found was sent, the pages not read properly yet
+    (scans and near-empty pages that weren't OCR'd, within the OCR limit) are
+    OCR'd one at a time, most table-like first, until a new table and its
+    next page are readable.
+    """
+    texts = list(found["texts"])
+    ocred = set(found["ocr"])
+
+    def pick():
+        for idx, basis in table_candidates(texts):
+            if idx not in sent:
+                return {**found, "texts": texts, "ocr": set(ocred), "pages": with_next_page(idx, texts),
+                        "basis": basis, "reason": f"{basis} table"}
+        return None
+
+    following = pick()
+    if following:
+        return following
+
+    limit = found.get("ocr_limit", MAX_PDF_PAGES)
+    unread = [
+        i for i, t in enumerate(texts)
+        if i < limit and i not in ocred
+        and (i in found.get("scans", ()) or len(t.strip()) < LOW_TEXT_PAGE_CHARS)
+    ]
+    unread.sort(key=lambda i: -table_hints(texts[i]))     # stable: page order on ties
+    if unread:
+        log.debug(f"no other table found yet; OCR-ing unread pages {[i + 1 for i in unread]} until one turns up")
+
+    started = time.monotonic()
+    try:
+        while unread:
+            idx = unread.pop(0)
+            texts[idx] = ocr_page(pdf_bytes, idx + 1)
+            ocred.add(idx)
+            following = pick()
+            if following:
+                waiting = [i for i in following["pages"] if i in unread]
+                if not waiting:
+                    return following
+                unread = waiting + [i for i in unread if i not in waiting]     # its next page first
+    except Exception as e:
+        log.warning(f"OCR extraction failed: {e}", extra=QUIET)
+    finally:
+        if timings is not None:
+            timings["ocr"] = timings.get("ocr", 0) + time.monotonic() - started
+
+    return pick()
+
+def answered_without_figures(raw_out: dict) -> bool:
+    """The model answered, but with no current-quarter figure for any line item."""
+    if "data" not in raw_out:
+        return False
+    data = raw_out["data"]
+    if not isinstance(data, dict):
+        return True
+
+    def current(key):
+        values = data.get(key)
+        return _to_number(values[0]) if isinstance(values, list) and values else None
+
+    return all(current(key) is None for key in FIN_KEYS)
 
 def pages_as_text(found: dict) -> str:
     return "\n".join(
@@ -1926,6 +2016,11 @@ def extract_financials(pdf_bytes: bytes, model: str | None = None,
     whose headline names no results — OCR is capped at AMBIGUOUS_OCR_PAGES and
     the table check outcome is logged. Raises SkipFiling when the PDF has no
     results table (the model isn't called).
+
+    If the model answers with no figures at all, the next-best candidate
+    tables are tried straight away (up to MAX_EXTRA_TABLE_TRIES, never a table
+    already sent). raw_out["tried"] lists the page spans sent, e.g.
+    ["10–11", "4–5"]; raw_out["data"] is the last answer.
     """
     try:
         found = find_result_pages(
@@ -1944,6 +2039,36 @@ def extract_financials(pdf_bytes: bytes, model: str | None = None,
         raise SkipFiling(found["reason"], status="NONE")
 
     model = model or EXTRACTION_MODEL
+    raw_out = {} if raw_out is None else raw_out
+    sent, tried = set(), []
+
+    for extra in range(MAX_EXTRA_TABLE_TRIES + 1):
+        sent.update(found["pages"])
+        tried.append(page_span(found["pages"]))
+        attempt = {}
+        fin = _extract_from_found(pdf_bytes, found, model, timings, attempt)
+        raw_out.clear()
+        raw_out.update(attempt)
+        raw_out["tried"] = list(tried)
+
+        if not answered_without_figures(attempt) or extra == MAX_EXTRA_TABLE_TRIES:
+            return fin
+
+        following = next_candidate(pdf_bytes, found, sent, timings)
+        if not following:
+            return fin
+
+        log.debug(
+            f"no figures from pages {tried[-1]} ({found['reason']}); "
+            f"trying the {following['reason']} on pages {page_span(following['pages'])}"
+        )
+        found = following
+
+    return fin
+
+def _extract_from_found(pdf_bytes: bytes, found: dict, model: str,
+                        timings: dict | None, raw_out: dict) -> dict | None:
+    """One model call for the pages in found: scans as images, else text."""
     scanned = [i for i in found["pages"] if is_scan(found, i)]
 
     if scanned and SEND_SCANS_AS_IMAGES and not _images_rejected:
@@ -2592,6 +2717,11 @@ def obtain_financials(filing: dict, nse: NseClient, ambiguous: bool = False,
     remember_pdf(digest, filing, "read")
     return fin
 
+def tried_text(raw_out: dict) -> str:
+    """" (pages 10–11, 4–5 tried)" when more than one table was sent, else ""."""
+    tried = raw_out.get("tried") or []
+    return f" (pages {', '.join(tried)} tried)" if len(tried) > 1 else ""
+
 def _read_financials(pdf: bytes, filing: dict, ambiguous: bool, timings: dict) -> dict:
     """obtain_financials after the download: extract, then validate."""
     raw_out = {}
@@ -2620,7 +2750,8 @@ def _read_financials(pdf: bytes, filing: dict, ambiguous: bool, timings: dict) -
 
     if not fin:
         if answered:
-            raise SkipFiling("the model found no figures it could use · not retried", model_called=True, status="MISS")
+            raise SkipFiling(f"the model found no figures it could use{tried_text(raw_out)} · not retried",
+                             model_called=True, status="MISS")
         if raw_out.get("cut_off"):
             raise RetryFiling("the model ran out of tokens before answering")
         raise RetryFiling("could not extract financials")
@@ -2630,7 +2761,8 @@ def _read_financials(pdf: bytes, filing: dict, ambiguous: bool, timings: dict) -
             name for key, name in (("revenue_from_operations", "revenue from operations"), ("pat", "PAT"))
             if fin[key][0] is None
         )
-        raise SkipFiling(f"no current-quarter {missing} in the table · not retried", model_called=True, status="MISS")
+        raise SkipFiling(f"no current-quarter {missing} in the table{tried_text(raw_out)} · not retried",
+                         model_called=True, status="MISS")
 
     if not pdf_quarter(fin, filed_on):
         raise QuarterUnknown(quarter_unknown_reason(fin, filed_on), fin)
@@ -2793,6 +2925,7 @@ class ScannerState:
         self.scored_names = scored_names_from_csv()   # (company_key, quarter) already scored
         self.held = set()                      # filing ids waiting for model credits (in pending, no retry used)
         self.pending = {}                      # filing id → filing awaiting retry
+        self.retry_after = {}                  # filing id → time.monotonic() before which it isn't retried
         self.bse_known_ids = set()             # BSE NEWSIDs fetched on earlier polls
         self.nse_known_ids = set()             # NSE filing ids fetched on earlier polls
         self.checker = AmbiguousChecker()
@@ -2880,6 +3013,7 @@ class ScannerState:
         self.seen.add(fid)
         save_seen(self.seen)
         self.pending.pop(fid, None)
+        self.retry_after.pop(fid, None)
         self.held.discard(fid)
 
         if self.retries.pop(fid, None) is not None:
@@ -2995,6 +3129,13 @@ def record_retry(filing: dict, state: ScannerState, reason: str, timings: dict,
         state.retries[fid] = attempts
         save_retries(state.retries)
         state.pending[fid] = filing
+
+        if reason.startswith("PDF download failed"):
+            delay = DOWNLOAD_RETRY_DELAYS_SEC[min(attempts, len(DOWNLOAD_RETRY_DELAYS_SEC)) - 1]
+            state.retry_after[fid] = time.monotonic() + delay
+            outcome += f" in {delay // 60} min" if delay >= 60 else f" in {delay} s"
+        else:
+            state.retry_after.pop(fid, None)
 
     if error is None:
         report("RETRY", filing, with_timings(f"{reason} · {outcome}", timings))
@@ -3397,7 +3538,11 @@ def poll_exchanges(state: ScannerState) -> list:
     by_id = {f["id"]: f for f in state.pending.values()}
     by_id.update({f["id"]: f for f in fresh})
 
-    return sorted(by_id.values(), key=lambda f: f["exchange_dt"] or datetime.max)
+    # A failed download waits out its delay (DOWNLOAD_RETRY_DELAYS_SEC)
+    now = time.monotonic()
+    due = [f for f in by_id.values() if state.retry_after.get(f["id"], 0) <= now]
+
+    return sorted(due, key=lambda f: f["exchange_dt"] or datetime.max)
 
 def dump_samples():
     """Save one raw announcements response per exchange to verify field names."""

@@ -1767,6 +1767,7 @@ with mock.patch.object(pt.client.chat.completions, "create", fake_create):
     except pt.SkipFiling as e:
         check("no results table -> SkipFiling, model not called", str(e) == "no results table found" and not sent_requests, str(e))
 
+
     sent_requests.clear()
     with LogCapture() as logs:
         pt.extract_financials(text_pdf(PAGES), ambiguous=True)
@@ -2345,6 +2346,51 @@ check("while waiting for credits: no more model calls or downloads, no retry use
 check("every POLL line keeps counting the result waiting for credits",
       sum(l.startswith("POLL") and "waiting for credits" in l for l in term.lines()) == 2, term.lines())
 
+# A failed PDF download is retried after 1, 5 and 15 minutes, not every poll
+dl_f = pt.normalise_nse(nse_raw("dl1", "ULTRACEMCO", "INE481G01011", "19-Oct-2026 13:46:00"))
+dl_tries = {"n": 0}
+def failing_download(filing, client):
+    dl_tries["n"] += 1
+    return None
+extract, calls = counting_extract({dl_f["attachment_url"]: good_fin})
+fresh_state_dir(); reset_credits()
+with TerminalCapture() as term:
+    run_main(4, nse=lambda c: [dl_f], extract=extract, download=failing_download)
+check("a failed download waits a minute instead of retrying every poll",
+      dl_tries["n"] == 1 and pt.load_retries() == {"NSE:dl1": 1}, (dl_tries, pt.load_retries()))
+check("…and the line says when", any("PDF download failed · retry 1/3 in 1 min" in l for l in term.lines()), term.lines())
+
+def let_time_pass(state, poll):           # each poll: every waiting download is due again
+    for fid in state.retry_after:
+        state.retry_after[fid] = 0
+    state.checker.todo.join()
+    pt.drain_checks(state)
+fresh_state_dir(); reset_credits()
+dl_tries["n"] = 0
+with TerminalCapture() as term:
+    run_main(5, nse=lambda c: [dl_f], extract=extract, download=failing_download, on_wait=let_time_pass)
+lines = [l for l in term.lines() if "PDF download failed" in l]
+check("the waits grow: 1, 5, then 15 minutes, then it gives up",
+      dl_tries["n"] == 4 and any("retry 1/3 in 1 min" in l for l in lines) and any("retry 2/3 in 5 min" in l for l in lines)
+      and any("retry 3/3 in 15 min" in l for l in lines) and any("gave up after 4 attempts" in l for l in lines)
+      and "NSE:dl1" in pt.load_seen(), lines)
+
+fresh_state_dir(); reset_credits()
+dl_tries["n"] = 0
+def download_once_ok(filing, client):
+    dl_tries["n"] += 1
+    return None if dl_tries["n"] == 1 else b"%PDF-" + filing["attachment_url"].encode()
+extract, calls = counting_extract({dl_f["attachment_url"]: good_fin})
+run_main(3, nse=lambda c: [dl_f], extract=extract, download=download_once_ok, on_wait=let_time_pass)
+check("a download that works on the retry is scored",
+      dl_tries["n"] == 2 and calls == {dl_f["attachment_url"]: 1} and "NSE:dl1" in pt.load_seen(), (dl_tries, calls))
+
+retry_other = pt.normalise_bse(bse_raw("ro1", 600031, "Result", "2026-10-19T13:50:00"))
+extract, calls = counting_extract({retry_other["attachment_url"]: None})
+fresh_state_dir(); reset_credits()
+run_main(3, bse=lambda k: [retry_other], extract=extract)
+check("other failures still retry every poll", calls == {retry_other["attachment_url"]: 3}, calls)
+
 # A filing waiting in memory holds the saved checkpoint back to its day, so a restart
 # fetches it again (16 Oct 2026: results held for credits from 10-15 Oct were lost
 # when the next run started from 16 Oct)
@@ -2402,6 +2448,88 @@ with mock.patch.object(pt.client.chat.completions, "create", always_broke):
 check("a vague outcome checked in the background waits for credits too",
       model_calls["n"] == 1 and pt.load_retries() == {} and "BSE:cr2" not in pt.load_seen(), model_calls)
 reset_credits()
+
+# ── An empty answer: try the next-best table at once (Adani Green, 21 Oct 2026)
+EMPTY_JSON = ('{"basis":"consolidated","unit":null,"period_end":null,"prev_period_end":null,"ly_period_end":null,'
+              '"revenue_from_operations":[null,null,null],"pat":[null,null,null],"basic_eps":[null,null,null]}')
+
+check("page_span", pt.page_span([9, 10]) == "10–11" and pt.page_span([3]) == "4")
+cand_texts = ["\n".join(p) for p in PAGES]
+check("candidates ranked: consolidated first, then standalone",
+      pt.table_candidates(cand_texts) == [(3, "consolidated"), (1, "standalone")], pt.table_candidates(cand_texts))
+for raw, want in [({}, False), ({"data": json.loads(EMPTY_JSON)}, True), ({"data": [1, 2]}, True),
+                  ({"data": {"unit": None, "revenue_from_operations": [1, 2, 3]}}, False),
+                  ({"data": {"pat": ["12.5", None, None]}}, False), ({"data": {"pat": "n/a"}}, True)]:
+    check(f"answered_without_figures {raw}", pt.answered_without_figures(raw) == want)
+
+def replies(*answers):
+    """create() mock: the given answers in order (the last one repeats), recording what was sent."""
+    queue, seen = list(answers), []
+    def create(**kw):
+        seen.append(sent_page_labels(kw["messages"][0]["content"]))
+        return Resp(queue.pop(0) if len(queue) > 1 else queue[0])
+    return create, seen
+
+create, seen_pages = replies(EMPTY_JSON, MODEL_JSON)
+raw = {}
+with mock.patch.object(pt.client.chat.completions, "create", create), LogCapture() as logs:
+    fin = pt.extract_financials(text_pdf(PAGES), raw_out=raw)
+check("empty answer from the consolidated table → standalone table tried at once, and read",
+      seen_pages == [["--- PAGE 4 ---", "--- PAGE 5 ---"], ["--- PAGE 2 ---", "--- PAGE 3 ---"]]
+      and fin is not None and fin["revenue_from_operations"][0] == 662.58 and raw["tried"] == ["4–5", "2–3"], (seen_pages, raw))
+check("the switch is logged (DEBUG)",
+      logs.has_line("DEBUG", "no figures from pages 4–5 (consolidated table); trying the standalone table on pages 2–3"))
+
+filing_q = {"exchange_dt": datetime(2026, 7, 20, 10, 0), "exchange": "BSE", "company": "Co"}
+create, seen_pages = replies(EMPTY_JSON)
+with mock.patch.object(pt.client.chat.completions, "create", create):
+    try:
+        pt._read_financials(text_pdf(PAGES), filing_q, False, {})
+        check("every table empty → MISS naming the pages tried", False)
+    except pt.SkipFiling as e:
+        check("every table empty → MISS naming the pages tried",
+              e.status == "MISS" and str(e) == "the model found no figures it could use (pages 4–5, 2–3 tried) · not retried"
+              and len(seen_pages) == 2, (str(e), seen_pages))
+
+FOUR_TABLES = [table_lines("Consolidated"), NOTES, table_lines("Standalone"), NOTES,
+               table_lines(""), NOTES, ["XYZ LIMITED"] + table_lines("")[3:], NOTES]
+create, seen_pages = replies(EMPTY_JSON)
+raw = {}
+with mock.patch.object(pt.client.chat.completions, "create", create):
+    pt.extract_financials(text_pdf(FOUR_TABLES), raw_out=raw)
+check("at most 2 extra tables: 3 calls although 4 tables exist",
+      pt.MAX_EXTRA_TABLE_TRIES == 2 and len(seen_pages) == 3 and raw["tried"] == ["1–2", "3–4", "5–6"], (seen_pages, raw))
+
+for label, answer in [("figures but no revenue (insurer-like)", '{"unit":"crores","pat":[5,4,3]}'),
+                      ("reply isn't JSON (retried later instead)", "sorry, no idea")]:
+    create, seen_pages = replies(answer)
+    with mock.patch.object(pt.client.chat.completions, "create", create):
+        pt.extract_financials(text_pdf(PAGES))
+    check(f"no extra table when {label}", len(seen_pages) == 1, seen_pages)
+
+create, seen_pages = replies(EMPTY_JSON)
+with mock.patch.object(pt.client.chat.completions, "create", create):
+    pt.extract_financials(text_pdf([table_lines("Consolidated"), ["XYZ LIMITED"] + table_lines("")[3:]]))
+check("a table already sent as the continuation page isn't sent again", len(seen_pages) == 1, seen_pages)
+
+# No table left: unread scans are OCR'd (no early stop) and looked at once more
+found = {"pages": [0, 1], "basis": "consolidated", "reason": "consolidated table",
+         "texts": ["\n".join(table_lines("Consolidated")), "", "", "notes " * 60, ""],
+         "ocr": set(), "scans": {1, 2, 4}, "ocr_limit": 25}
+ocr_calls = []
+def fake_ocr(pdf_bytes, page_num, dpi=None):
+    ocr_calls.append(page_num)
+    return "\n".join(table_lines("Standalone")) if page_num == 3 else "scan noise"
+with mock.patch.object(pt, "ocr_page", fake_ocr):
+    nxt = pt.next_candidate(b"%PDF-x", found, {0, 1})
+check("no table left → unread scans OCR'd until one turns up: page 3's standalone table is next, page 5 never read",
+      nxt is not None and nxt["pages"] == [2, 3] and nxt["basis"] == "standalone" and nxt["ocr"] == {1, 2}
+      and ocr_calls == [2, 3] and found["ocr"] == set(), (nxt and nxt["pages"], nxt and nxt["ocr"], ocr_calls))
+with mock.patch.object(pt, "ocr_page", fake_ocr):
+    check("nothing unread and no table left → None",
+          pt.next_candidate(b"%PDF-x", {**found, "scans": set(), "texts": found["texts"][:1] + ["x" * 300] * 3}, {0, 1}) is None)
+check("OCR limit respected: an unread scan past it isn't read",
+      pt.next_candidate(b"%PDF-x", {**found, "ocr_limit": 1}, {0, 1}) is None)
 
 # ─────────────────────────────────────────────────────────────
 section("compare_models.py")
