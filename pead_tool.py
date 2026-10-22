@@ -197,8 +197,8 @@ DIM_STATUSES = {"SKIP", "OLD", "NONE"}         # handled, nothing to act on
 DELAY_IN_TIMINGS = re.compile(r"exchange→(alert|scored) ((?:\d+h )?(?:\d+m )?\d+s)( \(catch-up\))?")
 CONSOLE_REWRITES = [
     (re.compile(r"^(Q[1-4]FY\d{2}): old quarter per headline, ignored.*$"), r"\1 result, skipped by its title"),
-    (re.compile(r"^(Q[1-4]FY\d{2}): old quarter, ignored.*$"), r"\1 result, ignored"),
-    (re.compile(r"^\S+_Q[1-4]FY\d{2} already scored.*$"), "already scored this quarter"),
+    (re.compile(r"^((?:Q[1-4]|H[12])FY\d{2}): old quarter, ignored.*$"), r"\1 result, ignored"),
+    (re.compile(r"^\S+_(?:Q[1-4]|H[12])FY\d{2} already scored.*$"), "already scored this quarter"),
     (re.compile(r"numbers don't add up \(.*\) · no alert"), "numbers don't add up · not alerted"),
     (re.compile(r"^no results table found · headline: .*$"), "no results table in the PDF"),
     (re.compile(r"^attachment is not a PDF.*$"), "attachment isn't a PDF"),
@@ -947,6 +947,31 @@ def quarter_label(period_end: date) -> str:
         return f"Q{(m - 4) // 3 + 1}FY{(y + 1) % 100:02d}"
     return f"Q4FY{y % 100:02d}"
 
+# SME companies report every six months (Poojaa Precision, 22 Oct 2026: half
+# years to Sep 2026, Mar 2026 and Sep 2025, no quarter anywhere). Their
+# results are scored like a quarter's, with the previous half year in the
+# previous-quarter slot, under a half-year label: H1 = Apr–Sep, H2 = Oct–Mar.
+
+def half_label(period_end: date) -> str:
+    """Indian FY half year ending in this date's quarter: 30 Sep 2026 → H1FY27,
+    31 Mar 2027 → H2FY27."""
+    quarter = quarter_label(period_end)
+    return ("H1" if quarter[1] in "12" else "H2") + quarter[2:]
+
+def half_ending(quarter: str) -> str | None:
+    """The half year that ends with this quarter: Q2FY27 → H1FY27, Q4FY27 →
+    H2FY27; None for Q1 and Q3."""
+    half = {"Q2": "H1", "Q4": "H2"}.get(quarter[:2])
+    return half + quarter[2:] if half else None
+
+def half_yearly(fin: dict | None) -> bool:
+    """The model read half-year columns (an SME company's results)."""
+    return bool(fin) and fin.get("period_months") == 6
+
+def period_label(period_end: date, fin: dict | None) -> str:
+    """Q2FY27, or H1FY27 for half-yearly results."""
+    return half_label(period_end) if half_yearly(fin) else quarter_label(period_end)
+
 def reporting_quarter(filed_on: date) -> str:
     """Estimate from the filing date (results are filed within three months of
     quarter end, e.g. filed Sep 2026 → Q1FY27). Only the cheap dedup pre-check
@@ -957,15 +982,16 @@ def reporting_quarter(filed_on: date) -> str:
     return quarter_label(date(y, m, 1))
 
 def pdf_quarter(fin: dict, filed_on: date) -> str | None:
-    """Quarter from the PDF's period_end, or None if missing or implausible
-    (it must fall 0–400 days before the filing date)."""
+    """Quarter from the PDF's period_end (a half year such as H1FY27 for
+    half-yearly results), or None if missing or implausible (it must fall
+    0–400 days before the filing date)."""
     period_end = fin.get("period_end")
 
     if period_end:
         ended = date.fromisoformat(period_end)
 
         if timedelta(0) <= filed_on - ended <= timedelta(days=400):
-            return quarter_label(ended)
+            return period_label(ended, fin)
 
     return None
 
@@ -994,11 +1020,13 @@ def quarter_unknown_reason(fin: dict, filed_on: date) -> str:
 
 def column_dates_problem(fin: dict) -> str | None:
     """Why the three quarterly columns aren't current / 3 months earlier / 12
-    months earlier, or None if they line up. Compares year and month only, so
-    30 vs 31 of the month doesn't matter. period_end must already be set."""
+    months earlier (6 / 12 for half-yearly results), or None if they line up.
+    Compares year and month only, so 30 vs 31 of the month doesn't matter.
+    period_end must already be set."""
     current, prev, ly = fin.get("period_end"), fin.get("prev_period_end"), fin.get("ly_period_end")
+    step, previous = (6, "previous-half-year") if half_yearly(fin) else (3, "previous-quarter")
 
-    missing = [name for name, value in [("previous-quarter", prev), ("last-year", ly)] if not value]
+    missing = [name for name, value in [(previous, prev), ("last-year", ly)] if not value]
     if missing:
         return f"{' and '.join(missing)} column date missing"
 
@@ -1006,8 +1034,8 @@ def column_dates_problem(fin: dict) -> str | None:
         d = date.fromisoformat(iso)
         return d.year * 12 + d.month
 
-    if months(current) - months(prev) != 3:
-        return f"previous column {prev} isn't 3 months before {current}"
+    if months(current) - months(prev) != step:
+        return f"previous column {prev} isn't {step} months before {current}"
 
     if months(current) - months(ly) != 12:
         return f"last-year column {ly} isn't 12 months before {current}"
@@ -1015,10 +1043,13 @@ def column_dates_problem(fin: dict) -> str | None:
     return None
 
 def quarter_index(label: str) -> int:
-    """Sortable number for "Q2FY27"-style labels."""
-    m = re.fullmatch(r"Q([1-4])FY(\d{2})", label)
+    """Sortable number for "Q2FY27"-style labels. A half year counts as the
+    quarter it ends with: H1FY27 = Q2FY27, H2FY27 = Q4FY27."""
+    m = re.fullmatch(r"Q([1-4])FY(\d{2})|H([12])FY(\d{2})", label)
     if not m:
         raise ValueError(f"bad quarter label {label!r}")
+    if m.group(3):
+        return int(m.group(4)) * 4 + int(m.group(3)) * 2
     return int(m.group(2)) * 4 + int(m.group(1))
 
 def fetch_bse_master() -> dict:
@@ -1127,7 +1158,7 @@ def processed_key(filing: dict, isin: str | None, quarter: str) -> str:
 # were scored once from NSE and again from BSE), the name catches it: both
 # exchanges print the same name apart from Ltd/Limited, "The" and punctuation.
 _NAME_NOISE = re.compile(r"\b(?:limited|ltd|the)\b")
-QUARTER_RE = re.compile(r"Q[1-4]FY\d{2}")
+QUARTER_RE = re.compile(r"Q[1-4]FY\d{2}|H[12]FY\d{2}")     # a quarter, or an SME company's half year
 
 def company_key(name: str) -> str:
     """A company's name as both exchanges print it: "E2E Networks Ltd" and
@@ -1150,7 +1181,7 @@ def scored_names_from_csv() -> set:
         pass
     return names
 
-KEY_RE = re.compile(r"(?:(BSE|NSE)-)?(.+)_(Q[1-4]FY\d{2})")
+KEY_RE = re.compile(r"(?:(BSE|NSE)-)?(.+)_(Q[1-4]FY\d{2}|H[12]FY\d{2})")
 
 def migrate_processed_keys(processed: set, master: dict) -> set:
     """Upgrade pre-NSE "{scrip}_{q}" keys and "{EXCHANGE}-{code}_{q}" fallback
@@ -1175,11 +1206,17 @@ def migrate_processed_keys(processed: set, master: dict) -> set:
 EXTRACTION_PROMPT = """These pages come from a quarterly financial result PDF filed by an Indian listed company on BSE/NSE. Each page is given either as extracted text or, for scanned pages, as an image; read the figures from whichever form you get.
 
 Use the CONSOLIDATED results if the text contains a consolidated results table; otherwise use the STANDALONE results.
-Use only the individual quarter columns (NOT year-to-date, half-year, nine-month or full year columns).
+Use only the individual quarter columns (NOT year-to-date, half-year, nine-month or full year columns), except for a half-yearly table (see HALF-YEARLY RESULTS).
 The result table has 3 quarterly columns:
   Column 1: Current quarter (most recent)
   Column 2: Previous quarter (immediately preceding)
   Column 3: Same quarter last year (year-over-year)
+
+HALF-YEARLY RESULTS: companies on the SME platform report every six months, so their table has half-year columns and NO quarter columns at all. Only for such a table (never when the table has quarter columns), use the half-year columns instead:
+  Column 1: Current half year (the most recent six months)
+  Column 2: Previous half year (the six months immediately before it)
+  Column 3: Same half year last year
+and read every "quarter" below as "half year".
 
 Extract these values exactly as printed, in the table's own unit (do NOT convert units):
 - revenue_from_operations: Revenue from operations / Net Sales (NOT total income)
@@ -1202,6 +1239,7 @@ Also report:
 - prev_period_end: the "quarter ended" date of the previous quarter column (Column 2), as YYYY-MM-DD
 - ly_period_end: the "quarter ended" date of the same quarter last year column (Column 3), as YYYY-MM-DD
   (use null for any of these dates the table doesn't show)
+- period_months: 3 for quarter columns, 6 for half-year columns (HALF-YEARLY RESULTS)
 
 BANKS: a bank's results table has no "Revenue from operations"; it shows Interest earned, Interest expended, Operating profit before provisions and contingencies, and Provisions and contingencies. For a bank's table use:
 - revenue_from_operations: Interest earned (its total)
@@ -1224,6 +1262,7 @@ Return ONLY a JSON object, no explanation, no markdown:
 "period_end":"YYYY-MM-DD",
 "prev_period_end":"YYYY-MM-DD",
 "ly_period_end":"YYYY-MM-DD",
+"period_months":3,
 "revenue_from_operations":[cq,pq,ly],
 "total_income":[cq,pq,ly],
 "ebitda":[cq,pq,ly],
@@ -1514,8 +1553,16 @@ def _find_result_pages(pdf_bytes: bytes, ocr_page_limit: int, timings: dict) -> 
             if len(t.strip()) < LOW_TEXT_PAGE_CHARS and i < ocr_page_limit
         ]
 
-        if not selected and low_text:
-            log.debug("no result table in text layer, OCR-ing low-text pages")
+        # An untitled "table" in the text layer can be a press release's
+        # summary box while the real statement is a scan (Automobile Corp of
+        # Goa, 21 Oct 2026: page 10's highlights were sent, the scanned
+        # statement on page 6 never read). Read the unread pages first; a
+        # titled table found there ranks above the untitled one.
+        if (not selected or basis == "untitled") and low_text:
+            log.debug(
+                "no result table in text layer, OCR-ing low-text pages" if not selected
+                else "only an untitled table in the text layer, OCR-ing low-text pages first"
+            )
             page_texts = ocr_pages(pdf_bytes, page_texts, low_text, timings, ocred)
             selected, basis = find_table_pages(page_texts)
 
@@ -1523,7 +1570,7 @@ def _find_result_pages(pdf_bytes: bytes, ocr_page_limit: int, timings: dict) -> 
         # garbled to show the table (GM Breweries, 8 Oct 2026: row names but
         # no figures). OCR them ourselves, the most table-like first.
         rescan = [i for i in sorted(scans) if i < ocr_page_limit and i not in ocred]
-        if not selected and rescan:
+        if (not selected or basis == "untitled") and rescan:
             rescan.sort(key=lambda i: -table_hints(page_texts[i]))      # stable: page order on ties
             log.debug("no result table in the scans' own text layer, OCR-ing the scanned pages")
             page_texts = ocr_pages(pdf_bytes, page_texts, rescan, timings, ocred)
@@ -1703,6 +1750,7 @@ def normalise_financials(data) -> dict | None:
         "period_end": parse_period_end(data.get("period_end")),
         "prev_period_end": parse_period_end(data.get("prev_period_end")),
         "ly_period_end": parse_period_end(data.get("ly_period_end")),
+        "period_months": 6 if _to_number(data.get("period_months")) == 6 else 3,
     }
 
     for key in FIN_KEYS:
@@ -2102,7 +2150,7 @@ def _extract_from_found(pdf_bytes: bytes, found: dict, model: str,
 # from a scan. A failed check doesn't stop the row being saved, but it is
 # flagged and never alerted.
 
-CHECK_COLUMNS = [(0, "this quarter"), (2, "year-ago quarter")]
+CHECK_COLUMNS = [(0, "this {}"), (2, "year-ago {}")]
 
 def numbers_problem(fin: dict) -> str | None:
     """Why the extracted figures don't add up, or None if they do (or there
@@ -2112,7 +2160,9 @@ def numbers_problem(fin: dict) -> str | None:
         values = fin.get(key) or []
         return values[i] if i < len(values) else None
 
-    for i, label in CHECK_COLUMNS:
+    period = "half year" if half_yearly(fin) else "quarter"
+
+    for i, label in ((i, label.format(period)) for i, label in CHECK_COLUMNS):
         revenue, total_income = at("revenue_from_operations", i), at("total_income", i)
         total_expenses, pbt, pat = at("total_expenses", i), at("pbt", i), at("pat", i)
 
@@ -2379,7 +2429,7 @@ def compute_pead_score(fin: dict):
         )
 
     # ─────────────────────────────────────────
-    # 5. Revenue QoQ Momentum (5 pts)
+    # 5. Revenue QoQ Momentum (5 pts; half on half for half-yearly results)
     # ─────────────────────────────────────────
 
     s = 0.0 if rev_qoq_small else band_score(rev_qoq, [
@@ -2391,7 +2441,7 @@ def compute_pead_score(fin: dict):
 
     score += s
 
-    bd["Revenue QoQ"] = (
+    bd["Revenue HoH" if half_yearly(fin) else "Revenue QoQ"] = (
         growth_label(rev_qoq, rev_qoq_small),
         f"{s:.1f}/5"
     )
@@ -2470,6 +2520,10 @@ def send_telegram(filing,
         if filing["exchange_dt"] else "N/A"
     )
     period = f"{quarter} (to {fin['period_end']})" if fin.get("period_end") else quarter
+    half = half_yearly(fin)
+    company = filing["company"] + (f" {SME_TAG}" if half else "")
+    figures, change, this, last = (("HALF-YEARLY", "HoH%", "CH", "PH") if half else
+                                   ("QUARTERLY", "QoQ%", "CQ", "PQ"))
 
     emoji = (
         "🚀" if score >= 40 else
@@ -2487,7 +2541,7 @@ def send_telegram(filing,
         *(["🔄 <b>TURNAROUND</b> (loss → profit)"] if "Turnaround" in bd else []),
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
 
-        f"🏢 <b>{html.escape(filing['company'])}</b>",
+        f"🏢 <b>{html.escape(company)}</b>",
         f"📌 {filing['exchange']}: <code>{html.escape(filing['code'])}</code>",
 
         "",
@@ -2501,15 +2555,15 @@ def send_telegram(filing,
 
         "",
 
-        f"📊 <b>QUARTERLY FINANCIALS (₹ Cr, {html.escape(fin.get('basis', 'unknown'))})</b>",
+        f"📊 <b>{figures} FINANCIALS (₹ Cr, {html.escape(fin.get('basis', 'unknown'))})</b>",
 
         "<pre>"
 
         f"{'Metric':<12}"
-        f"{'QoQ%':>10}"
+        f"{change:>10}"
         f"{'YoY%':>10}"
-        f"{'CQ':>12}"
-        f"{'PQ':>12}"
+        f"{this:>12}"
+        f"{last:>12}"
         f"{'LY':>12}\n"
 
         f"{'-'*68}\n"
@@ -2605,20 +2659,33 @@ def format_delay(since: datetime) -> str:
     text = f"{hours}h {mins}m {secs}s" if hours else f"{mins}m {secs}s"
     return text + (" (catch-up)" if is_catch_up(since) else "")
 
+SME_TAG = "[SME]"     # after the company name when its results are half-yearly
+
+def company_label(filing: dict) -> str:
+    """The company's name, tagged [SME] once its results read as half-yearly
+    (score_filing sets filing["sme"])."""
+    return f"{filing['company']} {SME_TAG}" if filing.get("sme") else filing["company"]
+
 def short_company(name: str, width: int = COMPANY_WIDTH) -> str:
-    """Company name without Ltd/Limited/-$, cut or padded to a fixed width."""
-    name = re.sub(r"\s*-\s*\$$", "", (name or "Unknown").strip())
+    """Company name without Ltd/Limited/-$, cut or padded to a fixed width.
+    A trailing [SME] tag survives the cut."""
+    name, tag = (name or "Unknown").strip(), ""
+    if name.endswith(SME_TAG):
+        name, tag = name[:-len(SME_TAG)].strip(), " " + SME_TAG
+    name = re.sub(r"\s*-\s*\$$", "", name)
     name = re.sub(r"[\s,]*\b(?:Ltd|Limited)\.?$", "", name, flags=re.I).strip() or "Unknown"
-    return name[:width - 1] + "…" if len(name) > width else name.ljust(width)
+    room = width - len(tag)
+    return ((name[:room - 1] + "…" if len(name) > room else name) + tag).ljust(width)
 
 def report(status: str, filing: dict, text: str, level: int = logging.INFO, console: bool = True):
     """The one line for a filing: status, exchange, company, text. The log
     file gets it whole; the terminal a shorter version (console_text), or
     nothing when console=False."""
+    company = company_label(filing)
     log.log(
         level,
-        f"{filing['exchange']:<3}  {short_company(filing['company'])}  {text}",
-        extra={"status": status, "exchange": filing["exchange"], "company": filing["company"],
+        f"{filing['exchange']:<3}  {short_company(company)}  {text}",
+        extra={"status": status, "exchange": filing["exchange"], "company": company,
                "text": text, "console": console},
     )
 
@@ -2789,6 +2856,7 @@ def score_filing(filing: dict, isin, fin: dict, processed: set, timings: dict,
     exchange_dt = filing["exchange_dt"]
     filed_on = (exchange_dt or datetime.now()).date()
     quarter = pdf_quarter(fin, filed_on)
+    filing["sme"] = half_yearly(fin)    # its line and alert carry [SME]
 
     if not quarter:      # obtain_financials already checks; never fall back to the filing date
         raise QuarterUnknown(quarter_unknown_reason(fin, filed_on), fin)
@@ -3072,20 +3140,24 @@ def triage(filing: dict, state: ScannerState) -> str:
     state.learn_isin(filing)
     isin = lookup_isin(filing, state.master)
 
-    # Cheap pre-check with the filing-date quarter; score_filing re-checks
-    # with the quarter printed in the PDF
+    # Cheap pre-check with the filing-date quarter, and the half year ending
+    # with it (an SME company's key); score_filing re-checks with the period
+    # printed in the PDF
     filed_on = (filing["exchange_dt"] or datetime.now()).date()
-    estimated_key = processed_key(filing, isin, reporting_quarter(filed_on))
+    estimated = reporting_quarter(filed_on)
 
-    if estimated_key in state.processed:
-        report("SKIP", filing, f"{estimated_key} already scored")
-        state.finish(fid)
-        return "duplicate"
+    for period in filter(None, [estimated, half_ending(estimated)]):
+        estimated_key = processed_key(filing, isin, period)
 
-    if (company_key(filing["company"]), reporting_quarter(filed_on)) in state.scored_names:
-        report("SKIP", filing, f"{reporting_quarter(filed_on)} already scored from the other exchange (same company name)")
-        state.finish(fid)
-        return "duplicate"
+        if estimated_key in state.processed:
+            report("SKIP", filing, f"{estimated_key} already scored")
+            state.finish(fid)
+            return "duplicate"
+
+        if (company_key(filing["company"]), period) in state.scored_names:
+            report("SKIP", filing, f"{period} already scored from the other exchange (same company name)")
+            state.finish(fid)
+            return "duplicate"
 
     return kind
 

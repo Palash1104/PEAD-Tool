@@ -53,7 +53,7 @@ Each poll, `main()` calls `run_cycle()` and then `wait_for_checks()` until the n
   - `MISS`: the model answered but without current-quarter revenue or PAT (insurers, banks, shell companies, wrong pages); never retried
   - `CHECK`: ambiguous outcome queued
   - `NONE`: no results table; for a "Result" filing the line includes its headline (160 chars)
-  - `SCORE` / `ALERT`: `score/50  quarter  basis`, plus "Telegram sent/FAILED" on alerts
+  - `SCORE` / `ALERT`: `score/50  quarter  basis`, plus "Telegram sent/FAILED" on alerts. For half-yearly (SME) results the company reads "Name [SME]" and the quarter `H1FY27`.
   - `OLD`: before `SCORE_FROM_QUARTER`
   - `RETRY`: reason · "retry n/3" or "gave up after n attempts"
   - `ERROR`: unexpected exception, logged at ERROR level; the traceback goes to DEBUG
@@ -103,14 +103,14 @@ Each poll, `main()` calls `run_cycle()` and then `wait_for_checks()` until the n
    - NSE `attchmntFile` is `-` when there is no attachment (treated as none). Some attachments are `.zip`.
 4. **Dedup**
    - The ISIN comes from the NSE filing itself, or from the scrip master for BSE (`lookup_isin`).
-   - The pre-check key is `{ISIN}_{quarter}`, with the quarter estimated from the filing date (`reporting_quarter`). This cheap dedup skip is the only use of the filing-date estimate; it never decides a score. While the ISIN is unknown the key is `{EXCHANGE}-{code}_{quarter}`.
+   - The pre-check key is `{ISIN}_{quarter}`, with the quarter estimated from the filing date (`reporting_quarter`). This cheap dedup skip is the only use of the filing-date estimate; it never decides a score. While the ISIN is unknown the key is `{EXCHANGE}-{code}_{quarter}`. The pre-check also tries the half year that ends with that quarter (`half_ending`: Q2 → H1, Q4 → H2), so a second copy of an SME company's half-yearly result is skipped before download.
    - If the key is already in `processed_scrips`, the filing is marked seen and skipped.
    - **Second check, by company name** (since 2026-10-17: E2E Networks and Shoppers Stop were scored once from NSE and again from BSE because the two ISIN keys differed). `company_key()` lowercases the name and drops Ltd/Limited, "The" and punctuation ("&" becomes "and"), so "E2E Networks Ltd" and "E2E Networks Limited" match. `state.scored_names` holds `(company_key, quarter)` for every scored company-quarter: seeded at startup from `pead_results.csv` by `scored_names_from_csv()` (FLAG rows and UNKNOWN quarters left out, so they stay open as with the ISIN key) and added to by `record_success` on SCORE/ALERT. Checked in `triage` (filing-date quarter, before downloading) and in `score_filing` (PDF quarter); the SKIP line reads "<quarter> already scored from the other exchange (same company name)". Not stored in `processed_scrips.json`, so the dashboard's count is unchanged.
 5. **`process_filing()`** = `obtain_financials()` + `score_filing()`. The first downloads (NSE via the session), extracts and validates; it touches no state, so the checker thread shares it. The second computes the real key, scores, writes the CSV and alerts, on the main thread only.
    - `obtain_financials` validates in this order:
      1. `has_core_values` (current revenue **and** PAT).
      2. The quarter: `pdf_quarter` takes it from the PDF's `period_end`, trusted only if it falls 0–400 days before the filing date. There is **no filing-date fallback**: without a usable `period_end` it raises `QuarterUnknown` ("quarter unknown (no period_end)" / "(period_end … implausible …)").
-     3. The column dates: `column_dates_problem` checks that `prev_period_end` is 3 months and `ly_period_end` 12 months before `period_end`, by year and month. A mismatch or missing date raises `RetryFiling("column dates don't line up (…)")`. This catches half-year, nine-month or swapped columns.
+     3. The column dates: `column_dates_problem` checks that `prev_period_end` is 3 months (6 for half-yearly results) and `ly_period_end` 12 months before `period_end`, by year and month. A mismatch or missing date raises `RetryFiling("column dates don't line up (…)")`. This catches half-year, nine-month or swapped columns.
    - If the PDF's quarter is before `SCORE_FROM_QUARTER` ("Q2FY27"), `score_filing` logs "<quarter>: old quarter, ignored" and raises `SkipFiling(model_called=True)`. The filing is marked seen, and it isn't scored, alerted, added to processed or retried.
    - If that key is already processed, the filing is a duplicate: no score and no alert.
    - Otherwise it scores, writes the CSV and alerts, and returns the key. It returns None on failure.
@@ -129,6 +129,9 @@ Each poll, `main()` calls `run_cycle()` and then `wait_for_checks()` until the n
 - pdfplumber reads pages 1–`MAX_PDF_PAGES` (25).
 - If the whole PDF has under `MIN_TEXT_CHARS` (500) of text, it is OCR'd.
 - Otherwise, if no result table is found in the text layer, the pages under `LOW_TEXT_PAGE_CHARS` (200) are OCR'd. That handles a text cover letter with scanned result pages.
+- **The same happens when the text layer's only table is "untitled"** (since 2026-10-21). That can be a press release's summary box (Total income / PBT / EPS) while the real statement is a scan. On Automobile Corporation of Goa's PDF, page 10's highlights were sent and the scanned statement on page 6 was never read, which became a MISS for no revenue or PAT.
+  - The low-text pages and unread scans are OCR'd first, and a titled table found there ranks above the untitled one.
+  - If nothing better turns up, the untitled table is still used.
 - **Scans with the scanner's own text layer**: `is_scanned_page()` — one image covering ≥ `SCAN_IMAGE_COVER` (85%) of the page. That layer can be too garbled to show the table (GM Breweries, 8 Oct 2026: row names, no figures, "lncome"). If still no table, those pages are OCR'd too, most table-like first (`table_hints`: line-item kinds, +3 for a consolidated title, +2 for another results title), within the same OCR page limit. `find_result_pages` returns them as `found["scans"]`.
 - `TABLE_MARKERS` income also accepts the OCR misreads "lncome" / "1ncome".
 - `ocr_pages()` works one page at a time in the order given (Poppler at `LOCATE_OCR_DPI` = 150, then Tesseract); once a consolidated table is found its next page is OCR'd next, and it stops when both are readable. This OCR only *locates* the table (keywords), so low resolution is fine; it records which pages were OCR'd.
@@ -168,6 +171,15 @@ Each poll, `main()` calls `run_cycle()` and then `wait_for_checks()` until the n
 2. Model call failed / reply not JSON → retry; model answered without usable figures, revenue or PAT → `MISS`, no retry. 3. Quarter unknown → retry. 4. Column dates don't line up → retry.
 5. **Sanity check** `numbers_problem()` on the current and year-ago columns: total income must not be below revenue, no expense line above total expenses, and income − total expenses (± `exceptional_items`, either sign, since tables print it both ways) must be near PBT (within max(10% of income, 25% of PBT)) or PAT (within max(10% of income, 50% of PAT)). `exceptional_items` is whatever the table prints between total expenses and PBT (exceptional items, share of associates/JVs); Bridge Securities (9 Oct 2026) was a false FLAG from a year-ago gain before it was extracted. A failure sets `fin["check"]`: the row is saved with that reason in the `check` CSV column, logged as a `FLAG` warning, **never alerted**, and the company-quarter is **not** marked processed, so a different copy (e.g. the other exchange's) can still score. It goes into `flagged_scrips.json` instead, and another copy that also fails saves no second row (`SKIP … already flagged`). The dashboard treats flagged rows as not alerted.
 
+### Half-yearly (SME) results
+Since 2026-10-22. Companies on the SME platform report every six months, so their tables have no quarter columns. Poojaa Precision's statement (half years to Sep 2026, Mar 2026 and Sep 2025) came back all null and was a MISS. Sungold Media's half-year columns failed the column check.
+- `EXTRACTION_PROMPT` has a HALF-YEARLY RESULTS section. Only when a table has no quarter columns, the model reads the current half year, the previous half year and the same half year last year into the usual three slots, and sets `period_months` to 6. `normalise_financials` keeps 6; anything else becomes 3. `half_yearly(fin)` tests it.
+- The label is `H1FY27` (Apr–Sep) or `H2FY27` (Oct–Mar), from `half_label`. `pdf_quarter` returns it, so the processed key is `{ISIN}_H1FY27` and `scored_names` holds `(company, "H1FY27")`. `quarter_index` ranks a half year with the quarter it ends with (H1FY27 = Q2FY27), so the `SCORE_FROM_QUARTER` cutoff works unchanged. `QUARTER_RE` and `KEY_RE` accept both.
+- `column_dates_problem` wants the previous column 6 months back; `numbers_problem` names "this half year".
+- Scoring is unchanged (same factors, bands and small-base thresholds). The momentum factor is "Revenue HoH": the current against the previous half year.
+- `score_filing` sets `filing["sme"]`. `report()` then shows "Name [SME]" (`company_label`; `short_company` keeps the tag when it cuts a long name). The Telegram alert has "[SME]" after the name and a "HALF-YEARLY FINANCIALS" table (HoH%, CH, PH, LY). The CSV's company stays plain; its quarter column says `H1FY27`.
+- Half-yearly is taken to mean SME, because mainboard companies must report quarterly. No debt-segment BSE codes were seen among the announcements.
+
 ### Before download
 - `triage()` reads quarter-end dates written in the headline (`headline_period_ends`: 31.03.2025, 30th June 2026, September 30th, 2026, 30-Jun-2026, …). If the latest one is before `SCORE_FROM_QUARTER`, the filing is logged `OLD … per headline · not downloaded` and marked seen; counted as "N old quarter by headline" in the POLL summary. Using the latest date means a headline that also names a 30 Sep meeting is never skipped.
 
@@ -204,7 +216,7 @@ Growth is `_pct(curr, prev) = (curr - prev) / abs(prev) * 100`. `band_score` awa
 | PAT growth | 10 | PAT YoY % | \|last-year PAT\| < ₹1 Cr |
 | Revenue growth | 10 | revenue YoY % | last-year revenue < ₹10 Cr |
 | EBITDA margin expansion | 5 | margin delta (pp) vs same quarter last year | — |
-| Revenue momentum | 5 | revenue QoQ % | last-quarter revenue < ₹10 Cr |
+| Revenue momentum | 5 | revenue QoQ % (half on half for SME results) | last-quarter revenue < ₹10 Cr |
 | Net margin quality | 5 | PAT / revenue % | — |
 
 - **Hard reject**: the score is 0 if current PAT, EBITDA or EPS is negative.
@@ -226,7 +238,7 @@ Growth is `_pct(curr, prev) = (curr - prev) / abs(prev) * 100`. `band_score` awa
 | `pead_terminal.log` (+ `.1`–`.2`) | Copy of the clean terminal, UTF-8, rotating at 1 MB with 2 backups. Read by the dashboard's Scanner log panel. | ignored |
 
 - **Scrip master**: built from BSE `ListofScripData` and NSE `EQUITY_L.csv` / `SME_EQUITY_L.csv`, refreshed daily. `updated` is only stamped when both downloads succeed, and failed downloads keep the cached mappings. NSE filings also teach symbol → ISIN (`learn_isin`).
-- **CSV columns**: timestamp, company, scrip (code or symbol), score, revenue/pat/ebitda for cq, pq and ly, eps_cq, eps_ly, exchange, filing_url (the result PDF's `attachment_url`), period_end, quarter (e.g. `Q2FY27`, or `UNKNOWN`), basis, unit, check, eps_pq. `eps_pq` (last quarter's EPS) was extracted all along but only saved since 2026-10-18; older rows have it blank and the dashboard shows "–" there.
+- **CSV columns**: timestamp, company, scrip (code or symbol), score, revenue/pat/ebitda for cq, pq and ly, eps_cq, eps_ly, exchange, filing_url (the result PDF's `attachment_url`), period_end, quarter (e.g. `Q2FY27`, `H1FY27` for an SME company's half year, or `UNKNOWN`), basis, unit, check, eps_pq. `eps_pq` (last quarter's EPS) was extracted all along but only saved since 2026-10-18; older rows have it blank and the dashboard shows "–" there.
   - `initialize_csv()` appends any `CSV_ADDED_COLUMNS` an older file lacks:
     - `exchange`: old rows marked BSE
     - `filing_url`: blank for rows scored before 2026-09-26
@@ -235,6 +247,7 @@ Growth is `_pct(curr, prev) = (curr - prev) / abs(prev) * 100`. `band_score` awa
 - **Dashboard quarter selector** (the grouping lives in `dashboard.py`, where `test_pead.py` covers it):
   - `read_all_results()` merges `archive/*/pead_results.csv` and `pead_results.csv` (archives first). Each row is tagged with `_quarter`, `_quarter_from` and `_source`.
   - `row_quarter()` takes the quarter column (incl. `UNKNOWN`), else `period_end`, else the timestamp via the filing-date mapping. `quarter_label` / `reporting_quarter` mirror `pead_tool.py`, and a test checks they match.
+  - Half-yearly (SME) rows: `row_quarter()` files `H1FY27` with Q2FY27 and `H2` with Q4, so they appear in the current-quarter view. `dashboard.html` (`r.half`) shows an SME badge after the company name, "This half / Last half / HoH" in the quick view and detail panel, the half year in the detail's quarter line, and "Revenue HoH" in the scorecard. Searching "sme" lists them.
   - `archive/pre-q2fy27` (renamed from `archive/q1fy27` on 2026-10-05; any folder name works) is mostly March-quarter results reported Apr–Jun: Q4FY26 has 165 scored results. Only a few rows are Q1FY27.
   - Rows scoring above 50 come from the old 100-point scale. They are dropped and counted per quarter (`hidden_old_scale`); the count line says "N rows from the old scoring scale hidden".
   - `group_quarters()` builds the dropdown options: newest first, "Quarter unknown" last, and the current quarter (`SCORE_FROM_QUARTER`, sent as `current_quarter`) always present. Labels give the period covered and when it was reported (`reported_window`, the three months after quarter end), e.g. "Q4 FY26 · Jan–Mar 2026 quarter · reported Apr–Jun 2026 (165)". The count is non-empty scored rows.

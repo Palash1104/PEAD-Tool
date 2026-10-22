@@ -126,12 +126,15 @@ def read_results(name: str = RESULTS_CSV):
 #   3. else its timestamp, mapped like pead_tool.reporting_quarter: results
 #      are filed in the three months after quarter end (filed Sep → Q1)
 # Indian FY quarters, as in pead_tool.py: Q1 = Apr–Jun, FY27 = Apr 2026 – Mar 2027.
+# An SME company's half-yearly row (quarter column H1FY27 / H2FY27) goes with
+# the quarter its half year ends with: H1 (Apr–Sep) with Q2, H2 with Q4.
 # Rows scoring above 50 come from the old 100-point scoring and are dropped,
 # counted per quarter so the page can say how many were hidden.
 
 ARCHIVE_DIR   = "archive"
 OLD_SCALE_MAX = 50
 QUARTER_RE    = re.compile(r"^Q([1-4])FY(\d{2})$")
+HALF_RE       = re.compile(r"^H([12])FY(\d{2})$")
 QUARTER_MONTHS = ["Apr–Jun", "Jul–Sep", "Oct–Dec", "Jan–Mar"]
 
 
@@ -203,6 +206,10 @@ def row_quarter(row: dict) -> tuple:
     q = (row.get("quarter") or "").strip().upper()
     if q == "UNKNOWN" or QUARTER_RE.match(q):
         return q, "csv"
+
+    half = HALF_RE.match(q)
+    if half:
+        return f"Q{int(half.group(1)) * 2}FY{half.group(2)}", "csv"
 
     period_end = _date(row.get("period_end"))
     if period_end:

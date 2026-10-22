@@ -2531,6 +2531,36 @@ with mock.patch.object(pt, "ocr_page", fake_ocr):
 check("OCR limit respected: an unread scan past it isn't read",
       pt.next_candidate(b"%PDF-x", {**found, "ocr_limit": 1}, {0, 1}) is None)
 
+# ── An untitled text "table" doesn't stop the scans being read (Automobile Corp of Goa, 21 Oct 2026):
+#    text cover letter, scanned statement, then a text press release with Total income / PBT / EPS
+PRESS_RELEASE = ["21 October 2026", "Automobile Corporation of Goa Limited (ACGL)",
+                 "announced its financial results for Q2 FY27 on 21st October 2026",
+                 "Key Financial for Q2 FY27 Highlights:", "Total income : Rs. 270.94 crore, up by 28.76% QoQ",
+                 "Profit Before Tax : Rs. 17.74 crore down by 9.80% QoQ", "Earnings Per Share (EPS)* : Rs 21.68",
+                 "In Rs. Crores Q2-FY27 Q1-FY27 Q2-FY26", "Total income 270.94 252.71 210.43", "EPS 21.68 18.42 24.03"] * 2
+SCANNED_STATEMENT = ["ACGL", "STATEMENT OF AUDITED RESULTS FOR THE QUARTER AND SIX MONTHS ENDED 30 SEPTEMBER 2026",
+                     "Rs. In Lakhs", "Particulars  30.09.2026  30.06.2026  30.09.2025",
+                     "Revenue from operations  26559.38  24894.40  20638.15", "Total income  27093.82  25271.20  21042.62",
+                     "Total expenses  25320.15  23752.26  19076.19", "Profit from ordinary activities before tax  1773.67  1518.94  1966.43",
+                     "Profit for the period  1319.89  1121.63  1463.61", "Basic Earnings per share  21.68  18.42  24.03"]
+doc = pdfium.PdfDocument.new()
+doc.import_pages(pdfium.PdfDocument(text_pdf([COVER])))
+doc.import_pages(pdfium.PdfDocument(scanned_pdf([SCANNED_STATEMENT])))
+doc.import_pages(pdfium.PdfDocument(text_pdf([PRESS_RELEASE])))
+buf = io.BytesIO()
+doc.save(buf)
+acgl_like = buf.getvalue()
+check("press release alone counts as an untitled table", pt.classify_result_page("\n".join(PRESS_RELEASE)) == "untitled")
+with LogCapture() as logs:
+    found = pt.find_result_pages(acgl_like, pt.AMBIGUOUS_OCR_PAGES)
+check("untitled text table → scans OCR'd first, the scanned statement is chosen",
+      found["pages"][:1] == [1] and found["basis"] == "generic" and 1 in found["ocr"]
+      and logs.has_line("DEBUG", "only an untitled table in the text layer, OCR-ing low-text pages first"),
+      (found["pages"], found["basis"], sorted(found["ocr"])))
+found = pt.find_result_pages(text_pdf([COVER, PRESS_RELEASE]))
+check("untitled table with nothing unread is still used, no OCR", found["pages"] == [1] and found["basis"] == "untitled"
+      and not found["ocr"], (found["pages"], found["basis"]))
+
 # ─────────────────────────────────────────────────────────────
 section("compare_models.py")
 
@@ -2847,6 +2877,114 @@ check("compare_models without a price shows tokens only",
 pt.usage_totals.clear()
 pt.answered_by.clear()
 pt.EXTRACTION_EFFORT = saved_effort
+
+# ─────────────────────────────────────────────────────────────
+section("half-yearly (SME) results (Poojaa Precision, 22 Oct 2026)")
+
+saved_cutoff = pt.SCORE_FROM_QUARTER
+pt.SCORE_FROM_QUARTER = CONFIGURED_SCORE_FROM_QUARTER      # Q2FY27, the real cutoff
+
+for d, h in [(date(2026, 9, 30), "H1FY27"), (date(2027, 3, 31), "H2FY27"), (date(2026, 3, 31), "H2FY26"),
+             (date(2026, 6, 30), "H1FY27"), (date(2026, 12, 31), "H2FY27")]:
+    check(f"half_label {d}", pt.half_label(d) == h, pt.half_label(d))
+for q, h in [("Q2FY27", "H1FY27"), ("Q4FY26", "H2FY26"), ("Q1FY27", None), ("Q3FY27", None)]:
+    check(f"half_ending {q}", pt.half_ending(q) == h, pt.half_ending(q))
+check("a half year sorts with the quarter it ends with",
+      pt.quarter_index("H1FY27") == pt.quarter_index("Q2FY27") and pt.quarter_index("H2FY26") == pt.quarter_index("Q4FY26")
+      and pt.quarter_index("H2FY26") < pt.quarter_index("Q1FY27") < pt.quarter_index("H1FY27") < pt.quarter_index("H2FY27"))
+try:
+    pt.quarter_index("H3FY27")
+    check("H3 is not a half year", False)
+except ValueError:
+    check("H3 is not a half year", True)
+
+check("prompt explains half-yearly tables and asks for period_months",
+      "HALF-YEARLY RESULTS" in pt.EXTRACTION_PROMPT and '"period_months":3' in pt.EXTRACTION_PROMPT)
+for value, want in [(6, 6), ("6", 6), (6.0, 6), (3, 3), (None, 3), ("half", 3), (12, 3)]:
+    got = pt.normalise_financials({"unit": "lakhs", "period_months": value})["period_months"]
+    check(f"period_months {value!r} → {want}", got == want, got)
+
+# Poojaa's table: half years to Sep 2026, Mar 2026 and Sep 2025, in lakhs
+HALF = dict(unit="lakhs", basis="standalone", period_months=6,
+            period_end="30.09.2026", prev_period_end="31.03.2026", ly_period_end="30.09.2025",
+            revenue_from_operations=[1500, 1200, 1000], total_income=[1510, 1210, 1005],
+            total_expenses=[1100, 950, 860], pbt=[410, 260, 145], pat=[300, 190, 100],
+            finance_cost=[20, 20, 20], depreciation=[50, 50, 50], basic_eps=[3, 1.9, 1])
+half_fin = pt.normalise_financials(HALF)
+check("half year: columns 6 and 12 months apart line up", pt.column_dates_problem(half_fin) is None,
+      pt.column_dates_problem(half_fin))
+check("half year: quarter-spaced columns don't",
+      pt.column_dates_problem({**half_fin, "prev_period_end": "2026-06-30"})
+      == "previous column 2026-06-30 isn't 6 months before 2026-09-30")
+check("half year: a missing previous column is named",
+      pt.column_dates_problem({**half_fin, "prev_period_end": None}) == "previous-half-year column date missing")
+check("quarterly results still need 3 months",
+      pt.column_dates_problem({**half_fin, "period_months": 3})
+      == "previous column 2026-03-31 isn't 3 months before 2026-09-30")
+check("pdf_quarter labels a half year", pt.pdf_quarter(half_fin, date(2026, 10, 22)) == "H1FY27")
+problem = pt.numbers_problem({**half_fin, "pbt": [0.5, 2.6, 1.45]})
+check("sanity check names the half year", (problem or "").startswith("this half year:"), problem)
+
+s_half, bd_half = pt.compute_pead_score(half_fin)
+check("half year scored like a quarter, momentum half on half",
+      "Revenue HoH" in bd_half and "Revenue QoQ" not in bd_half and bd_half["Revenue HoH"][0] == "25.0%", bd_half)
+
+tagged = pt.short_company("Tinna Rubber and Infrastructure Limited [SME]")
+check("[SME] kept when a long name is cut", len(tagged) == pt.COMPANY_WIDTH and tagged.endswith("… [SME]"), tagged)
+check("short name: Ltd dropped, [SME] kept",
+      pt.short_company("Poojaa Precision Engg. Ltd [SME]") == "Poojaa Precision Engg. [SME]".ljust(pt.COMPANY_WIDTH))
+check("no tag, cut as before", pt.short_company("Tinna Rubber and Infrastructure Limited") == "Tinna Rubber and Infrastructu…")
+
+sme_filing = pt.normalise_bse(bse_raw("p1", 544844, "Result", "2026-10-22T14:57:17"))
+with mock.patch.object(pt.requests, "post", fake_post):
+    pt.send_telegram(sme_filing, s_half, bd_half, half_fin, "H1FY27", "22 Oct 2026  14:58:00", "43s")
+t = sent["text"]
+check("alert: [SME] after the name, half-yearly table",
+      "<b>Co 544844 [SME]</b>" in t and "HALF-YEARLY FINANCIALS" in t and "HoH%" in t
+      and "Revenue HoH" in t and "H1FY27 (to 2026-09-30)" in t and "QoQ" not in t, t)
+
+# The scanner end to end: scored under its own key, then a later copy skipped before download
+fresh_state_dir()
+again = pt.normalise_bse(bse_raw("p2", 544844, "Result", "2026-10-23T11:00:00"))
+extract, calls = counting_extract({sme_filing["attachment_url"]: half_fin, again["attachment_url"]: half_fin})
+sme_master = {"bse": {"544844": "INE288301026"}, "nse": {}}
+with LogCapture() as cap:
+    run_main(1, bse=lambda k: [sme_filing], extract=extract, master=sme_master)
+processed = set(json.load(open(pt.PROCESSED_SCRIPS_FILE)))
+row = list(csv.DictReader(open(pt.RESULTS_CSV, encoding="utf-8")))[-1]
+check("half-yearly result scored under its own key", processed == {"INE288301026_H1FY27"}, processed)
+check("CSV row: quarter H1FY27, the previous half year in the pq columns, name untagged",
+      row["quarter"] == "H1FY27" and row["revenue_pq"] == "12.0" and row["period_end"] == "2026-09-30"
+      and row["company"] == "Co 544844", row)
+check("its line carries [SME] and H1FY27",
+      any(st in ("SCORE", "ALERT") and "Co 544844 [SME]" in m and "H1FY27" in m for st, _, m in cap.records), cap.records)
+check("scored_names_from_csv keeps half years", ("co 544844", "H1FY27") in pt.scored_names_from_csv())
+
+with LogCapture() as cap:
+    run_main(1, bse=lambda k: [again], extract=extract, master=sme_master)      # restart
+check("a later copy is skipped before download by the half-year key",
+      again["attachment_url"] not in calls and cap.has_line("SKIP", "INE288301026_H1FY27 already scored"),
+      (calls, cap.records))
+
+old_half = pt.normalise_financials({**HALF, "period_end": "31.03.2026", "prev_period_end": "30.09.2025",
+                                    "ly_period_end": "31.03.2025"})
+try:
+    pt.score_filing(pt.normalise_bse(bse_raw("p3", 544844, "Result", "2026-05-20T10:00:00")),
+                    "INE288301026", old_half, set(), {})
+    check("a half year before SCORE_FROM_QUARTER is old", False)
+except pt.SkipFiling as e:
+    check("a half year before SCORE_FROM_QUARTER is old", e.status == "OLD" and str(e).startswith("H2FY26: old quarter"), e)
+
+check("half-year fallback keys move to the ISIN too",
+      pt.migrate_processed_keys({"BSE-544844_H1FY27"}, sme_master) == {"INE288301026_H1FY27"})
+check("terminal shortens a half-year duplicate",
+      pt.console_text("SKIP", "INE288301026_H1FY27 already scored") == "already scored this quarter")
+for dash_row, want in [({"quarter": "H1FY27", "period_end": "2026-09-30"}, ("Q2FY27", "csv")),
+                       ({"quarter": "h2fy26"}, ("Q4FY26", "csv"))]:
+    check(f"dashboard: half year {dash_row['quarter']} sits with {want[0]}",
+          dashboard.row_quarter(dash_row) == want, dashboard.row_quarter(dash_row))
+
+pt.SCORE_FROM_QUARTER = saved_cutoff
 
 
 print(f"\nFAILURES: {fails}")

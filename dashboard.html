@@ -253,6 +253,8 @@ a.co:hover, a.d-co:hover { color: var(--accent); text-decoration-color: var(--ac
   border-radius: 9px; padding: 6px 10px; font: inherit; font-size: 13px; font-weight: 600;
 }
 .qtag { display: inline-block; font-size: 12px; padding: 1px 7px; border-radius: 999px; border: 1px solid transparent; white-space: nowrap; }
+/* SME company (half-yearly results), after its name */
+.sme { display: inline-block; margin-left: 6px; padding: 0 5px; border-radius: 4px; font-size: 10px; font-weight: 600; letter-spacing: 0.04em; line-height: 16px; vertical-align: 2px; color: var(--text-secondary); border: 1px solid var(--border); }
 .qtag.off, .qstate-tag.past { color: var(--warn); border: 1px solid color-mix(in srgb, var(--warn) 55%, var(--border)); background: color-mix(in srgb, var(--warn) 12%, transparent); font-weight: 600; }
 .qstate-tag.current { color: var(--good); border: 1px solid color-mix(in srgb, var(--good) 55%, var(--border)); background: color-mix(in srgb, var(--good) 12%, transparent); font-weight: 600; }
 .qstate-tag { font-size: 12px; padding: 3px 9px; border-radius: 999px; white-space: nowrap; }
@@ -620,13 +622,26 @@ function fmtPeriodEnd(iso) {
   return d && !isNaN(d) ? d.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" }) : "";
 }
 
+// "H1FY27" → "H1 FY27 · Apr–Sep 2026 half year" (an SME company's results)
+function halfName(q) {
+  const m = /^H([12])FY(\d{2})$/.exec(q || "");
+  if (!m) return q;
+  const y = 2000 + Number(m[2]) - 1;
+  return `H${m[1]} FY${m[2]} · ${m[1] === "1" ? `Apr–Sep ${y}` : `Oct ${y}–Mar ${y + 1}`} half year`;
+}
+
+// The company name, with an SME tag for half-yearly results
+function smeTag(r) {
+  return r.half ? `<span class="sme" title="SME company: results are half-yearly, scored half year on half year">SME</span>` : "";
+}
+
 // Detail panel: which quarter, and how dashboard.py knew it
 function quarterLine(r) {
-  const name = (quarterOption(r.qkey) || {}).name || r.qkey;
+  const name = r.half ? halfName(r.quarter) : (quarterOption(r.qkey) || {}).name || r.qkey;
   const parts = [r.qkey === "UNKNOWN"
     ? `<span class="qtag off">⚠ Quarter unknown</span>`
     : `<span class="qtag">${esc(name)}</span>`];
-  if (r.periodEnd) parts.push(`quarter ended ${esc(fmtPeriodEnd(r.periodEnd) || r.periodEnd)}`);
+  if (r.periodEnd) parts.push(`${r.half ? "half year" : "quarter"} ended ${esc(fmtPeriodEnd(r.periodEnd) || r.periodEnd)}`);
   else if (r.quarterFrom === "filed") parts.push("quarter from filing date (not recorded in this row)");
   else parts.push("no quarter-end date");
   if (r.basis) parts.push(esc(r.basis));
@@ -663,6 +678,7 @@ function normalise(raw, i) {
     quarterFrom: raw._quarter_from || "",
     source: raw._source || "",
   };
+  r.half = /^H[12]FY\d{2}$/.test(r.quarter);      // an SME company's half-yearly result
   r.empty = r.revCq == null && r.patCq == null && r.epsCq == null;
   r.revYoy = pct(r.revCq, r.revLy);
   r.patYoy = pct(r.patCq, r.patLy);
@@ -710,10 +726,10 @@ function scorecard(r) {
     const d = (r.ebCq / r.revCq - r.ebLy / r.revLy) * 100;
     add("EBITDA margin", (d > 0 ? "+" : "") + d.toFixed(1) + "pp", band(d, [[5, 5], [3, 4], [2, 3], [1, 2], [0.5, 1]]), 5);
   } else add("EBITDA margin", "–", 0, 5);
-  // 5. Revenue QoQ (5)
-  const qoq = pct(r.revCq, r.revPq);
-  if (r.revPq != null && r.revPq < 10) add("Revenue QoQ", fmtPct(qoq), 0, 5, "small base");
-  else add("Revenue QoQ", fmtPct(qoq), band(qoq, [[25, 5], [15, 4], [10, 3], [5, 2]]), 5);
+  // 5. Revenue QoQ (5), half on half for half-yearly results
+  const qoq = pct(r.revCq, r.revPq), momentum = r.half ? "Revenue HoH" : "Revenue QoQ";
+  if (r.revPq != null && r.revPq < 10) add(momentum, fmtPct(qoq), 0, 5, "small base");
+  else add(momentum, fmtPct(qoq), band(qoq, [[25, 5], [15, 4], [10, 3], [5, 2]]), 5);
   // 6. Net margin (5)
   if (r.patCq != null && r.revCq > 0) {
     const nm = r.patCq / r.revCq * 100;
@@ -738,7 +754,7 @@ function applyFilters() {
         if (r.ts.toDateString() !== now.toDateString()) return false;
       } else if ((now - r.ts) / 86400000 > days) return false;
     }
-    if (qq && !(r.company.toLowerCase().includes(qq) || r.scrip.toLowerCase().includes(qq))) return false;
+    if (qq && !(r.company.toLowerCase().includes(qq) || r.scrip.toLowerCase().includes(qq) || (r.half && qq === "sme"))) return false;
     return true;
   });
   const inQuarter = S.rows.filter((r) => r.qkey === S.quarter && r.score != null && !r.empty).length;
@@ -862,9 +878,9 @@ function renderDetail() {
     : r.check ? "⚠ Numbers don't add up · no alert"
     : r.quarter === "UNKNOWN" ? "Quarter unknown · no alert" : "No alert";
   $("d-badge").className = "badge" + (hit ? " alert" : (r.check || r.quarter === "UNKNOWN") ? " off" : "");
-  $("d-name").innerHTML = screenerUrl(r)
+  $("d-name").innerHTML = (screenerUrl(r)
     ? `<a class="d-co" href="${esc(screenerUrl(r))}" target="_blank" rel="noopener" title="Open ${esc(r.company)} on Screener">${esc(r.company)}</a>`
-    : esc(r.company);
+    : esc(r.company)) + smeTag(r);
   $("d-name").title = r.company;
   $("d-meta").innerHTML = `${esc(r.exchange)} · <a href="${esc(companyPage(r))}" target="_blank" rel="noopener" style="color:var(--accent)">${esc(r.scrip)}</a> · ${esc(r.tsStr)}`;
   $("d-quarter").innerHTML = quarterLine(r);
@@ -887,7 +903,8 @@ function renderDetail() {
     ["PAT", r.patCq, r.patPq, r.patLy],
     ["EPS (₹)", r.epsCq, r.epsPq, r.epsLy],
   ];
-  $("d-fin").innerHTML = `<thead><tr><th>₹ Cr</th><th>This qtr</th><th>Last qtr</th><th>Year ago</th></tr></thead><tbody>` +
+  const [thisP, lastP] = r.half ? ["This half", "Last half"] : ["This qtr", "Last qtr"];
+  $("d-fin").innerHTML = `<thead><tr><th>₹ Cr</th><th>${thisP}</th><th>${lastP}</th><th>Year ago</th></tr></thead><tbody>` +
     rowsF.map(([n, a, b, c]) => `<tr><td>${n}</td><td>${fmtNum(a)}</td><td>${fmtNum(b)}</td><td>${fmtNum(c)}</td></tr>`).join("") + "</tbody>";
 
   let note = "Breakdown recomputed from the figures in pead_results.csv.";
@@ -924,14 +941,16 @@ function quickView(r, animate) {
     return `<tr class="sub"><td>${name}</td><td class="cq">${fmtM(m[0])}</td><td>${fmtM(m[1])}</td><td>${fmtM(m[2])}</td>
       <td class="gap">${chg(q, fmtPp(q))}</td><td>${chg(y, fmtPp(y))}</td></tr>`;
   };
-  const meta = [r.qkey && r.qkey !== "UNKNOWN" ? esc(r.qkey) : "quarter unknown",
-                r.periodEnd ? "quarter ended " + esc(fmtPeriodEnd(r.periodEnd) || r.periodEnd) : "",
+  const period = r.half ? "half year" : "quarter";
+  const meta = [r.half ? esc(r.quarter) + " (SME)" : r.qkey && r.qkey !== "UNKNOWN" ? esc(r.qkey) : "quarter unknown",
+                r.periodEnd ? `${period} ended ` + esc(fmtPeriodEnd(r.periodEnd) || r.periodEnd) : "",
                 r.basis ? esc(r.basis) : "", "₹ crore, EPS in ₹"].filter(Boolean).join(" · ");
+  const [thisP, lastP, change] = r.half ? ["This half", "Last half", "HoH"] : ["This qtr", "Last qtr", "QoQ"];
   const figures = `<div>
-    <div class="qcap">Quarterly figures</div>
+    <div class="qcap">${r.half ? "Half-yearly" : "Quarterly"} figures</div>
     <div class="qmeta">${meta}</div>
     <table>
-      <thead><tr><th></th><th>This qtr</th><th>Last qtr</th><th>Year ago</th><th class="gap">QoQ</th><th>YoY</th></tr></thead>
+      <thead><tr><th></th><th>${thisP}</th><th>${lastP}</th><th>Year ago</th><th class="gap">${change}</th><th>YoY</th></tr></thead>
       <tbody>
         ${amount("Revenue", r.revCq, r.revPq, r.revLy)}
         ${amount("EBITDA", r.ebCq, r.ebPq, r.ebLy)}
@@ -1000,7 +1019,7 @@ function renderTable() {
       <td class="mono">${esc(r.tsStr.slice(5, 16))}</td>
       <td>${screenerUrl(r)
         ? `<a class="co" href="${esc(screenerUrl(r))}" target="_blank" rel="noopener" title="Open ${esc(r.company)} on Screener">${esc(r.company)}</a>`
-        : `<span class="co" title="${esc(r.company)}">${esc(r.company)}</span>`}</td>
+        : `<span class="co" title="${esc(r.company)}">${esc(r.company)}</span>`}${smeTag(r)}</td>
       <td>${r.filingUrl
         ? `<a class="ex-link" href="${esc(filingLink(r))}" target="_blank" rel="noopener" title="Open the result filing on ${esc(r.exchange)}">${esc(r.exchange)}</a>`
         : `<a class="ex-link fallback" href="${esc(companyPage(r))}" target="_blank" rel="noopener" title="Filing link wasn't recorded for this row; opens the company's ${esc(r.exchange)} page">${esc(r.exchange)}</a>`}</td>

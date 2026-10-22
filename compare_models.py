@@ -25,7 +25,7 @@ import time
 
 import pead_tool as pt
 
-META_KEYS = ["basis", "unit", "period_end", "prev_period_end", "ly_period_end"]
+META_KEYS = ["basis", "unit", "period_end", "prev_period_end", "ly_period_end", "period_months"]
 
 # USD per million tokens (input, output) on AICredits, Oct 2026. Thinking is
 # billed as output. Haiku 5.5's price is for prompts under 100k tokens.
