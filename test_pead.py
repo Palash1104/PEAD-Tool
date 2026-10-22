@@ -566,6 +566,46 @@ check("results page preferred over its cash flow page",
 check("a results heading beats a cash-flow word in it",
       pt.classify_result_page("Statement of Audited Financial Results and Cash Flow for the quarter\n" + table) == "generic")
 
+# Tinna Rubber (22 Oct 2026): both cash flow statements and the auditor's report
+# were taken for results tables, so the real statement (page 2) was never sent
+TINNA_CASH_FLOW = """TINNA RUBBER AND INFRASTRUCTURE LIMITED
+UNAUDITED CONSOLIDATED STATEMENT OF CASH FLOWS FOR THE HALF YEAR ENDED SEPTEMBER 30, 2026
+Particulars Half Year ended Half Year ended
+A. CASH FLOWS FROM OPERATING ACTIVITIES
+Net Profit before tax 5,091.82 3,195.98
+Depreciation and amortisation expense 859.09 581.95
+Finance cost 552.70 541.59"""
+TINNA_AUDITOR = """SS KOTHARI MEHTA & CO.LLP - CHARTERED ACCOUNTANTS
+6. Emphasis of matter
+We draw attention to Note 5 to the financial results, which describes the issue related to acquisition of land.
+7. Other matter
+This Statement includes the interim financial results of 2 subsidiaries, whose interim financial result reflects total assets
+of Rs. 3195.77 lakhs, as at September 30, 2026, total revenues of Rs. 1,123.67 lakhs and Rs. 1,995.11 lakhs, total net
+profit after tax of Rs. 93.35 lakhs and Rs. 115.91 lakhs, as considered in the unaudited consolidated financial results."""
+TINNA_STATEMENT = ("TINNA RUBBER AND INFRASTRUCTURE LIMITED\nSTATEMENT OF STANDLONE UN-AUDITED FINANCIAL RESULTS\n"
+                   "FOR THE QUARTER AND HALF YEAR ENDED SEPTEMBER 30, 2026\n" + table)
+FIGURES = "\n".join(f"Line {i}  {i},234.56  {i},111.20  {i},000.10" for i in range(1, 13))    # 36 amounts
+check("a consolidated cash flow statement isn't a results table",
+      pt.classify_result_page(TINNA_CASH_FLOW) is None, pt.classify_result_page(TINNA_CASH_FLOW))
+check("…nor a standalone one",
+      pt.classify_result_page(TINNA_CASH_FLOW.replace("CONSOLIDATED", "STANDALONE")) is None)
+check("a cash flow heading that also says results is still a table",
+      pt.classify_result_page("Statement of Unaudited Consolidated Financial Results and Statement of Cash Flows\n" + table)
+      == "consolidated")
+check("an auditor's report quoting revenue and profit isn't a results table",
+      pt.classify_result_page(TINNA_AUDITOR) is None, pt.classify_result_page(TINNA_AUDITOR))
+check("a results table with the auditor's stamp at the top is still one",
+      pt.classify_result_page("Initialled for identification\nFor XYZ & Co., Chartered Accountants\n"
+                              "Statement of Unaudited Standalone Financial Results for the quarter ended 30.09.2026\n"
+                              + table + FIGURES) == "standalone")
+check("'CONSOLIDATED UN-AUDITED' heading", pt.classify_result_page(
+      "STATEMENT OF CONSOLIDATED UN-AUDITED FINANCIAL RESULTS\n" + table) == "consolidated")
+check("'UN-AUDITED STANDALONE' heading", pt.classify_result_page(
+      "STATEMENT OF UN-AUDITED STANDALONE FINANCIAL RESULTS\n" + table) == "standalone")
+check("Tinna's pages: only the real statement is a candidate",
+      pt.table_candidates([cover, TINNA_STATEMENT, TINNA_CASH_FLOW, notes, TINNA_AUDITOR]) == [(1, "generic")],
+      pt.table_candidates([cover, TINNA_STATEMENT, TINNA_CASH_FLOW, notes, TINNA_AUDITOR]))
+
 # ─────────────────────────────────────────────────────────────
 section("normalise_financials")
 
@@ -2390,6 +2430,37 @@ extract, calls = counting_extract({retry_other["attachment_url"]: None})
 fresh_state_dir(); reset_credits()
 run_main(3, bse=lambda k: [retry_other], extract=extract)
 check("other failures still retry every poll", calls == {retry_other["attachment_url"]: 3}, calls)
+
+# A PDF that stops short (Tinna Rubber's NSE copy, 22 Oct 2026: NSE serves 2.65 MB
+# of a 6 MB file, the same on every download) is named, and waits like a failed download
+def unreadable(*a, **kw):
+    raise ValueError("Unexpected EOF")
+with mock.patch.object(pt, "find_result_pages", unreadable):
+    try:
+        pt.extract_financials(b"%PDF-1.6\n" + b"x" * 2_700_000)
+        check("a cut-off PDF is named", False)
+    except pt.RetryFiling as e:
+        check("a cut-off PDF is named", str(e) == "PDF is cut off (2.6 MB, no end marker)", e)
+    check("a complete PDF that won't parse is still 'could not extract'",
+          pt.extract_financials(b"%PDF-1.6\n" + b"x" * 3000 + b"\n%%EOF\n") is None)
+cut_short = text_pdf([["ABC LIMITED"] * 40] * 3)
+try:
+    pt.extract_financials(cut_short[:len(cut_short) // 3])
+    check("a real PDF cut to a third is named as cut off", False)
+except pt.RetryFiling as e:
+    check("a real PDF cut to a third is named as cut off", str(e).startswith("PDF is cut off ("), e)
+except pt.SkipFiling as e:
+    check("a real PDF cut to a third is named as cut off", False, f"pdfplumber read it: {e}")
+
+cut_f = pt.normalise_nse(nse_raw("cut1", "TINNARUBR", "INE015C01016", "22-Oct-2026 14:13:31"))
+extract, calls = counting_extract({cut_f["attachment_url"]: pt.RetryFiling("PDF is cut off (2.5 MB, no end marker)")})
+fresh_state_dir(); reset_credits()
+with TerminalCapture() as term:
+    run_main(4, nse=lambda c: [cut_f], extract=extract)
+check("a cut-off PDF waits a minute too, and the line says why",
+      calls == {cut_f["attachment_url"]: 1}
+      and any("PDF is cut off (2.5 MB, no end marker) · retry 1/3 in 1 min" in l for l in term.lines()),
+      (calls, term.lines()))
 
 # A filing waiting in memory holds the saved checkpoint back to its day, so a restart
 # fetches it again (16 Oct 2026: results held for credits from 10-15 Oct were lost

@@ -75,8 +75,10 @@ POLL_INTERVAL_SEC  = 30
 MAX_RETRIES        = 3      # extra attempts per failed filing, one per poll
 # ...except a failed PDF download, retried after 1, 5 and 15 minutes: the file
 # may not be up yet or the server is struggling (19 Oct 2026: UltraTech's NSE
-# PDF failed four times within 90 seconds)
+# PDF failed four times within 90 seconds). A PDF that is cut off waits the
+# same, in case it is uploaded again.
 DOWNLOAD_RETRY_DELAYS_SEC = (60, 300, 900)
+WAIT_BEFORE_RETRY = ("PDF download failed", "PDF is cut off")
 BLOCKED_ALERT_SEC  = 3600   # Telegram at most hourly about an exchange blocking us
 
 # Only results whose PDF says which quarter they are get scored. An earlier
@@ -1364,22 +1366,37 @@ TABLE_MARKERS = {
 }
 
 # A page headed like this is a cash flow statement or balance sheet, not
-# the results table, unless its heading also names the results
+# the results table, unless its heading also says "results". Checked before
+# RESULT_HEADINGS: "Unaudited Consolidated Statement of Cash Flows" matches
+# the consolidated pattern (Tinna Rubber, 22 Oct 2026: both cash flow
+# statements were taken for results tables, the real ones never sent).
 NOT_TABLE_HEADINGS = re.compile(r"cash\s+flow|assets\s+and\s+liabilities|balance\s+sheet")
 
-# Checked against the top of each table page, in order of preference
+# An auditor's review report quotes a few figures in its prose ("total
+# revenues of Rs. 1,123.67 lakhs ... net profit after tax"), enough to pass
+# the line-item check (Tinna Rubber, page 13). A page with the auditor in its
+# heading and fewer than AUDITOR_PAGE_AMOUNTS amounts is such a report; a
+# results table carrying an auditor's stamp still has a grid of figures.
+AUDITOR_HEADINGS = re.compile(
+    r"chartered\s+accountants|independent\s+auditor|review\s+report|emphasis\s+of\s+matter|other\s+matters?\b"
+)
+AMOUNT_RE = re.compile(r"\d[\d,]*\.\d+|\d{1,3}(?:,\d{2,3})+")
+AUDITOR_PAGE_AMOUNTS = 30
+
+# Checked against the top of each table page, in order of preference.
+# "Un-audited" is often hyphenated (Tinna Rubber's "CONSOLIDATED UN-AUDITED").
 RESULT_HEADINGS = [
     ("consolidated", re.compile(
-        r"(?:un)?audited\s+consolidated|consolidated\s+(?:un)?audited"
+        r"(?:un[-\s]?)?audited\s+consolidated|consolidated\s+(?:un[-\s]?)?audited"
         r"|consolidated\s+(?:financial\s+)?results|consolidated\s+statement"
     )),
     ("standalone", re.compile(
-        r"(?:un)?audited\s+standalone|standalone\s+(?:un)?audited"
+        r"(?:un[-\s]?)?audited\s+standalone|standalone\s+(?:un[-\s]?)?audited"
         r"|standalone\s+(?:financial\s+)?results|standalone\s+statement"
     )),
     ("generic", re.compile(
         r"results\s+for\s+the\s+(?:quarter|half\s+year|period)"
-        r"|(?:un)?audited\s+financial\s+results"
+        r"|(?:un[-\s]?)?audited\s+financial\s+results"
     )),
 ]
 
@@ -1400,12 +1417,19 @@ def classify_result_page(text: str) -> str | None:
         return None
 
     heading = " ".join(lower.splitlines()[:HEADING_LINES])
+    statement = NOT_TABLE_HEADINGS.search(heading)
+
+    if statement and not RESULT_WORD_RE.search(heading):
+        return None
+
+    if AUDITOR_HEADINGS.search(heading) and len(AMOUNT_RE.findall(lower)) < AUDITOR_PAGE_AMOUNTS:
+        return None
 
     for basis, pattern in RESULT_HEADINGS:
         if pattern.search(heading):
             return basis
 
-    if NOT_TABLE_HEADINGS.search(heading):
+    if statement:
         return None
 
     return "untitled"
@@ -2078,6 +2102,10 @@ def extract_financials(pdf_bytes: bytes, model: str | None = None,
         )
     except Exception as e:
         log.warning(f"PDF text extraction failed: {e}", extra=QUIET)
+        if b"%%EOF" not in pdf_bytes[-2048:]:
+            # The file stops short (Tinna Rubber's NSE copy, 22 Oct 2026: NSE
+            # serves 2.65 MB of a 6 MB PDF, the same on every download)
+            raise RetryFiling(f"PDF is cut off ({len(pdf_bytes) / (1024 * 1024):.1f} MB, no end marker)")
         return None
 
     if ambiguous:
@@ -3202,7 +3230,7 @@ def record_retry(filing: dict, state: ScannerState, reason: str, timings: dict,
         save_retries(state.retries)
         state.pending[fid] = filing
 
-        if reason.startswith("PDF download failed"):
+        if reason.startswith(WAIT_BEFORE_RETRY):
             delay = DOWNLOAD_RETRY_DELAYS_SEC[min(attempts, len(DOWNLOAD_RETRY_DELAYS_SEC)) - 1]
             state.retry_after[fid] = time.monotonic() + delay
             outcome += f" in {delay // 60} min" if delay >= 60 else f" in {delay} s"
