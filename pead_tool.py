@@ -1281,6 +1281,7 @@ Return ONLY a JSON object, no explanation, no markdown:
 
 Rules:
 - null for any value not found with confidence
+- A line the table prints with a dash (- or –) or "nil" in a column is 0 there, not null
 - Plain numbers only, no commas or symbols
 - Negatives as negative numbers e.g. -12.5 (values in brackets like (12.5) are negative)
 - Do NOT include annual/year-ended columns"""
@@ -1320,12 +1321,13 @@ PERIOD_END_FORMATS = [
     "%d-%b-%Y", "%d %b %Y", "%d %B %Y", "%B %d, %Y", "%b %d, %Y",
 ]
 
-MAX_PDF_PAGES       = 25
+MAX_PDF_PAGES       = 25    # read first (text layer, OCR where needed)
+LONG_PDF_PAGES      = 60    # no titled results table in those → read on up to here
 AMBIGUOUS_OCR_PAGES = 8     # OCR budget for outcomes whose headline names no results
 MIN_TEXT_CHARS      = 500   # whole PDF below this → treat as scanned, OCR it all
 LOW_TEXT_PAGE_CHARS = 200   # no table in text layer → OCR pages below this
 SCAN_IMAGE_COVER    = 0.85  # a page this much covered by one image is a scan, whatever text it carries
-HEADING_LINES       = 20    # a result table's title sits near the top of its page
+HEADING_LINES       = 20    # a result table's title sits in its page's first non-empty lines
 
 # Scanned pages. OCR only has to find which pages hold the results table
 # (keywords, not exact digits), so it runs at a low resolution. The selected
@@ -1379,20 +1381,38 @@ NOT_TABLE_HEADINGS = re.compile(r"cash\s+flow|assets\s+and\s+liabilities|balance
 # results table carrying an auditor's stamp still has a grid of figures.
 AUDITOR_HEADINGS = re.compile(
     r"chartered\s+accountants|independent\s+auditor|review\s+report|emphasis\s+of\s+matter|other\s+matters?\b"
+    r"|reviewed\s+by\s+us|the\s+statement\s+includes"      # a report's later pages (Bansal Wire, 23 Oct 2026)
 )
 AMOUNT_RE = re.compile(r"\d[\d,]*\.\d+|\d{1,3}(?:,\d{2,3})+")
 AUDITOR_PAGE_AMOUNTS = 30
 
+# Pages about the results rather than the statement itself (23 Oct 2026):
+# notes, whose title names the results (Coforge's segment table on page 15
+# and Le Travenues' notes on page 8 were sent as the consolidated table), and
+# press releases (Dr. Reddy's and Emmvee, page 2). The first title-like line
+# of a notes page starts with "Notes" / "Explanatory notes", that of a
+# segment page with "(Consolidated unaudited) Segment …" (Emmvee, page 44).
+TITLE_LINE = re.compile(r"statement|results|notes?\b|segment")
+NOTES_OR_SEGMENT_TITLE = re.compile(
+    r"^\W*(?:selected\s+)?(?:explanatory\s+)?notes?\b"
+    r"|^\W*(?:(?:un[-\s]?)?audited\s+|c?onsolidated\s+|s?tandalone\s+)*segment"
+)
+PRESS_RELEASE_HEADINGS = re.compile(
+    r"today\s+announced|(?:press|media|earnings|investor)\s+release|\bhighlights\b"
+)
+
 # Checked against the top of each table page, in order of preference.
-# "Un-audited" is often hyphenated (Tinna Rubber's "CONSOLIDATED UN-AUDITED").
+# "Un-audited" is often hyphenated (Tinna Rubber's "CONSOLIDATED UN-AUDITED"),
+# and OCR can lose a title's first letter against a table border (Coforge's
+# "onsolidated Financial Results").
 RESULT_HEADINGS = [
     ("consolidated", re.compile(
-        r"(?:un[-\s]?)?audited\s+consolidated|consolidated\s+(?:un[-\s]?)?audited"
-        r"|consolidated\s+(?:financial\s+)?results|consolidated\s+statement"
+        r"(?:un[-\s]?)?audited\s+c?onsolidated|c?onsolidated\s+(?:un[-\s]?)?audited"
+        r"|c?onsolidated\s+(?:financial\s+)?results|c?onsolidated\s+statement"
     )),
     ("standalone", re.compile(
-        r"(?:un[-\s]?)?audited\s+standalone|standalone\s+(?:un[-\s]?)?audited"
-        r"|standalone\s+(?:financial\s+)?results|standalone\s+statement"
+        r"(?:un[-\s]?)?audited\s+s?tandalone|s?tandalone\s+(?:un[-\s]?)?audited"
+        r"|s?tandalone\s+(?:financial\s+)?results|s?tandalone\s+statement"
     )),
     ("generic", re.compile(
         r"results\s+for\s+the\s+(?:quarter|half\s+year|period)"
@@ -1410,19 +1430,29 @@ TABLE_PREFERENCE = ["consolidated", "standalone", "generic", "untitled"]
 # never resending a table already sent. Only then is it a MISS.
 MAX_EXTRA_TABLE_TRIES = 2
 
+def heading_lines(text: str) -> list:
+    """A page's first HEADING_LINES non-empty lines. OCR text is full of blank
+    lines (Emmvee, 23 Oct 2026: page 41's title came after line 20 counting them)."""
+    return [line for line in text.splitlines() if line.strip()][:HEADING_LINES]
+
 def classify_result_page(text: str) -> str | None:
     lower = text.lower()
 
     if sum(1 for pattern in TABLE_MARKERS.values() if pattern.search(lower)) < 2:
         return None
 
-    heading = " ".join(lower.splitlines()[:HEADING_LINES])
+    lines = heading_lines(lower)
+    heading = " ".join(lines)
     statement = NOT_TABLE_HEADINGS.search(heading)
 
     if statement and not RESULT_WORD_RE.search(heading):
         return None
 
     if AUDITOR_HEADINGS.search(heading) and len(AMOUNT_RE.findall(lower)) < AUDITOR_PAGE_AMOUNTS:
+        return None
+
+    title = next((line for line in lines if TITLE_LINE.search(line)), "")
+    if NOTES_OR_SEGMENT_TITLE.search(title) or PRESS_RELEASE_HEADINGS.search(heading):
         return None
 
     for basis, pattern in RESULT_HEADINGS:
@@ -1507,15 +1537,16 @@ def ocr_pages(pdf_bytes: bytes, page_texts: list, indices: list,
 
     return page_texts
 
-def find_result_pages(pdf_bytes: bytes, ocr_page_limit: int = MAX_PDF_PAGES,
+def find_result_pages(pdf_bytes: bytes, ocr_page_limit: int = LONG_PDF_PAGES,
                       timings: dict | None = None) -> dict:
     """Locate the result table pages: {"pages", "basis", "reason", "texts", "ocr"}.
 
     pages is [] when no page passes the results-table check, even after OCR.
     texts holds every page's text (OCR text for scanned pages); ocr is the set
-    of page indices whose text came from OCR. Only the first ocr_page_limit
-    pages are ever OCR'd. Records timings["scan"] (text layer + table check)
-    and timings["ocr"].
+    of page indices whose text came from OCR. The first MAX_PDF_PAGES pages
+    are read; only if they hold no titled table, the rest up to
+    LONG_PDF_PAGES. Only pages below ocr_page_limit are ever OCR'd. Records
+    timings["scan"] (text layer + table check) and timings["ocr"].
     """
     started = time.monotonic()
     timings = {} if timings is None else timings
@@ -1544,61 +1575,82 @@ def table_hints(text: str) -> int:
     one point per kind of line item, plus 3 for a consolidated results title
     (2 for any other results title)."""
     lower = text.lower()
-    heading = " ".join(lower.splitlines()[:HEADING_LINES])
+    heading = " ".join(heading_lines(lower))
     points = sum(1 for pattern in TABLE_MARKERS.values() if pattern.search(lower))
     for basis, pattern in RESULT_HEADINGS:
         if pattern.search(heading):
             return points + (3 if basis == "consolidated" else 2)
     return points
 
-def _find_result_pages(pdf_bytes: bytes, ocr_page_limit: int, timings: dict) -> dict:
+def read_text_layer(pdf_bytes: bytes, start: int, end: int) -> tuple:
+    """Text of pages start..end-1 (0-based), the indices among them that are
+    scans, and the PDF's page count."""
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        page_count = min(len(pdf.pages), MAX_PDF_PAGES)
-        page_texts = [
-            page.extract_text() or ""
-            for page in pdf.pages[:page_count]
-        ]
-        scans = {i for i, page in enumerate(pdf.pages[:page_count]) if is_scanned_page(page)}
+        pages = pdf.pages[start:end]
+        texts = [page.extract_text() or "" for page in pages]
+        scans = {start + i for i, page in enumerate(pages) if is_scanned_page(page)}
+        return texts, scans, len(pdf.pages)
 
+def ocr_unread(pdf_bytes: bytes, page_texts: list, scans: set, ocred: set, limit: int,
+               timings: dict) -> tuple:
+    """OCR the pages below limit not read properly yet, while no titled table
+    is found: near-empty pages, then scans. Returns (texts, pages, basis)."""
+    selected, basis = find_table_pages(page_texts)
+
+    # Hybrid PDF: text cover letter, scanned result pages
+    low_text = [
+        i for i, t in enumerate(page_texts)
+        if len(t.strip()) < LOW_TEXT_PAGE_CHARS and i < limit and i not in ocred
+    ]
+
+    # An untitled "table" in the text layer can be a press release's
+    # summary box while the real statement is a scan (Automobile Corp of
+    # Goa, 21 Oct 2026: page 10's highlights were sent, the scanned
+    # statement on page 6 never read). Read the unread pages first; a
+    # titled table found there ranks above the untitled one.
+    if (not selected or basis == "untitled") and low_text:
+        log.debug(
+            "no result table in text layer, OCR-ing low-text pages" if not selected
+            else "only an untitled table in the text layer, OCR-ing low-text pages first"
+        )
+        page_texts = ocr_pages(pdf_bytes, page_texts, low_text, timings, ocred)
+        selected, basis = find_table_pages(page_texts)
+
+    # Scans that carry the scanner's own text layer: that layer can be too
+    # garbled to show the table (GM Breweries, 8 Oct 2026: row names but
+    # no figures). OCR them ourselves, the most table-like first.
+    rescan = [i for i in sorted(scans) if i < limit and i not in ocred]
+    if (not selected or basis == "untitled") and rescan:
+        rescan.sort(key=lambda i: -table_hints(page_texts[i]))      # stable: page order on ties
+        log.debug("no result table in the scans' own text layer, OCR-ing the scanned pages")
+        page_texts = ocr_pages(pdf_bytes, page_texts, rescan, timings, ocred)
+        selected, basis = find_table_pages(page_texts)
+
+    return page_texts, selected, basis
+
+def _find_result_pages(pdf_bytes: bytes, ocr_page_limit: int, timings: dict) -> dict:
+    page_texts, scans, page_count = read_text_layer(pdf_bytes, 0, MAX_PDF_PAGES)
+    first_limit = min(ocr_page_limit, MAX_PDF_PAGES)
     real_chars = sum(len(t.strip()) for t in page_texts)
     ocred = set()
 
     if real_chars < MIN_TEXT_CHARS:
         log.debug(f"only {real_chars} chars of text layer, OCR-ing the whole PDF")
-        page_texts = ocr_pages(pdf_bytes, page_texts, list(range(min(page_count, ocr_page_limit))), timings, ocred)
+        page_texts = ocr_pages(pdf_bytes, page_texts, list(range(min(len(page_texts), first_limit))), timings, ocred)
         selected, basis = find_table_pages(page_texts)
-
     else:
-        selected, basis = find_table_pages(page_texts)
+        page_texts, selected, basis = ocr_unread(pdf_bytes, page_texts, scans, ocred, first_limit, timings)
 
-        # Hybrid PDF: text cover letter, scanned result pages
-        low_text = [
-            i for i, t in enumerate(page_texts)
-            if len(t.strip()) < LOW_TEXT_PAGE_CHARS and i < ocr_page_limit
-        ]
-
-        # An untitled "table" in the text layer can be a press release's
-        # summary box while the real statement is a scan (Automobile Corp of
-        # Goa, 21 Oct 2026: page 10's highlights were sent, the scanned
-        # statement on page 6 never read). Read the unread pages first; a
-        # titled table found there ranks above the untitled one.
-        if (not selected or basis == "untitled") and low_text:
-            log.debug(
-                "no result table in text layer, OCR-ing low-text pages" if not selected
-                else "only an untitled table in the text layer, OCR-ing low-text pages first"
-            )
-            page_texts = ocr_pages(pdf_bytes, page_texts, low_text, timings, ocred)
-            selected, basis = find_table_pages(page_texts)
-
-        # Scans that carry the scanner's own text layer: that layer can be too
-        # garbled to show the table (GM Breweries, 8 Oct 2026: row names but
-        # no figures). OCR them ourselves, the most table-like first.
-        rescan = [i for i in sorted(scans) if i < ocr_page_limit and i not in ocred]
-        if (not selected or basis == "untitled") and rescan:
-            rescan.sort(key=lambda i: -table_hints(page_texts[i]))      # stable: page order on ties
-            log.debug("no result table in the scans' own text layer, OCR-ing the scanned pages")
-            page_texts = ocr_pages(pdf_bytes, page_texts, rescan, timings, ocred)
-            selected, basis = find_table_pages(page_texts)
+    # Long PDFs can put a press release and an investor deck first (23 Oct
+    # 2026: Dr. Reddy's statements came after page 25 of 36, Emmvee's on pages
+    # 41 and 48 of 51). With no titled table so far, read on.
+    if (not selected or basis == "untitled") and page_count > MAX_PDF_PAGES:
+        more, more_scans, _ = read_text_layer(pdf_bytes, MAX_PDF_PAGES, LONG_PDF_PAGES)
+        log.debug(f"no titled results table in the first {MAX_PDF_PAGES} pages; reading pages "
+                  f"{MAX_PDF_PAGES + 1}–{MAX_PDF_PAGES + len(more)}")
+        page_texts = page_texts + more
+        scans = scans | more_scans
+        page_texts, selected, basis = ocr_unread(pdf_bytes, page_texts, scans, ocred, ocr_page_limit, timings)
 
     found = {
         "pages": selected,
@@ -1647,7 +1699,7 @@ def next_candidate(pdf_bytes: bytes, found: dict, sent: set, timings: dict | Non
     if following:
         return following
 
-    limit = found.get("ocr_limit", MAX_PDF_PAGES)
+    limit = found.get("ocr_limit", LONG_PDF_PAGES)
     unread = [
         i for i, t in enumerate(texts)
         if i < limit and i not in ocred
@@ -1677,19 +1729,29 @@ def next_candidate(pdf_bytes: bytes, found: dict, sent: set, timings: dict | Non
 
     return pick()
 
+def current_figures(raw_out: dict) -> dict:
+    """The answer's current-quarter figures by FIN_KEYS key (empty if none)."""
+    data = raw_out.get("data")
+    if not isinstance(data, dict):
+        return {}
+    figures = {}
+    for key in FIN_KEYS:
+        values = data.get(key)
+        number = _to_number(values[0]) if isinstance(values, list) and values else None
+        if number is not None:
+            figures[key] = number
+    return figures
+
 def answered_without_figures(raw_out: dict) -> bool:
     """The model answered, but with no current-quarter figure for any line item."""
-    if "data" not in raw_out:
-        return False
-    data = raw_out["data"]
-    if not isinstance(data, dict):
-        return True
+    return "data" in raw_out and not current_figures(raw_out)
 
-    def current(key):
-        values = data.get(key)
-        return _to_number(values[0]) if isinstance(values, list) and values else None
-
-    return all(current(key) is None for key in FIN_KEYS)
+def partial_answer(raw_out: dict) -> bool:
+    """Figures, but neither EPS nor total expenses this quarter: a segment
+    table, press release or highlights box rather than the results statement
+    (Coforge, 23 Oct 2026: page 15's segment table gave revenue, PBT and PAT)."""
+    figures = current_figures(raw_out)
+    return bool(figures) and "basic_eps" not in figures and "total_expenses" not in figures
 
 def pages_as_text(found: dict) -> str:
     return "\n".join(
@@ -2089,15 +2151,17 @@ def extract_financials(pdf_bytes: bytes, model: str | None = None,
     the table check outcome is logged. Raises SkipFiling when the PDF has no
     results table (the model isn't called).
 
-    If the model answers with no figures at all, the next-best candidate
-    tables are tried straight away (up to MAX_EXTRA_TABLE_TRIES, never a table
-    already sent). raw_out["tried"] lists the page spans sent, e.g.
-    ["10–11", "4–5"]; raw_out["data"] is the last answer.
+    If the model answers with no figures at all, or with figures but neither
+    EPS nor total expenses (a segment table or press release, not the
+    statement), the next-best candidate tables are tried straight away (up to
+    MAX_EXTRA_TABLE_TRIES, never a table already sent), and the most complete
+    reading is kept. raw_out["tried"] lists the page spans sent, e.g.
+    ["10–11", "4–5"]; raw_out["data"] is the kept answer.
     """
     try:
         found = find_result_pages(
             pdf_bytes,
-            AMBIGUOUS_OCR_PAGES if ambiguous else MAX_PDF_PAGES,
+            AMBIGUOUS_OCR_PAGES if ambiguous else LONG_PDF_PAGES,
             timings
         )
     except Exception as e:
@@ -2117,29 +2181,45 @@ def extract_financials(pdf_bytes: bytes, model: str | None = None,
     model = model or EXTRACTION_MODEL
     raw_out = {} if raw_out is None else raw_out
     sent, tried = set(), []
+    best = None     # (rank, fin, attempt, span): the most complete reading so far
 
     for extra in range(MAX_EXTRA_TABLE_TRIES + 1):
         sent.update(found["pages"])
         tried.append(page_span(found["pages"]))
         attempt = {}
         fin = _extract_from_found(pdf_bytes, found, model, timings, attempt)
-        raw_out.clear()
-        raw_out.update(attempt)
-        raw_out["tried"] = list(tried)
 
-        if not answered_without_figures(attempt) or extra == MAX_EXTRA_TABLE_TRIES:
-            return fin
+        # Validated first, then a statement (EPS or total expenses), then more
+        # figures, then consolidated; between empty answers the latest stands
+        figures = current_figures(attempt)
+        rank = (fin is not None, bool(figures.keys() & {"basic_eps", "total_expenses"}), len(figures),
+                (fin or {}).get("basis") == "consolidated")
+        if best is None or rank > best[0] or not (figures or best[0][2]):
+            best = (rank, fin, attempt, tried[-1])
 
-        following = next_candidate(pdf_bytes, found, sent, timings)
+        if answered_without_figures(attempt):
+            missing = "no figures"
+        elif partial_answer(attempt):
+            missing = "no EPS or total expenses"
+        else:
+            break
+
+        following = next_candidate(pdf_bytes, found, sent, timings) if extra < MAX_EXTRA_TABLE_TRIES else None
         if not following:
-            return fin
+            break
 
         log.debug(
-            f"no figures from pages {tried[-1]} ({found['reason']}); "
+            f"{missing} from pages {tried[-1]} ({found['reason']}); "
             f"trying the {following['reason']} on pages {page_span(following['pages'])}"
         )
         found = following
 
+    _, fin, attempt, span = best
+    if span != tried[-1]:
+        log.debug(f"kept the reading of pages {span}, the most complete")
+    raw_out.clear()
+    raw_out.update(attempt)
+    raw_out["tried"] = tried
     return fin
 
 def _extract_from_found(pdf_bytes: bytes, found: dict, model: str,
@@ -2247,8 +2327,16 @@ def estimate_ebitda(fin):
         return ebitda
 
     pbt_vals = fin.get("pbt") or [None, None, None]
-    fin_cost_vals = fin.get("finance_cost") or [None, None, None]
-    dep_vals = fin.get("depreciation") or [None, None, None]
+
+    # A cost line blank in all three columns is one the company doesn't have
+    # (no borrowings, nothing to depreciate): nothing to add back. 23 Oct
+    # 2026: 20 of 307 scored rows had no EBITDA because a "–" came back null.
+    def cost(key):
+        values = fin.get(key) or [None, None, None]
+        return [0.0, 0.0, 0.0] if all(v is None for v in values) else values
+
+    fin_cost_vals = cost("finance_cost")
+    dep_vals = cost("depreciation")
 
     estimated = []
 

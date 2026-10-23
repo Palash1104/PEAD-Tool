@@ -606,6 +606,41 @@ check("Tinna's pages: only the real statement is a candidate",
       pt.table_candidates([cover, TINNA_STATEMENT, TINNA_CASH_FLOW, notes, TINNA_AUDITOR]) == [(1, "generic")],
       pt.table_candidates([cover, TINNA_STATEMENT, TINNA_CASH_FLOW, notes, TINNA_AUDITOR]))
 
+# Pages about the results, not the statement (23 Oct 2026): Coforge's segment-table
+# notes and Le Travenues' notes were sent as the consolidated table, Dr. Reddy's and
+# Emmvee's press releases too, and Bansal Wire's auditor's report page ahead of its statement
+COFORGE_NOTES = """Selected explanatory notes to the Consolidated Financial Results for the Quarter and Six Months ended September 30, 2026
+1 The above results were reviewed and recommended by the Audit Committee
+4 Segment information at Consolidated level for Continuing operation Rs. In Mn
+Revenue from Operations
+Americas 38,935 34,178 23,208
+Total 61,708 55,277 40,164
+Profit Before Tax 7,989 7,021 5,582
+Profit after tax 6,049 5,317 4,254"""
+LE_TRAVENUES_NOTES = ("Le Travenues Technology Limited\nCIN: L63000HR2006PLC071540\nRegistered office: Second Floor, Veritas Building\n"
+                      "Notes to the statement of unaudited consolidated financial results for the quarter and half year ended "
+                      "September 30, 2026:\n" + table)
+PRESS = ("Dr. Reddy's Q2 & H1FY27 Financial Results\nHyderabad, India, October 23, 2026: Dr. Reddy's Laboratories Ltd. "
+         "today announced its consolidated financial results for the quarter\n" + table)
+BANSAL_AUDITOR = """6. The Statement includes the unaudited financial results of two subsidiaries, whose results
+reflect total revenues of Rs. 1,234.56 lakhs and total net profit after tax of Rs. 123.45 lakhs, which
+results of M/s. BWI Steel Private Limited have been reviewed by us"""
+for label, page in [("segment-table notes (Coforge p15)", COFORGE_NOTES), ("notes to the statement (Le Travenues p8)", LE_TRAVENUES_NOTES),
+                    ("a press release (Dr. Reddy's p2)", PRESS), ("an auditor's later page (Bansal Wire p12)", BANSAL_AUDITOR)]:
+    check(f"{label} isn't a results table", pt.classify_result_page(page) is None, pt.classify_result_page(page))
+EMMVEE_SEGMENTS = ("EMMVEE PHOTOVOLTAIC POWER LIMITED\nCONSOLIDATED UNAUDITED SEGMENT INFORMATION FOR THE QUARTER AND SIX MONTHS "
+                   "ENDED SEPTEMBER 30, 2026\nSegment Revenue\n" + table)
+check("a segment information page isn't a results table (Emmvee p44)", pt.classify_result_page(EMMVEE_SEGMENTS) is None)
+check("a title after 20 lines counting blanks still counts (Emmvee p41's OCR text)",
+      pt.classify_result_page("EMMVEE PHOTOVOLTAIC POWER LIMITED\n\n\n" + "\n\n".join(["Registered office"] * 9)
+                              + "\n\nSTATEMENT OF CONSOLIDATED UNAUDITED FINANCIAL RESULTS\n" + table) == "consolidated")
+check("a statement whose title mentions notes later is still one",
+      pt.classify_result_page("XYZ LIMITED\nStatement of Unaudited Consolidated Financial Results (see notes below)\n" + table)
+      == "consolidated")
+check("OCR's 'onsolidated' (first letter lost at a border) still reads as consolidated (Coforge p12)",
+      pt.classify_result_page("Statement of Unaudited Financial Results for the quarter ended September 30, 2026\n"
+                              "onsolidated Financial Results\n" + table) == "consolidated")
+
 # ─────────────────────────────────────────────────────────────
 section("normalise_financials")
 
@@ -668,6 +703,19 @@ check("tiny loss base = small base, no turnaround label", "Turnaround" not in bd
 
 s_rej, bd_rej = pt.compute_pead_score(mk(revenue_from_operations=[150, 120, 100], pat=[-3, 2, 1]))
 check("negative PAT still rejected", s_rej == 0 and "Rejected" in bd_rej)
+
+# A "–" for finance cost came back null and left EBITDA blank (20 of 307 rows, 23 Oct 2026)
+check("prompt: a dash is 0, not null", "dash (- or –)" in pt.EXTRACTION_PROMPT)
+check("EBITDA: no finance cost line at all counts as 0",
+      pt.estimate_ebitda(mk(pbt=[40, 30, 15], depreciation=[5, 5, 5])) == [45.0, 35.0, 20.0])
+check("EBITDA: nothing to depreciate counts as 0 too",
+      pt.estimate_ebitda(mk(pbt=[40, 30, 15], finance_cost=[2, 2, 2])) == [42.0, 32.0, 17.0])
+check("EBITDA: a cost missing in one column only leaves that column blank",
+      pt.estimate_ebitda(mk(pbt=[40, 30, 15], finance_cost=[None, 2, 2], depreciation=[5, 5, 5])) == [None, 37.0, 22.0])
+check("EBITDA: no PBT, no estimate", pt.estimate_ebitda(mk(finance_cost=[2, 2, 2])) == [None, None, None])
+_, bd_nodebt = pt.compute_pead_score(mk(revenue_from_operations=[150, 120, 100], pat=[30, 20, 10], basic_eps=[3, 2, 1],
+                                        pbt=[40, 30, 15], depreciation=[5, 5, 5]))
+check("a debt-free company gets its EBITDA margin factor", bd_nodebt["EBITDA Margin Exp"][0] != "N/A", bd_nodebt)
 
 # ─────────────────────────────────────────────────────────────
 section("telegram")
@@ -2571,12 +2619,43 @@ with mock.patch.object(pt.client.chat.completions, "create", create):
 check("at most 2 extra tables: 3 calls although 4 tables exist",
       pt.MAX_EXTRA_TABLE_TRIES == 2 and len(seen_pages) == 3 and raw["tried"] == ["1–2", "3–4", "5–6"], (seen_pages, raw))
 
-for label, answer in [("figures but no revenue (insurer-like)", '{"unit":"crores","pat":[5,4,3]}'),
+for label, answer in [("figures and EPS but no revenue (insurer-like)", '{"unit":"crores","pat":[5,4,3],"basic_eps":[1,1,1]}'),
+                      ("figures and total expenses but no EPS", '{"unit":"crores","pat":[5,4,3],"total_expenses":[9,8,7]}'),
                       ("reply isn't JSON (retried later instead)", "sorry, no idea")]:
     create, seen_pages = replies(answer)
     with mock.patch.object(pt.client.chat.completions, "create", create):
         pt.extract_financials(text_pdf(PAGES))
     check(f"no extra table when {label}", len(seen_pages) == 1, seen_pages)
+
+# ── A partial answer (neither EPS nor total expenses) is a segment table or press
+#    release, not the statement: try the next table, keep the most complete reading
+#    (Coforge, 23 Oct 2026: page 15's segment table gave revenue, PBT and PAT only)
+SEGMENT_JSON = ('{"basis":"consolidated","unit":"millions","period_end":"2026-09-30","prev_period_end":"2026-06-30",'
+                '"ly_period_end":"2025-09-30","revenue_from_operations":[61708,55277,40164],"pbt":[7989,7021,5582],'
+                '"pat":[6049,5317,4254]}')
+PAT_ONLY_JSON = '{"basis":"standalone","unit":"millions","pat":[2103,2046,3623]}'
+for raw, want in [({"data": json.loads(SEGMENT_JSON)}, True), ({"data": json.loads(PAT_ONLY_JSON)}, True),
+                  ({"data": json.loads(EMPTY_JSON)}, False), ({"data": json.loads(MODEL_JSON.split("```json\n")[1].split("\n```")[0])}, False),
+                  ({"data": {"pat": [5], "total_expenses": [9]}}, False), ({}, False)]:
+    check(f"partial_answer {str(raw)[:70]}", pt.partial_answer(raw) == want)
+
+create, seen_pages = replies(SEGMENT_JSON, MODEL_JSON)
+raw = {}
+with mock.patch.object(pt.client.chat.completions, "create", create), LogCapture() as logs:
+    fin = pt.extract_financials(text_pdf(PAGES), raw_out=raw)
+check("partial answer → the next table is read and kept",
+      len(seen_pages) == 2 and fin["basic_eps"] == [7.0, 6.0, 4.0] and raw["tried"] == ["4–5", "2–3"]
+      and logs.has_line("DEBUG", "no EPS or total expenses from pages 4–5 (consolidated table); trying the standalone table"),
+      (seen_pages, raw.get("tried"), fin))
+
+create, seen_pages = replies(SEGMENT_JSON, PAT_ONLY_JSON, EMPTY_JSON)
+raw = {}
+with mock.patch.object(pt.client.chat.completions, "create", create), LogCapture() as logs:
+    fin = pt.extract_financials(text_pdf(FOUR_TABLES), raw_out=raw)
+check("nothing better turns up → the most complete reading is kept (the first)",
+      len(seen_pages) == 3 and fin["pat"][0] == 604.9 and raw["tried"] == ["1–2", "3–4", "5–6"]
+      and raw["data"]["pbt"] == [7989, 7021, 5582] and logs.has_line("DEBUG", "kept the reading of pages 1–2"),
+      (seen_pages, raw.get("tried"), fin and fin["pat"]))
 
 create, seen_pages = replies(EMPTY_JSON)
 with mock.patch.object(pt.client.chat.completions, "create", create):
@@ -2614,23 +2693,48 @@ SCANNED_STATEMENT = ["ACGL", "STATEMENT OF AUDITED RESULTS FOR THE QUARTER AND S
                      "Revenue from operations  26559.38  24894.40  20638.15", "Total income  27093.82  25271.20  21042.62",
                      "Total expenses  25320.15  23752.26  19076.19", "Profit from ordinary activities before tax  1773.67  1518.94  1966.43",
                      "Profit for the period  1319.89  1121.63  1463.61", "Basic Earnings per share  21.68  18.42  24.03"]
-doc = pdfium.PdfDocument.new()
-doc.import_pages(pdfium.PdfDocument(text_pdf([COVER])))
-doc.import_pages(pdfium.PdfDocument(scanned_pdf([SCANNED_STATEMENT])))
-doc.import_pages(pdfium.PdfDocument(text_pdf([PRESS_RELEASE])))
-buf = io.BytesIO()
-doc.save(buf)
-acgl_like = buf.getvalue()
-check("press release alone counts as an untitled table", pt.classify_result_page("\n".join(PRESS_RELEASE)) == "untitled")
+SUMMARY_TABLE = ["In Rs. Crores Q2-FY27 Q1-FY27 Q2-FY26", "Total income 270.94 252.71 210.43",
+                 "Profit Before Tax 17.74 19.67 21.04", "EPS 21.68 18.42 24.03"] * 4    # no title, not a press release
+
+def statement_after(last_page):
+    doc = pdfium.PdfDocument.new()
+    doc.import_pages(pdfium.PdfDocument(text_pdf([COVER])))
+    doc.import_pages(pdfium.PdfDocument(scanned_pdf([SCANNED_STATEMENT])))
+    doc.import_pages(pdfium.PdfDocument(text_pdf([last_page])))
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+check("a press release isn't a results table (since 23 Oct 2026)", pt.classify_result_page("\n".join(PRESS_RELEASE)) is None)
+check("a summary table without a title is untitled", pt.classify_result_page("\n".join(SUMMARY_TABLE)) == "untitled")
 with LogCapture() as logs:
-    found = pt.find_result_pages(acgl_like, pt.AMBIGUOUS_OCR_PAGES)
+    found = pt.find_result_pages(statement_after(SUMMARY_TABLE), pt.AMBIGUOUS_OCR_PAGES)
 check("untitled text table → scans OCR'd first, the scanned statement is chosen",
       found["pages"][:1] == [1] and found["basis"] == "generic" and 1 in found["ocr"]
       and logs.has_line("DEBUG", "only an untitled table in the text layer, OCR-ing low-text pages first"),
       (found["pages"], found["basis"], sorted(found["ocr"])))
-found = pt.find_result_pages(text_pdf([COVER, PRESS_RELEASE]))
+found = pt.find_result_pages(statement_after(PRESS_RELEASE), pt.AMBIGUOUS_OCR_PAGES)
+check("ACGL's press release: the scanned statement is chosen",
+      found["pages"][:1] == [1] and found["basis"] == "generic", (found["pages"], found["basis"]))
+found = pt.find_result_pages(text_pdf([COVER, SUMMARY_TABLE]))
 check("untitled table with nothing unread is still used, no OCR", found["pages"] == [1] and found["basis"] == "untitled"
       and not found["ocr"], (found["pages"], found["basis"]))
+
+# ── Long PDFs: no titled table in the first 25 pages → read on, up to page 60
+#    (23 Oct 2026: Dr. Reddy's statements came after page 25, Emmvee's on pages 41 and 48 of 51)
+DECK = ["Investor presentation: growth strategy, order book and capacity expansion plans for the year ahead."] * 4
+with LogCapture() as logs:
+    found = pt.find_result_pages(text_pdf([COVER] + [DECK] * 28 + [table_lines("Consolidated"), NOTES]))
+check("statement on page 30 of 31: read on past page 25 and found",
+      found["pages"] == [29, 30] and found["basis"] == "consolidated" and len(found["texts"]) == 31
+      and logs.has_line("DEBUG", "no titled results table in the first 25 pages; reading pages 26–31"),
+      (found["pages"], len(found["texts"])))
+found = pt.find_result_pages(text_pdf([COVER, table_lines("Consolidated")] + [DECK] * 30))
+check("a titled table early on: the rest of a long PDF isn't read",
+      found["pages"] == [1, 2] and len(found["texts"]) == pt.MAX_PDF_PAGES, (found["pages"], len(found["texts"])))
+found = pt.find_result_pages(text_pdf([COVER] + [DECK] * 60 + [table_lines("Consolidated")]))
+check(f"nothing read past page {pt.LONG_PDF_PAGES}",
+      found["pages"] == [] and len(found["texts"]) == pt.LONG_PDF_PAGES, (found["pages"], len(found["texts"])))
 
 # ─────────────────────────────────────────────────────────────
 section("compare_models.py")
